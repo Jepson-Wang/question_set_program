@@ -1,7 +1,7 @@
 #在这里面完成login相关逻辑
 from sqlalchemy import select
-from model import get_db
-from model.user import User
+from backend.model import get_db
+from backend.model.user import User
 
 class loginService:
     async def login(self, username, password):
