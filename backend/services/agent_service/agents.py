@@ -126,7 +126,7 @@ def build_common_agent() -> CompiledStateGraph[GraphState] | None:
     :return:
     """
 
-    model = os.getenv('COMMON_MODEL')
+    model = os.getenv('MODEL_NAME')
 
     if not model:
         agent = get_llm()

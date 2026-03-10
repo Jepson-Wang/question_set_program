@@ -24,7 +24,7 @@ SYSTEM_PROMPT = ChatPromptTemplate.from_messages([
 PLANNER_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是一个任务规划助手，负责根据用户请求规划和调度以下智能体
             -extract : 提取请求中所给题目的难度，知识点,并最终生成题目
-            -common : 其他情况，比如不是生成题目，而是其他问题，比如解释知识点，或者其他问题。
+            -common : 除生成题目和需要生成图片的情况外，就调用common智能体，主要是解释知识点和解释这个题怎么解。
         约束规则:
         1. 你将在上面的智能体中选择一个，根据用户请求进行调度。
         2. 你只能选择一个智能体进行调用。
@@ -99,11 +99,12 @@ ANALYSE_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 COMMON_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是一个回答通用问题的助手，负责回答解题步骤，解题思路，解题方法等
+    ("system", """你是一个回答负责回答下列问题的助手，包括负责回答解题步骤，解题思路，解题方法
             根据用户的输入，选择性的回答以下问题：
             1. 回答这个题的解题步骤，解题思路，解题方法等
             2. 回答这个题的相关问题，如这个题的难度，涉及的知识点等
-            3. 回答用户的其他问题
+            注意：
+            1. 如果用户的输入中不包含解题步骤，解题思路，解题方法等问题，你不应该回答。而是调用extract智能体
             """),
     ("user", "{input}")  # 使用"user"角色而不是"human"
 ])

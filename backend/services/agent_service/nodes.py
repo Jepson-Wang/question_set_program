@@ -142,7 +142,7 @@ def common_node(state: GraphState) -> GraphState:
     # 进行大模型调用相关操作
     common_agent = build_common_agent()
     common_chain = COMMON_PROMPT | common_agent
-    response = common_agent.invoke({'input': user_input})
+    response = common_chain.invoke({'input': user_input})
     # 将回答返回给state,并追加到result
     response_text = extract_text_from_response(response)
     state['result'] = state['result'] + '\n' + response_text
