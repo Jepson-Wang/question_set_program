@@ -1,6 +1,4 @@
 .env
-.env
 .idea/
 *.env
-.idea/
 __pycache__/
