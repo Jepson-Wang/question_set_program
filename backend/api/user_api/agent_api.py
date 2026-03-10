@@ -19,7 +19,7 @@ class TextRequest(BaseModel):
 agent_router = APIRouter(prefix="/agent", tags=["agent"])
 
 @agent_router.post('/analyse')
-def analyse(request: TextRequest,user : User = Depends(get_current_user())) -> dict:
+def analyse(request: TextRequest,token,user : User = Depends(get_current_user)) -> dict:
     if user:
         agent = build_graph()
         text = request.text
