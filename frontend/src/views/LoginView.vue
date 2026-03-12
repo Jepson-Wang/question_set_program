@@ -58,7 +58,6 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { loginApi } from '../api/auth'
 
 const router = useRouter()
 const formRef = ref()
@@ -82,28 +81,12 @@ const handleLogin = async () => {
   try {
     await formRef.value.validate()
 
-    const res = await loginApi({
-      username: loginForm.username,
-      password: loginForm.password
-    })
-
-    console.log('登录返回结果：', res)
-
-    // 兼容两种可能：
-    // 1. data 直接就是 token
-    // 2. data 是对象，token 在 data.token
-    const token = res?.data?.token || res?.data
-
-    if (res.code === 200 && token) {
-      localStorage.setItem('token', token)
-      ElMessage.success(res.msg || '登录成功')
-      router.push('/chat')
-    } else {
-      ElMessage.error(res.msg || '登录失败')
-    }
+    // 临时模拟登录成功
+    localStorage.setItem('token', 'mock-token')
+    ElMessage.success('模拟登录成功')
+    router.push('/chat')
   } catch (error) {
-    console.log('登录出错：', error)
-    ElMessage.error('请求失败，请检查后端服务是否启动')
+    console.log('表单校验未通过', error)
   }
 }
 
@@ -111,7 +94,6 @@ const goRegister = () => {
   router.push('/register')
 }
 </script>
-
 <style scoped>
 .login-page {
   min-height: 100vh;
