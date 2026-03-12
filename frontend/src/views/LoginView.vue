@@ -58,6 +58,7 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { loginApi } from '../api/auth'
 
 const router = useRouter()
 const formRef = ref()
@@ -72,8 +73,8 @@ const rules = {
     { required: true, message: '请输入用户名', trigger: 'blur' }
   ],
   password: [
-    { required: true, message: 'Please enter password', trigger: 'blur' },
-    { min: 6, message: '密码至少为6个字符', trigger: 'blur' }
+    { required: true, message: '请输入密码', trigger: 'blur' },
+    { min: 6, message: '密码长度不能少于 6 位', trigger: 'blur' }
   ]
 }
 
@@ -81,18 +82,28 @@ const handleLogin = async () => {
   try {
     await formRef.value.validate()
 
-    // 这里先写死演示，后面再接接口
-    ElMessage.success('Login form validation passed')
-
-    console.log('登录参数：', {
+    const res = await loginApi({
       username: loginForm.username,
       password: loginForm.password
     })
 
-    // 后面接上接口成功后再跳转
-    // router.push('/chat')
+    console.log('登录返回结果：', res)
+
+    // 兼容两种可能：
+    // 1. data 直接就是 token
+    // 2. data 是对象，token 在 data.token
+    const token = res?.data?.token || res?.data
+
+    if (res.code === 200 && token) {
+      localStorage.setItem('token', token)
+      ElMessage.success(res.msg || '登录成功')
+      router.push('/chat')
+    } else {
+      ElMessage.error(res.msg || '登录失败')
+    }
   } catch (error) {
-    console.log('表单校验未通过', error)
+    console.log('登录出错：', error)
+    ElMessage.error('请求失败，请检查后端服务是否启动')
   }
 }
 
