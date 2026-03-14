@@ -3,10 +3,10 @@ from pydantic import BaseModel
 
 from backend.api.dependencies import get_current_user
 from backend.model.user import User
-from backend.services.agent_service.agents import GraphState
+from backend.agents.agent.agents import GraphState
 import logging
 
-from backend.services.agent_service.nodes import build_graph
+from backend.agents.agent.nodes import build_graph
 
 # 设置日志
 logging.basicConfig(level=logging.INFO)
