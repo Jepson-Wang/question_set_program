@@ -1,4 +1,4 @@
-from backend.services.agent_service.agents import GraphState, build_planner_agent, extract_text_from_response, build_extract_agent, \
+from backend.agents.agent.agents import GraphState, build_planner_agent, extract_text_from_response, build_extract_agent, \
     build_question_set_agent, build_analyse_agent, build_common_agent
 import os
 import json
@@ -11,7 +11,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.state import CompiledStateGraph
 
-from backend.services.agent_service.prompt import EXTRACT_PROMPT, QUESTION_SET_PROMPT, COMMON_PROMPT, PLANNER_PROMPT
+from backend.agents.agent.prompt import EXTRACT_PROMPT, QUESTION_SET_PROMPT, COMMON_PROMPT, PLANNER_PROMPT
 
 
 def planner_node(state: GraphState) -> GraphState:
