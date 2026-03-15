@@ -148,6 +148,67 @@ def common_node(state: GraphState) -> GraphState:
     state['result'] = state['result'] + '\n' + response_text
     return state
 
+async def async_planner_node(state: GraphState) -> GraphState:
+    user_input = state['input']
+    planner_agent = build_planner_agent()
+    planner_chain = PLANNER_PROMPT | planner_agent
+    response = await planner_chain.ainvoke({'input': user_input})
+    response_text = extract_text_from_response(response)
+    try:
+        if '{' in response_text and '}' in response_text:
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            parsed = json.loads(response_text[json_start:json_end])
+            route = parsed.get('route', '').lower()
+        else:
+            route = response_text.strip().lower()
+    except:
+        route = response_text.strip().lower()
+    if route not in ['extract', 'question_set', 'analyse', 'common']:
+        route = 'common'
+    state['route'] = route
+    return state
+
+
+async def async_extract_node(state: GraphState) -> GraphState:
+    system_input = state['input']
+    extract_agent = build_extract_agent()
+    extract_chain = EXTRACT_PROMPT | extract_agent
+    response = await extract_chain.ainvoke({'input': system_input})
+    response_text = extract_text_from_response(response)
+    try:
+        if '{' in response_text and '}' in response_text:
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            parsed = json.loads(response_text[json_start:json_end])
+            state['extract'] = parsed
+        else:
+            state['extract'] = {}
+    except:
+        state['extract'] = {}
+    return state
+
+
+async def async_question_set_node(state: GraphState) -> GraphState:
+    user_input = state['input']
+    extract_input = state['extract']
+    question_set_agent = build_question_set_agent(streaming=True)
+    question_set_chain = QUESTION_SET_PROMPT | question_set_agent
+    enhanced_input = f"请基于以下参考题目生成一道变式题：\n\n{user_input}\n\n知识点要求：{extract_input}"
+    response = await question_set_chain.ainvoke({'input': enhanced_input})
+    state['result'] = extract_text_from_response(response)
+    return state
+
+
+async def async_common_node(state: GraphState) -> GraphState:
+    user_input = state['input']
+    common_agent = build_common_agent(streaming=True)
+    common_chain = COMMON_PROMPT | common_agent
+    response = await common_chain.ainvoke({'input': user_input})
+    state['result'] = extract_text_from_response(response)
+    return state
+
+
 def build_graph() -> CompiledStateGraph[GraphState]:
     """
     负责构建工作流
@@ -190,4 +251,35 @@ def build_graph() -> CompiledStateGraph[GraphState]:
     graph.add_edge('question_set', END)
     graph.add_edge('common', END)
     graph.add_edge('analyse', END)
+    return graph.compile()
+
+
+def build_stream_graph() -> CompiledStateGraph[GraphState]:
+    """
+    构建支持流式输出的异步工作流
+    """
+    graph = StateGraph(GraphState)  # type:ignore
+    graph.add_node("planner", async_planner_node)  # type:ignore
+    graph.add_node("extract", async_extract_node)  # type:ignore
+    graph.add_node("question_set", async_question_set_node)  # type:ignore
+    graph.add_node("common", async_common_node)  # type:ignore
+
+    def router_logic(state: GraphState):
+        route = state['route']
+        if route not in ['extract', 'common']:
+            route = 'common'
+        return route
+
+    graph.add_edge(START, "planner")
+    graph.add_conditional_edges(
+        "planner",
+        router_logic,
+        {
+            "extract": "extract",
+            "common": "common"
+        }
+    )
+    graph.add_edge('extract', 'question_set')
+    graph.add_edge('question_set', END)
+    graph.add_edge('common', END)
     return graph.compile()
