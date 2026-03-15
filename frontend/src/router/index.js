@@ -26,14 +26,14 @@ const router = createRouter({
   history: createWebHistory(),
   routes
 })
-
+//路由守卫
 router.beforeEach((to, from, next) => {
   const token = localStorage.getItem('token')
 
   if (to.path === '/chat' && !token) {
-    next('/login')
+    return '/login'
   } else {
-    next()
+    return true
   }
 })
 
