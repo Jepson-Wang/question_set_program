@@ -6,7 +6,8 @@ import ChatView from '../views/ChatView.vue'
 const routes = [
   {
     path: '/',
-    redirect: '/login'
+    redirect: '/login',
+    meta:{title:"登录页"}
   },
   {
     path: '/login',
@@ -27,7 +28,7 @@ const router = createRouter({
   routes
 })
 //路由守卫
-router.beforeEach((to, from, next) => {
+router.beforeEach((to) => {
   const token = localStorage.getItem('token')
 
   if (to.path === '/chat' && !token) {
@@ -36,8 +37,9 @@ router.beforeEach((to, from, next) => {
     return true
   }
 })
+router.afterEach((to,from)=>{
 
-
+})
 
 
 export default router
