@@ -55,18 +55,22 @@
 </template>
 
 <script setup>
+
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { setToken } from '../utils/auth'
 
 const router = useRouter()
 const formRef = ref()
 
+// 登录表单数据
 const loginForm = reactive({
   username: '',
   password: ''
 })
 
+// 表单校验规则
 const rules = {
   username: [
     { required: true, message: '请输入用户名', trigger: 'blur' }
@@ -77,22 +81,33 @@ const rules = {
   ]
 }
 
+// 点击登录
 const handleLogin = async () => {
   try {
+    // 先做表单校验
     await formRef.value.validate()
 
-    // 临时模拟登录成功
-    localStorage.setItem('token', 'mock-token')
+    // TODO: 后端接口可用后，这里换成真实登录请求
+    // 现在先临时模拟登录成功
+    setToken('mock-token')
+
     ElMessage.success('模拟登录成功')
+
+    // 跳转到聊天页
     router.push('/chat')
   } catch (error) {
     console.log('表单校验未通过', error)
   }
 }
 
+// 去注册页
 const goRegister = () => {
   router.push('/register')
 }
+
+
+
+
 </script>
 <style scoped>
 .login-page {

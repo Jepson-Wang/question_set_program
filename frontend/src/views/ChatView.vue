@@ -66,6 +66,7 @@
 import { nextTick, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { removeToken } from '../utils/auth'
 
 const router = useRouter()
 
@@ -97,7 +98,7 @@ const handleSend = async () => {
     return
   }
 
-  // 先加用户消息
+  // 先追加用户消息
   messageList.value.push({
     id: Date.now(),
     role: 'user',
@@ -114,14 +115,14 @@ const handleSend = async () => {
     messageList.value.push({
       id: Date.now() + 1,
       role: 'assistant',
-      content: `你刚刚输入的是：${userText}。这里先做模拟回复，后面等后端聊天接口好了再接真实数据。`
+      content: `你刚刚输入的是：${userText}。这里先做模拟回复，后面再接真实聊天接口。`
     })
 
     await scrollToBottom()
   }, 500)
 }
 
-// Enter 发送，Shift + Enter 换行
+// 回车发送
 const handleEnter = (event) => {
   if (event.shiftKey) return
   event.preventDefault()
@@ -141,11 +142,15 @@ const handleLogout = async () => {
       }
     )
 
-    localStorage.removeItem('token')
+    // 删除 token
+    removeToken()
+
     ElMessage.success('已退出登录')
+
+    // 回到登录页
     router.push('/login')
   } catch (error) {
-    // 用户取消，不处理
+    // 用户点了取消，不处理
   }
 }
 
@@ -154,7 +159,6 @@ const handleMockUpload = () => {
   ElMessage.info('文件上传功能后续接入')
 }
 </script>
-
 <style scoped>
 .chat-page {
   min-height: 100vh;
