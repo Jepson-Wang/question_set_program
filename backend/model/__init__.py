@@ -1,8 +1,11 @@
+import os
+
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# 数据库连接地址：mysql+asyncmy://用户名:密码@主机:端口/库名
-SQLALCHEMY_DATABASE_URL = "mysql+asyncmy://root:123456@localhost:3306/question_set"
+url = os.getenv("SQL_DATABASE_URL")
+
+SQLALCHEMY_DATABASE_URL = url
 
 # 创建异步引擎（管理连接池）
 engine = create_async_engine(
