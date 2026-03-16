@@ -15,14 +15,14 @@
 3. 如果确实要匹配的话，我可以进行如下设计
     用户画像，包括年级，长期偏好（经常问的知识点）
 """
-from sqlalchemy.ext.asyncio.session import AsyncSession
 
+from backend.agents.memory.short_term_memory import ShortTermMemory, get_short_term_memory
 from backend.dao.user_profile_mapper import UserProfileMapper
-from backend.model import get_db
 from backend.model.user_profile import UserProfile
-from sqlalchemy import select
 from pydantic import BaseModel,Field
 from fastapi import Depends
+from backend.dao.user_profile_mapper import get_usr_profile_mapper
+
 
 class LTMRequest(BaseModel):
     user_id: str = Field(...,description='用户唯一ID（业务主键）')
@@ -30,12 +30,13 @@ class LTMRequest(BaseModel):
     subject: str = Field(...,description='主修学科')
     preferences: str = Field(...,description='长期偏好（JSON）')
 
-async def get_usr_profile_mapper(db : AsyncSession = Depends(get_db)) -> UserProfileMapper:
-    return UserProfileMapper(db)
 
 class LongTermMemory:
-    def __init__(self,user_profile_mapper:UserProfileMapper):
+    def __init__(self,
+                 user_profile_mapper:UserProfileMapper = Depends(get_usr_profile_mapper),
+                 short_term_memory:ShortTermMemory = Depends(get_short_term_memory)):
         self.user_profile_mapper = user_profile_mapper
+        self.short_term_memory = short_term_memory
 
     async def add_or_update(self,request:LTMRequest):
         user_profile = await self.user_profile_mapper.get_by_user_id(request.user_id)
@@ -58,4 +59,7 @@ class LongTermMemory:
 
     async def delete(self,user_id:str):
         await self.user_profile_mapper.delete_memory(user_id)
+
+    async def get_from_STM(self,user_id:str) -> list[str] | None:
+        user_memory = await self.short_term_memory.get_latest_memories(user_id)
 

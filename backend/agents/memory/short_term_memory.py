@@ -18,8 +18,10 @@
 1. 将短期记忆存进redis中
 2. 将用户和大模型的对话放入本地缓存中 ， 根据  用户 ID + 会话 ID / 任务 ID + 类型  来存储
 """
+import asyncio
 from collections import deque
-from typing import Dict
+from typing import Dict, List, Any
+
 
 class MemoryUnit(dict):
     def __init__(self, user_memory : Dict[str,str] ="", model_memory : Dict[str,str] =""):
@@ -28,18 +30,50 @@ class MemoryUnit(dict):
             model = model_memory
         )
 
+#TODO 后续需要完成短期记忆持久化操作
+#1. 最近的八条，存入Redis缓存中
+#2. 处于队列前端的两条记录，进行提取，并存入RAG或者其他的
 class ShortTermMemory:
-    def __init__(self,max_len = 20):
-        self.short_memory = deque(maxlen=max_len)
+    def __init__(self, max_memory_size: int = 10):
+        # 双端队列存储记忆，max_memory_size 控制最大记忆条数
+        #max_memory为9条，多出的那个用来交给相关的大模型进行提炼操作
+        self._memory = deque(maxlen=max_memory_size)
+        # 协程锁保证并发安全
+        self._lock = asyncio.Lock()
 
-    def add(self,memory:MemoryUnit) -> None:
-        self.short_memory.append(memory)
+    async def add_memory(self, memory: MemoryUnit):
+        """添加新记忆（自动删除超出长度的最早记忆）"""
+        async with self._lock:
+            # memory 示例：{"role": "user", "content": "你好", "timestamp": 1710678900}
+            self._memory.append(memory)
+            #TODO 后续需要添加判断逻辑：如果当前记忆大于最大记忆，那就将最前面的那个给提取出来
 
-    def get(self,mount : int = 10) -> list[MemoryUnit]:
-        return list(self.short_memory)[-mount:]
+    async def get_latest_memories(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """获取最新N条记忆（默认全部）"""
+        async with self._lock:
+            if limit is None:
+                # 返回副本，避免外部修改原队列
+                return list(self._memory)
+            # 取最后limit条（最新的）
+            return list(self._memory)[-limit:]
 
-    def clear(self) -> None:
-        self.short_memory.clear()
+    async def remove_oldest_memory(self) -> Dict[str, Any] | None:
+        """删除最早的1条记忆"""
+        #TODO 完成接入大模型进行提取的操作
+        async with self._lock:
+            if not self._memory:
+                return None
+            return self._memory.popleft()
 
-    def getSize(self)->int:
-        return len(self.short_memory)
+    async def clear_all(self):
+        """清空所有记忆"""
+        async with self._lock:
+            self._memory.clear()
+
+    async def get_memory_size(self) -> int:
+        """获取当前记忆条数"""
+        async with self._lock:
+            return len(self._memory)
+
+async def get_short_term_memory() -> ShortTermMemory | None:
+    return ShortTermMemory()
