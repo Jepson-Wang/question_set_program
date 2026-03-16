@@ -50,12 +50,13 @@ api_key = os.getenv('API_KEY')
 base_url = os.getenv('API_URL')
 
 #先创建几个大模型
-def get_llm(model:str=model)  :
+def get_llm(model:str=model, streaming:bool=False):
     llm = ChatOpenAI(
         model=model,
         api_key=api_key,
         base_url=base_url,
-        temperature=0.3
+        temperature=0.3,
+        streaming=streaming
     )
     return llm
 
@@ -90,22 +91,19 @@ def build_extract_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
-def build_question_set_agent() -> CompiledStateGraph[GraphState] | None:
+def build_question_set_agent(streaming: bool = False):
     """
     负责根据提取到的知识点和难度，生成题目
-    :return:
     """
-
     model = os.getenv('QUESTION_SET_MODEL')
-
     if not model:
-        agent = get_llm()
+        agent = get_llm(streaming=streaming)
     else:
-        agent = get_llm(model=model)
-
+        agent = get_llm(model=model, streaming=streaming)
     return agent
 
-def build_analyse_agent() -> CompiledStateGraph[GraphState] | None:
+
+def build_analyse_agent():
     """
     负责审核生成的题目
     :return:
@@ -120,19 +118,15 @@ def build_analyse_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
-def build_common_agent() -> CompiledStateGraph[GraphState] | None:
+def build_common_agent(streaming: bool = False):
     """
     负责其他一般性回答
-    :return:
     """
-
     model = os.getenv('COMMON_MODEL')
-
     if not model:
-        agent = get_llm()
+        agent = get_llm(streaming=streaming)
     else:
-        agent = get_llm(model=model)
-
+        agent = get_llm(model=model, streaming=streaming)
     return agent
 
 def build_image_geng_agent() -> CompiledStateGraph[GraphState] | None:
