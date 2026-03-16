@@ -38,7 +38,7 @@ class LongTermMemory:
         self.user_profile_mapper = user_profile_mapper
         self.short_term_memory = short_term_memory
 
-    async def add_or_update(self,request:LTMRequest):
+    async def add_or_update(self,request:LTMRequest) -> None:
         user_profile = await self.user_profile_mapper.get_by_user_id(request.user_id)
         if user_profile is None:
             user_profile = UserProfile(
@@ -57,9 +57,9 @@ class LongTermMemory:
     async def get_by_user_id(self,user_id:str) -> UserProfile | None:
         return await self.user_profile_mapper.get_by_user_id(user_id)
 
-    async def delete(self,user_id:str):
+    async def delete(self,user_id:str) -> None:
         await self.user_profile_mapper.delete_memory(user_id)
 
     async def get_from_STM(self,user_id:str) -> list[str] | None:
-        user_memory = await self.short_term_memory.get_latest_memories(user_id)
+        user_memory = await self.short_term_memory.get_latest_memories(limit=5)
 
