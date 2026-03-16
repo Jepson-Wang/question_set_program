@@ -1,21 +1,24 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import and_, update
+
+from backend.model import get_db
 from backend.model.user_profile import UserProfile
 from typing import Optional, Dict, Any, List
+from fastapi import Depends
+
 
 class UserProfileMapper:
     def __init__(self, db_session: AsyncSession):
         self.session = db_session
 
-    async def create_memory(self, user_id: str, grade: str, subject: str, weak_points: Dict[str, Any], preferences: Dict[str, Any]):
+    async def create_memory(self, user_profile : UserProfile):
         """创建用户画像记录"""
         user_profile = UserProfile(
-            user_id=user_id,
-            grade=grade,
-            subject=subject,
-            weak_points=weak_points,
-            preferences=preferences
+            user_id= user_profile.user_id,
+            grade= user_profile.grade,
+            subject= user_profile.subject,
+            weak_points= user_profile.weak_points,
+            preferences= user_profile.preferences
         )
         self.session.add(user_profile)
         await self.session.commit()
@@ -58,7 +61,7 @@ class UserProfileMapper:
         """获取所有用户画像（支持分页）"""
         stmt = select(UserProfile).offset(offset).limit(limit)
         result = await self.session.execute(stmt)
-        return result.scalars().all()
+        return list(result.scalars().all())
 
     async def update_weak_points(self, user_id: str, weak_points: Dict[str, Any]) -> Optional[UserProfile]:
         """更新薄弱知识点"""
@@ -75,3 +78,6 @@ class UserProfileMapper:
     async def update_subject(self, user_id: str, subject: str) -> Optional[UserProfile]:
         """更新学科"""
         return await self.update_memory(user_id, subject=subject)
+
+async def get_usr_profile_mapper(db : AsyncSession = Depends(get_db)) -> UserProfileMapper:
+    return UserProfileMapper(db)
