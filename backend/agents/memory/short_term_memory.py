@@ -31,10 +31,12 @@ from datetime import datetime
 from backend.utils.redis_client import get_redis_client
 
 class MemoryUnit(dict):
-    def __init__(self, user_memory: Dict[str, str] = "", model_memory: Dict[str, str] = ""):
+    def __init__(self, user_memory: str = "", model_memory: str = ""):
         super().__init__(
-            user=user_memory,
-            model=model_memory,
+            memory = Dict(
+                user_memory=user_memory,
+                model_memory=model_memory,
+            ),
             timestamp=datetime.now().isoformat()
         )
 
