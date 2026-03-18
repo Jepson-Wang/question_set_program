@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.api.user_api.agent_api import agent_router
 from backend.api.user_api.login_api import login_router
 from backend.core.hooks import startup_event, shutdown_event
+from backend.utils.redis_client import close_redis
 
 app = FastAPI(
     debug=True,
