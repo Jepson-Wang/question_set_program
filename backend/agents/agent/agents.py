@@ -1,12 +1,9 @@
 import os
-import json
 from typing import TypedDict, Literal
 
 from dotenv import load_dotenv
-from langchain.agents import create_agent
-from langchain_core.messages import SystemMessage, BaseMessage
+from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, START, END
 from langgraph.graph.state import CompiledStateGraph
 
 load_dotenv()
@@ -42,8 +39,10 @@ class GraphState(TypedDict):
 
     input: str
     route: Literal['extract', 'question_set', 'analyse', 'common']
+    extract: dict[str, str]
+    memory : dict[str,str]
     result: str
-    extract : dict[str,str]
+
 
 model = os.getenv('MODEL_NAME')
 api_key = os.getenv('API_KEY')
