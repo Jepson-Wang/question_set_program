@@ -17,12 +17,7 @@ class RedisClient:
             redis_url: Redis连接URL
         """
         self.redis_url = redis_url
-        self.redis = None
-    
-    async def initialize(self):
-        """初始化Redis连接"""
-        if self.redis is None:
-            self.redis = await aioredis.from_url(
+        self.redis = aioredis.from_url(
                 self.redis_url,
                 encoding="utf-8",
                 decode_responses=True
