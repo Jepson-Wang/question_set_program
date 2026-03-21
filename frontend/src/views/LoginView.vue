@@ -55,11 +55,11 @@
 </template>
 
 <script setup>
-
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { setToken } from '../utils/auth'
+import { loginApi } from '../api/auth'
+import { setToken, setTokenType } from '../utils/auth'
 
 const router = useRouter()
 const formRef = ref()
@@ -87,16 +87,36 @@ const handleLogin = async () => {
     // 先做表单校验
     await formRef.value.validate()
 
-    // TODO: 后端接口可用后，这里换成真实登录请求
-    // 现在先临时模拟登录成功
-    setToken('mock-token')
+    // 调用登录接口
+    const res = await loginApi({
+      username: loginForm.username,
+      password: loginForm.password
+    })
 
-    ElMessage.success('模拟登录成功')
+    console.log('登录返回结果：', res)
 
-    // 跳转到聊天页
-    router.push('/chat')
+    // 后端最新说会返回 access_token 和 token_type
+    const accessToken = res.access_token
+    const tokenType = res.token_type
+
+    // 登录成功
+    if (accessToken) {
+      // 保存 token
+      setToken(accessToken)
+
+      // 保存 token_type
+      setTokenType(tokenType)
+
+      ElMessage.success('登录成功')
+
+      // 跳转到聊天页
+      router.push('/chat')
+    } else {
+      ElMessage.error(res.msg || '登录失败')
+    }
   } catch (error) {
-    console.log('表单校验未通过', error)
+    console.log('登录请求失败：', error)
+    ElMessage.error('请求失败，请检查后端服务是否启动')
   }
 }
 
@@ -104,10 +124,6 @@ const handleLogin = async () => {
 const goRegister = () => {
   router.push('/register')
 }
-
-
-
-
 </script>
 <style scoped>
 .login-page {
