@@ -6,8 +6,8 @@ import logging
 
 from backend.api.dependencies import get_current_user
 from backend.model.user import User
-from backend.agents.agent.agents import GraphState
-from backend.agents.agent.nodes import build_graph, build_stream_graph
+from backend.agents.agent.tools import GraphState
+from backend.agents.agent.graph_build import build_graph, build_stream_graph
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ agent_router = APIRouter(prefix="/agent", tags=["agent"])
 
 
 @agent_router.post('/analyse')
-def analyse(request: TextRequest, token, user: User = Depends(get_current_user)) -> dict:
+def analyse(request: TextRequest,token: str = None, user: User = Depends(get_current_user)) -> dict:
     if user:
         agent = build_graph()
         text = request.text
