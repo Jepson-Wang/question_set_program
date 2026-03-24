@@ -6,6 +6,8 @@ from langchain_core.messages import BaseMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph.state import CompiledStateGraph
 
+from backend.core.single_tool import singleton_method
+
 load_dotenv()
 
 def extract_text_from_response(response) -> str:
@@ -38,6 +40,8 @@ class GraphState(TypedDict):
     """多智能体工作流的状态定义"""
 
     input: str
+    user_id : int
+    session_id : int
     route: Literal['extract', 'question_set', 'analyse', 'common']
     extract: dict[str, str]
     memory : dict[str,str]
@@ -48,7 +52,7 @@ model = os.getenv('MODEL_NAME')
 api_key = os.getenv('API_KEY')
 base_url = os.getenv('API_URL')
 
-#先创建几个大模型
+@singleton_method
 def get_llm(model:str=model, streaming:bool=False):
     llm = ChatOpenAI(
         model=model,
@@ -60,85 +64,14 @@ def get_llm(model:str=model, streaming:bool=False):
     return llm
 
 
-def build_planner_agent() -> CompiledStateGraph[GraphState] | None:
-    """
-    负责任务规划和调度的智能体
-    :return:
-    """
-
-    model = os.getenv('PLANNER_MODEL')
-
-    if not model:
-        agent = get_llm()
-    else:
-        agent = get_llm(model=model)
-
-    return agent
-
-def build_extract_agent() -> CompiledStateGraph[GraphState] | None:
-    """
-    负责任务分析和解释的智能体
-    :return:
-    """
-
-    model = os.getenv('EXTRACT_MODEL')
-
-    if not model:
-        agent = get_llm()
-    else:
-        agent = get_llm(model=model)
-
-    return agent
-
-def build_question_set_agent(streaming: bool = False):
-    """
-    负责根据提取到的知识点和难度，生成题目
-    """
-    model = os.getenv('QUESTION_SET_MODEL')
-    if not model:
-        agent = get_llm(streaming=streaming)
-    else:
-        agent = get_llm(model=model, streaming=streaming)
-    return agent
 
 
-def build_analyse_agent():
-    """
-    负责审核生成的题目
-    :return:
-    """
 
-    model = os.getenv('ANALYSE_MODEL')
 
-    if not model:
-        agent = get_llm()
-    else:
-        agent = get_llm(model=model)
 
-    return agent
 
-def build_common_agent(streaming: bool = False):
-    """
-    负责其他一般性回答
-    """
-    model = os.getenv('COMMON_MODEL')
-    if not model:
-        agent = get_llm(streaming=streaming)
-    else:
-        agent = get_llm(model=model, streaming=streaming)
-    return agent
 
-def build_image_geng_agent() -> CompiledStateGraph[GraphState] | None:
-    """
-    负责根据用户输入，生成图片
-    :return:
-    """
 
-    model = os.getenv('IMAGE_GENE_MODEL')
 
-    if not model:
-        agent = get_llm()
-    else:
-        agent = get_llm(model=model)
 
-    return agent
+
