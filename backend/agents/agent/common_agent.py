@@ -5,6 +5,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
 from dotenv import load_dotenv
+
+from backend.core.single_tool import singleton_method
+
 load_dotenv()
 
 COMMON_PROMPT = ChatPromptTemplate.from_messages([
@@ -17,6 +20,7 @@ COMMON_PROMPT = ChatPromptTemplate.from_messages([
     ("user", "{input}")  # 使用"user"角色而不是"human"
 ])
 
+@singleton_method
 def build_common_agent(streaming: bool = False) -> CompiledStateGraph[GraphState] | None:
     """
     负责其他一般性回答
@@ -28,6 +32,7 @@ def build_common_agent(streaming: bool = False) -> CompiledStateGraph[GraphState
         agent = get_llm(model=model, streaming=streaming)
     return agent
 
+@singleton_method
 def common_node(state: GraphState) -> GraphState:
     """
     负责其他一般性回答

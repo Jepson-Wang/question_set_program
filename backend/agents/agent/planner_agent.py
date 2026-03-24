@@ -6,6 +6,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
 from dotenv import load_dotenv
+
+from backend.core.single_tool import singleton_method
+
 load_dotenv()
 
 PLANNER_PROMPT = ChatPromptTemplate.from_messages([
@@ -27,6 +30,7 @@ PLANNER_PROMPT = ChatPromptTemplate.from_messages([
     ("user", "{input}")
 ])
 
+@singleton_method
 def build_planner_agent() -> CompiledStateGraph[GraphState] | None:
     """
     负责任务规划和调度的智能体
@@ -42,6 +46,7 @@ def build_planner_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
+@singleton_method
 def planner_node(state: GraphState) -> GraphState:
     """
     负责任务规划和调度

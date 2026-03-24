@@ -5,7 +5,10 @@ from backend.agents.agent.tools import GraphState, extract_text_from_response, g
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
+from backend.core.single_tool import singleton_method
+
 from dotenv import load_dotenv
+
 load_dotenv()
 
 EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
@@ -23,6 +26,7 @@ EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
     ("user", "{input}")  # 使用"user"角色而不是"human"
 ])
 
+@singleton_method
 def build_extract_agent() -> CompiledStateGraph[GraphState] | None:
     """
     负责任务分析和解释的智能体
@@ -38,6 +42,7 @@ def build_extract_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
+@singleton_method
 def extract_node(state: GraphState) -> GraphState:
     """
     负责提取请求中知识点和难度

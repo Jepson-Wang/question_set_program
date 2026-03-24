@@ -6,6 +6,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
 from dotenv import load_dotenv
+
+from backend.core.single_tool import singleton_method
+
 load_dotenv()
 
 QUESTION_SET_PROMPT = ChatPromptTemplate.from_messages([
@@ -33,6 +36,7 @@ QUESTION_SET_PROMPT = ChatPromptTemplate.from_messages([
     ("user", "{input}")  # 使用"user"角色而不是"human"
 ])
 
+@singleton_method
 def build_question_set_agent(streaming: bool = False) -> CompiledStateGraph[GraphState] | None:
     """
     负责根据提取到的知识点和难度，生成题目
@@ -44,6 +48,7 @@ def build_question_set_agent(streaming: bool = False) -> CompiledStateGraph[Grap
         agent = get_llm(model=model, streaming=streaming)
     return agent
 
+@singleton_method
 def question_set_node(state: GraphState) -> GraphState:
     """
     负责根据提用户输入的题目和根据题目的知识点和难度，生成一个新题

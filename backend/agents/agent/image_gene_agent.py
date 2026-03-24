@@ -6,6 +6,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
 from dotenv import load_dotenv
+
+from backend.core.single_tool import singleton_method
+
 load_dotenv()
 
 IMAGE_GENE_PROMPT = ChatPromptTemplate.from_messages([
@@ -29,6 +32,7 @@ IMAGE_GENE_PROMPT = ChatPromptTemplate.from_messages([
     ("user", "{input}")  # 使用"user"角色而不是"human"
 ])
 
+@singleton_method
 def build_image_geng_agent() -> CompiledStateGraph[GraphState] | None:
     """
     负责根据用户输入，生成图片

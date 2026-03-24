@@ -6,6 +6,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
 from dotenv import load_dotenv
+
+from backend.core.single_tool import singleton_method
+
 load_dotenv()
 
 ANALYSE_PROMPT = ChatPromptTemplate.from_messages([
@@ -26,6 +29,7 @@ ANALYSE_PROMPT = ChatPromptTemplate.from_messages([
     ("user", "{input}")  # 使用"user"角色而不是"human"
 ])
 
+@singleton_method
 def build_analyse_agent() -> CompiledStateGraph[GraphState] | None:
     """
     负责审核生成的题目
@@ -41,6 +45,7 @@ def build_analyse_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
+@singleton_method
 def analyse_node(state: GraphState) -> GraphState:
     """
     负责审核生成的题目
