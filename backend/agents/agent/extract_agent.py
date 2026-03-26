@@ -42,7 +42,6 @@ def build_extract_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
-@singleton_method
 def extract_node(state: GraphState) -> GraphState:
     """
     负责提取请求中知识点和难度

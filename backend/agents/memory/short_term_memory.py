@@ -25,19 +25,21 @@
 5. 备份和恢复机制
 """
 import json
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 from datetime import datetime
 
 from backend.utils.redis_client import get_redis_client
+from redis.exceptions import AuthenticationError
 
 class MemoryUnit(dict):
     def __init__(self, user_memory: str = "", model_memory: str = ""):
+        # 注意：这里不要使用 typing.Dict（不可实例化），而要用普通 dict。
         super().__init__(
-            memory = Dict(
-                user_memory=user_memory,
-                model_memory=model_memory,
-            ),
-            timestamp=datetime.now().isoformat()
+            memory={
+                "user_memory": user_memory,
+                "model_memory": model_memory,
+            },
+            timestamp=datetime.now().isoformat(),
         )
 
 
@@ -53,7 +55,7 @@ class ShortTermMemory:
         self.max_memory_size = max_memory_size
         self._redis_client = get_redis_client()
 
-    async def add_memory(self, user_id: int, session_id: str, memory: MemoryUnit):
+    async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit):
         """添加新记忆（自动删除超出长度的最早记忆）"""
         # 构建Redis键
         redis_key = f"user:{user_id}:session:{session_id}"
@@ -84,14 +86,18 @@ class ShortTermMemory:
         # 设置过期时间（24小时）
         await self._redis_client.client.expire(redis_key, 86400) #存入redis一天
 
-    async def get_latest_memories(self, user_id: int, session_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    async def get_latest_memories(self, user_id: int, session_id: int, limit: int = 5) -> List[Dict[str, Any]]:
         """获取最新N条记忆"""
         
         # 构建Redis键
         redis_key = f"user:{user_id}:session:{session_id}"
         
         # 获取记忆列表
-        memory_list_str = await self._redis_client.client.hget(redis_key, "memory_list")
+        try:
+            memory_list_str = await self._redis_client.client.hget(redis_key, "memory_list")
+        except AuthenticationError:
+            # Redis 未配置密码/密码错误时，不让整个接口失败（直接返回空记忆）
+            return []
         if not memory_list_str:
             return []
         
@@ -99,7 +105,7 @@ class ShortTermMemory:
         # 返回最新的limit条
         return memory_list[:limit]
 
-    async def remove_oldest_memory(self, user_id: int, session_id: str) -> Dict[str, Any] | None:
+    async def remove_oldest_memory(self, user_id: int, session_id: int) -> Dict[str, Any] | None:
         """删除最早的1条记忆"""
         
         # 构建Redis键
@@ -128,7 +134,7 @@ class ShortTermMemory:
         
         return oldest_memory
 
-    async def clear_all(self, user_id: int, session_id: str):
+    async def clear_all(self, user_id: int, session_id: int):
         """清空所有记忆"""
         
         # 构建Redis键
@@ -136,7 +142,7 @@ class ShortTermMemory:
         # 删除Redis键
         await self._redis_client.client.delete(redis_key)
 
-    async def get_memory_size(self, user_id: int, session_id: str) -> int:
+    async def get_memory_size(self, user_id: int, session_id: int) -> int:
         """获取当前记忆条数"""
         
         # 构建Redis键
@@ -152,6 +158,34 @@ class ShortTermMemory:
 
     async def get_max_memory_size(self) -> int:
         return self.max_memory_size
+
+    async def delete_max_memory(self, user_id: int, session_id: int,size:int):
+        """删除超出最大记忆条数的最早记忆"""
+        # 构建Redis键
+        redis_key = f"user:{user_id}:session:{session_id}"
+        # 获取记忆列表
+        memory_list_str = await self._redis_client.client.hget(redis_key, "memory_list")
+        if not memory_list_str:
+            return None
+
+        memory_list = json.loads(memory_list_str)
+        if len(memory_list) <= size:
+            return None
+
+        # 移除最早的记忆（列表末尾）
+        for _ in range(size):
+            memory_list.pop()
+
+        # 更新Redis
+        await self._redis_client.client.hset(
+            redis_key,
+            mapping={
+                "memory_list": json.dumps(memory_list),
+                "last_updated": datetime.now().isoformat()
+            }
+        )
+
+        return memory_list
 
 async def get_short_term_memory() -> ShortTermMemory:
     """

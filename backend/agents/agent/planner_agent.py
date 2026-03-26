@@ -11,20 +11,40 @@ from backend.core.single_tool import singleton_method
 
 load_dotenv()
 
+# PLANNER_PROMPT = ChatPromptTemplate.from_messages([
+#     ("system", """你是一个任务规划助手，负责根据用户请求规划和调度以下智能体
+#             -extract : 提取请求中所给题目的难度，知识点,并最终生成题目
+#             -common : 比如不是生成题目，而是解释知识点，解答这道题等。
+#         约束规则:
+#         1. 你将在上面的智能体中选择一个，根据用户请求进行调度，默认调用为extract。
+#         2. 你只能选择一个智能体进行调用。
+#         3. 需要根据用户请求，判断是提取知识点还是生成题目。
+#         4. 如果用户输入中含有“提取知识点”、“生成题目”、“提取分析”等关键词，调用extract智能体。
+#         5. 若用户请求中包含解释知识点，或者解答这个题目，再调用common智能体。
+#         最终目的:生成一个符合要求的题目
+#         输出格式示例:
+#         {{
+#             "route": "extract",
+#         }}
+#         """),
+#     ("user", "{input}")
+# ])
+
 PLANNER_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是一个任务规划助手，负责根据用户请求规划和调度以下智能体
-            -extract : 提取请求中所给题目的难度，知识点,并最终生成题目
-            -common : 其他情况，比如不是生成题目，而是其他问题，比如解释知识点，或者其他问题。
-        约束规则:
-        1. 你将在上面的智能体中选择一个，根据用户请求进行调度。
-        2. 你只能选择一个智能体进行调用。
-        3. 需要根据用户请求，判断是提取知识点还是生成题目。
-        4. 默认调用为extract
-        5. 若用户请求中包含解释知识点，或者其他问题，再调用common智能体。
-        最终目的:生成一个符合要求的题目
-        输出格式示例:
+    ("system", """你是一个任务规划助手，严格根据用户请求调度以下两个智能体：
+        - extract：用于用户要求**生成题目、生成变式题、提取知识点、提取题目难度、提取题目分析**等场景
+        - common：用于用户要求**解释知识点、解答题目、给出答案、题目解析、讲解思路**等场景
+        
+        约束规则：
+        1. 必须且只能选择一个智能体返回
+        2. 只要用户输入包含【生成题目、生成变式题】，一律路由 extract
+        3. 只要用户输入是【解释、解答、答案、解析、讲解、说明，、提取知识点、提取难度、提取分析】知识点/题目，一律路由 common
+        4. 默认路由：extract
+        5. 禁止添加任何解释、文字、标点，只输出指定格式
+        
+        输出格式（严格JSON）：
         {{
-            "route": "extract",
+            "route": "extract" 或 "common"
         }}
         """),
     ("user", "{input}")
@@ -46,7 +66,6 @@ def build_planner_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
-@singleton_method
 def planner_node(state: GraphState) -> GraphState:
     """
     负责任务规划和调度

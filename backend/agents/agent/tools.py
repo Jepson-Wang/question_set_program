@@ -1,5 +1,5 @@
 import os
-from typing import TypedDict, Literal
+from typing import TypedDict, Literal, Any
 
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage
@@ -39,12 +39,14 @@ def extract_text_from_response(response) -> str:
 class GraphState(TypedDict):
     """多智能体工作流的状态定义"""
 
-    input: str
+    input: dict[str,Any] = {
+        "input": str,
+        "memory": dict[str,list[dict[str,Any]]]
+    }
     user_id : int
     session_id : int
     route: Literal['extract', 'question_set', 'analyse', 'common']
     extract: dict[str, str]
-    memory : dict[str,str]
     result: str
 
 

@@ -10,10 +10,6 @@ from backend.schemas.DTO.user_profile_update_DTO import UserProfileUpdateDTO
 from backend.schemas.VO.user_profile_VO import UserProfileVO
 from fastapi import Depends
 
-# 定义 AsyncSessionLocal 类型（方便类型提示）
-AsyncSessionLocal = async_sessionmaker[AsyncSession]
-
-
 class UserProfileMapper:
     def __init__(self, session_factory: AsyncSessionLocal):
         self.session_factory = session_factory  # 接收工厂，而非实例
@@ -77,7 +73,7 @@ class UserProfileMapper:
         :param user_id:
         :return:
         """
-        async with self.session_factory as session:
+        async with self.session_factory() as session:
             try:
                 user_profile = await self.get_by_user_id(user_id)
                 if user_profile:

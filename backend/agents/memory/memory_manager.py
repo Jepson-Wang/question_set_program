@@ -2,19 +2,26 @@
 后续还可添加功能
 将长期记忆存入RAG知识库中：根据用户输入的问题，整合RAG检索和长短期记忆，返回规划器需要的记忆
 """
+import time
+from typing import Any
 
+from backend.agents.agent.extract_memory_agent import get_extract_memory
 from backend.agents.memory.long_term_memory import LongTermMemory
 from backend.agents.memory.short_term_memory import ShortTermMemory, MemoryUnit
+from backend.agents.memory.vector_store_manager import VectorStoreManager
+from backend.core.single_tool import singleMeta
 
 
-class MemoryManager:
+class MemoryManager(metaclass=singleMeta):
     def __init__(self,
                  long_term_memory:LongTermMemory,
-                 short_term_memory:ShortTermMemory):
+                 short_term_memory:ShortTermMemory,
+                 vector_memory:VectorStoreManager):
         self.long_term_memory = long_term_memory
         self.short_term_memory = short_term_memory
+        self.vector_memory = vector_memory
 
-    async def get_memory_for_planner(self, user_id: int, session_id: str):
+    async def get_memory_for_planner(self, user_id: int, session_id: int) -> dict[str,list[dict[str,Any]]]:
         """获取规划器需要的记忆（短期+长期）"""
         short_memory = await self.short_term_memory.get_latest_memories(user_id, session_id)
         long_memory = await self.long_term_memory.get_by_user_id(user_id)
@@ -23,7 +30,7 @@ class MemoryManager:
             "long_memory": long_memory
         }
 
-    async def update_memory(self, user_id: int, session_id: str, memory: MemoryUnit):
+    async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit):
         """
         对短期记忆进行修改操作，并检查记忆是否已满
         如果已满，则进行记忆的删除，同时将修改后的记忆添加到长期记忆中
@@ -37,6 +44,12 @@ class MemoryManager:
             # 检查记忆是否已满
             memory_size = await self.short_term_memory.get_memory_size(user_id, session_id)
             max_memory_size = await self.short_term_memory.get_max_memory_size()
+            metadata = {
+                'user_id' : user_id,
+                'session_id' : session_id,
+                'timestamp' : int(time.time()),
+                'tags' : []
+            }
             if memory_size < max_memory_size:
                 # 添加到短期记忆
                 await self.short_term_memory.add_memory(user_id, session_id, memory)
@@ -48,9 +61,25 @@ class MemoryManager:
                 3.将这段记忆切分后返回给RAG知识库（还未开发）
                 4.然后进行短期记忆的删除操作
                 """
-                memories = await self.short_term_memory.get_latest_memories(user_id, session_id,memory_size)[-(memory_size-max_memory_size):]
-
-
+                #1. 获取超过max_size的那几条记录
+                delete_size : int = memory_size-max_memory_size
+                memories = await self.short_term_memory.get_latest_memories(user_id, session_id,delete_size)
+                #2. 通过大模型进行提取
+                extracted_memory = await get_extract_memory(memories)
+                #3. 将提取后的记忆返回给RAG向量库
+                for index, memory_dict in enumerate(extracted_memory):
+                    metadata['tags'].append(memory_dict['tags'])
+                    result = await self.vector_memory.add_document([memory_dict['memory']], metadata)
+                    if not result:
+                        time.sleep(0.5)
+                        result = await self.vector_memory.add_document([memory_dict['memory']], metadata)
+                        if not result:
+                            print(f'添加第{index}条记忆到向量数据库失败')
+                            continue
+                #4. 删除短期记忆
+                await self.short_term_memory.delete_max_memory(user_id, session_id,delete_size)
         except Exception as e:
-            print(f"更新记忆时出错: {e}")
-            raise
+            print(f"更新记忆失败：{e}")
+
+
+    #TODO 完成记忆模块的clear功能

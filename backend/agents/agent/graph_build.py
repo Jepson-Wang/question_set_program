@@ -7,14 +7,20 @@ from backend.agents.agent.analyse_agent import analyse_node
 from backend.agents.agent.common_agent import common_node, async_common_node
 from backend.agents.agent.question_set_agent import question_set_node, async_question_set_node
 
-def build_graph() -> CompiledStateGraph[GraphState]:
+
+
+
+
+
+def build_graph(user_id: int, session_id :int) -> CompiledStateGraph[GraphState]:
     """
     负责构建工作流
     :return:
     """
-
-
     graph = StateGraph(GraphState) #type:ignore
+    # 注意：这里的 `graph` 是 LangGraph 的构建器（StateGraph），
+    # 不是可写的状态 dict；真实的初始 state 应当在 `agent.invoke(state)` 时传入（见 api 层）。
+
     #添加节点
     graph.add_node("planner", planner_node) #type:ignore
     graph.add_node("extract", extract_node) #type:ignore

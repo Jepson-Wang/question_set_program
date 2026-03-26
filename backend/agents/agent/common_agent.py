@@ -11,13 +11,13 @@ from backend.core.single_tool import singleton_method
 load_dotenv()
 
 COMMON_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是一个回答通用问题的助手，负责回答解题步骤，解题思路，解题方法等
-            根据用户的输入，选择性的回答以下问题：
-            1. 回答这个题的解题步骤，解题思路，解题方法等
-            2. 回答这个题的相关问题，如这个题的难度，涉及的知识点等
-            3. 回答用户的其他问题
-            """),
-    ("user", "{input}")  # 使用"user"角色而不是"human"
+    ("system", """你是专业教育解题助手，负责：
+        - 提供解题步骤、思路、方法、答案
+        - 解释知识点、难度、考点、易错点
+        - 解答题目相关疑问
+        - 回答应该简练，避免使用复杂的词汇
+        - 回答清晰易懂，不生成新题目。"""),
+    ("user", "{input}")
 ])
 
 @singleton_method
@@ -32,7 +32,6 @@ def build_common_agent(streaming: bool = False) -> CompiledStateGraph[GraphState
         agent = get_llm(model=model, streaming=streaming)
     return agent
 
-@singleton_method
 def common_node(state: GraphState) -> GraphState:
     """
     负责其他一般性回答
@@ -46,7 +45,9 @@ def common_node(state: GraphState) -> GraphState:
     # 进行大模型调用相关操作
     common_agent = build_common_agent()
     common_chain = COMMON_PROMPT | common_agent
-    response = common_agent.invoke({'input': user_input})
+    # 注意：这里必须调用 prompt-chain，而不是直接调用 llm
+    # 否则会把 {'input': ...} 作为无效输入类型传给 ChatOpenAI
+    response = common_chain.invoke({'input': user_input})
     # 将回答返回给state,并追加到result
     response_text = extract_text_from_response(response)
     state['result'] = state['result'] + '\n' + response_text

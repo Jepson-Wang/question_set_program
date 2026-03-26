@@ -45,7 +45,6 @@ def build_analyse_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
-@singleton_method
 def analyse_node(state: GraphState) -> GraphState:
     """
     负责审核生成的题目
