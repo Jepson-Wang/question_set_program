@@ -1,8 +1,15 @@
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import declarative_base, sessionmaker
+import os
 
-# 数据库连接地址：mysql+asyncmy://用户名:密码@主机:端口/库名
-SQLALCHEMY_DATABASE_URL = "mysql+asyncmy://root:123456@localhost:3306/question_set"
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+
+from dotenv import load_dotenv
+from sqlalchemy.orm.decl_api import declarative_base
+
+load_dotenv()
+
+url = os.getenv("SQL_DATABASE_URL")
+
+SQLALCHEMY_DATABASE_URL = url
 
 # 创建异步引擎（管理连接池）
 engine = create_async_engine(
@@ -13,7 +20,7 @@ engine = create_async_engine(
 )
 
 # 异步会话工厂
-AsyncSessionLocal = sessionmaker(
+AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
     expire_on_commit=False,  # 提交后不失效 ORM 对象
@@ -25,7 +32,7 @@ AsyncSessionLocal = sessionmaker(
 Base = declarative_base()
 
 # 依赖函数：获取异步数据库会话（自动开闭连接）
-async def get_db() -> AsyncSession:
+async def get_db() -> AsyncSessionLocal:
     async with AsyncSessionLocal() as session:
         try:
             yield session
