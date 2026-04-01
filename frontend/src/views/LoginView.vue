@@ -73,11 +73,13 @@ const loginForm = reactive({
 // 表单校验规则
 const rules = {
   username: [
-    { required: true, message: '请输入用户名', trigger: 'blur' }
+    { required: true, message: '请输入用户名', trigger: 'blur' },
+    { pattern: /^[^\s]*$/, message: '用户名不能包含空格', trigger: 'blur' }
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 6, message: '密码长度不能少于 6 位', trigger: 'blur' }
+    { min: 6,max:14, message: '6-14个字符', trigger: 'blur' },
+    { pattern: /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{6,14}$/, message: '密码必须包含字母和数字', trigger: 'blur' }
   ]
 }
 
@@ -85,7 +87,11 @@ const rules = {
 const handleLogin = async () => {
   try {
     // 先做表单校验
-    await formRef.value.validate()
+    await formRef.value.validate((valid)=>{
+      if (valid){
+        //执行登录逻辑
+      }
+    })
 
     // 调用登录接口
     const res = await loginApi({
