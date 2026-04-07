@@ -34,6 +34,11 @@
           />
         </el-form-item>
 
+        <el-form-item label-width="22px" prop="agree">
+        <el-checkbox size="large" v-model="loginForm.agree">
+                  我已同意隐私条款和服务条款
+        </el-checkbox>
+        </el-form-item>
         <el-form-item>
           <el-button
             type="primary"
@@ -67,7 +72,8 @@ const formRef = ref()
 // 登录表单数据
 const loginForm = reactive({
   username: '',
-  password: ''
+  password: '',
+  agree: ''
 })
 
 // 表单校验规则
