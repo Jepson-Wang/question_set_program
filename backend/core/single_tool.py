@@ -34,26 +34,50 @@ class singleMeta(type):
 
 class _LRUTTLCache:
     """
-    LRU + TTL 双策略缓存。
-    - maxsize：最多缓存 maxsize 个不同参数的结果，超出时淘汰最久未用的
-    - ttl：单个缓存项超过 ttl 秒未被访问则视为过期，下次访问时惰性删除
+    LRU + TTL 双策略缓存，混合两种清理机制：
+    - 惰性删除：get() 发现过期项时立即删除
+    - 后台定期扫描：每隔 cleanup_interval 秒（默认 ttl/2）由守护线程扫描全表，
+      删除所有已过期但从未被 get() 触及的条目
+
+    - maxsize：最多缓存 maxsize 个不同参数组合，超出时淘汰最久未用的（LRU）
+    - ttl：超过 ttl 秒未被访问的条目视为过期
+    - cleanup_interval：后台扫描间隔，None 表示使用 ttl/2
     """
 
-    def __init__(self, maxsize: int = 32, ttl: float = 3600.0):
+    def __init__(self, maxsize: int = 32, ttl: float = 3600.0,
+                 cleanup_interval: float = None):
         self.maxsize = maxsize
         self.ttl = ttl
+        self.cleanup_interval = cleanup_interval if cleanup_interval is not None else ttl / 2
         # OrderedDict 维护 LRU 顺序：key -> (value, last_access_timestamp)
         self._cache: OrderedDict = OrderedDict()
         self._lock = threading.Lock()
 
+        # 启动后台守护线程，进程退出时自动终止
+        self._stop_event = threading.Event()
+        self._cleaner = threading.Thread(target=self._background_cleanup, daemon=True)
+        self._cleaner.start()
+
+    def _background_cleanup(self):
+        """守护线程：每隔 cleanup_interval 秒扫描全表，删除所有过期条目。"""
+        while not self._stop_event.wait(self.cleanup_interval):
+            now = time.monotonic()
+            with self._lock:
+                expired_keys = [
+                    k for k, (_, last_access) in self._cache.items()
+                    if now - last_access > self.ttl
+                ]
+                for k in expired_keys:
+                    del self._cache[k]
+
     def get(self, key):
-        """返回 (value, hit)。过期 key 会被惰性删除。"""
+        """返回 (value, hit)。命中过期项时立即惰性删除。"""
         with self._lock:
             if key not in self._cache:
                 return None, False
             value, last_access = self._cache[key]
             if time.monotonic() - last_access > self.ttl:
-                # TTL 过期，惰性删除
+                # 惰性删除：该 key 已过期
                 del self._cache[key]
                 return None, False
             # 命中：移到末尾（最近使用）并刷新时间戳
