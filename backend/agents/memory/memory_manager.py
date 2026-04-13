@@ -2,7 +2,7 @@
 后续还可添加功能
 将长期记忆存入RAG知识库中：根据用户输入的问题，整合RAG检索和长短期记忆，返回规划器需要的记忆
 """
-import time
+import asyncio
 from typing import Any
 
 from backend.agents.agent.extract_memory_agent import get_extract_memory
@@ -44,40 +44,49 @@ class MemoryManager(metaclass=singleMeta):
             # 检查记忆是否已满
             memory_size = await self.short_term_memory.get_memory_size(user_id, session_id)
             max_memory_size = await self.short_term_memory.get_max_memory_size()
-            metadata = {
-                'user_id' : user_id,
-                'session_id' : session_id,
-                'timestamp' : int(time.time()),
-                'tags' : []
-            }
+
             if memory_size < max_memory_size:
-                # 添加到短期记忆
+                # 未满，直接添加
                 await self.short_term_memory.add_memory(user_id, session_id, memory)
             else:
                 """
                 步骤：
-                1.调用方法get_latest_memories获取超过max_size的那几个记忆
-                2.将这几个记忆先通过大模型进行提取，并添加到长期记忆中
-                3.将这段记忆切分后返回给RAG知识库（还未开发）
-                4.然后进行短期记忆的删除操作
+                1. 取出最旧的 1 条记忆（列表尾部）准备归档
+                2. 通过大模型提取后存入向量库
+                3. 删除最旧的 1 条短期记忆
+                4. 将新记忆添加到短期记忆
                 """
-                #1. 获取超过max_size的那几条记录
-                delete_size : int = memory_size-max_memory_size
-                memories = await self.short_term_memory.get_latest_memories(user_id, session_id,delete_size)
-                #2. 通过大模型进行提取
-                extracted_memory = await get_extract_memory(memories)
-                #3. 将提取后的记忆返回给RAG向量库
+                import time as _time
+                delete_size = 1  # 每次淘汰最旧的 1 条为新记忆腾位
+                metadata = {
+                    'user_id': user_id,
+                    'session_id': session_id,
+                    'timestamp': int(_time.time()),
+                    'tags': []
+                }
+
+                # 1. 获取全量记忆，从尾部取最旧的 delete_size 条
+                all_memories = await self.short_term_memory.get_latest_memories(user_id, session_id, memory_size)
+                memories_to_archive = all_memories[-delete_size:]
+
+                # 2. 通过大模型提取后存入向量库
+                extracted_memory = await get_extract_memory(memories_to_archive)
                 for index, memory_dict in enumerate(extracted_memory):
                     metadata['tags'].append(memory_dict['tags'])
-                    result = await self.vector_memory.add_document([memory_dict['memory']], metadata)
+                    result = await self.vector_memory.add_document(memory_dict['memory'], metadata)
                     if not result:
-                        time.sleep(0.5)
-                        result = await self.vector_memory.add_document([memory_dict['memory']], metadata)
+                        await asyncio.sleep(0.5)
+                        result = await self.vector_memory.add_document(memory_dict['memory'], metadata)
                         if not result:
                             print(f'添加第{index}条记忆到向量数据库失败')
                             continue
-                #4. 删除短期记忆
-                await self.short_term_memory.delete_max_memory(user_id, session_id,delete_size)
+
+                # 3. 删除最旧的 delete_size 条短期记忆
+                await self.short_term_memory.delete_max_memory(user_id, session_id, delete_size)
+
+                # 4. 添加新记忆
+                await self.short_term_memory.add_memory(user_id, session_id, memory)
+
         except Exception as e:
             print(f"更新记忆失败：{e}")
 

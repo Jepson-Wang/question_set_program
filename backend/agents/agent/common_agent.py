@@ -1,8 +1,7 @@
 import os
 
-from backend.agents.agent.tools import GraphState, extract_text_from_response, get_llm
+from backend.agents.agent.get_llm import get_llm
 from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph.state import CompiledStateGraph
 
 from dotenv import load_dotenv
 
@@ -21,7 +20,7 @@ COMMON_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 @singleton_method
-def build_common_agent(streaming: bool = False) -> CompiledStateGraph[GraphState] | None:
+def build_common_agent(streaming: bool = False) :
     """
     负责其他一般性回答
     """
@@ -32,31 +31,26 @@ def build_common_agent(streaming: bool = False) -> CompiledStateGraph[GraphState
         agent = get_llm(model=model, streaming=streaming)
     return agent
 
-def common_node(state: GraphState) -> GraphState:
+def common_tool(text: str) -> str:
     """
     负责其他一般性回答
-    :param state:
+    :param text: 用户的查询内容
     :return:
     """
 
     print('正在初始化common_agent')
-    user_input = state['input']
 
     # 进行大模型调用相关操作
     common_agent = build_common_agent()
     common_chain = COMMON_PROMPT | common_agent
     # 注意：这里必须调用 prompt-chain，而不是直接调用 llm
     # 否则会把 {'input': ...} 作为无效输入类型传给 ChatOpenAI
-    response = common_chain.invoke({'input': user_input})
-    # 将回答返回给state,并追加到result
-    response_text = extract_text_from_response(response)
-    state['result'] = state['result'] + '\n' + response_text
-    return state
+    response = common_chain.invoke({'input': text})
+    # 将回答返回给用户
+    return response
 
-async def async_common_node(state: GraphState) -> GraphState:
-    user_input = state['input']
+async def async_common_tool(text: str) -> str:
     common_agent = build_common_agent(streaming=True)
     common_chain = COMMON_PROMPT | common_agent
-    response = await common_chain.ainvoke({'input': user_input})
-    state['result'] = extract_text_from_response(response)
-    return state
+    response = await common_chain.ainvoke({'input': text})
+    return response

@@ -1,7 +1,7 @@
 import json
 import os
 
-from backend.agents.agent.tools import GraphState, extract_text_from_response, get_llm
+from backend.agents.agent.tools import GraphState, get_llm
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
@@ -59,6 +59,6 @@ def analyse_node(state: GraphState) -> GraphState:
     analyse_agent = build_analyse_agent()
     response = analyse_agent.invoke({'input': result})
     # 将审核结果返回给state,并追加到result
-    response_text = extract_text_from_response(response)
+    response_text = response.content
     state['result'] = result + '\n' + response_text
     return state
