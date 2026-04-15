@@ -2,7 +2,7 @@ import asyncio
 import os
 from functools import partial
 
-from llama_index.core import VectorStoreIndex, StorageContext, Settings
+from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.schema import Document
 from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
 from llama_index.vector_stores.chroma import ChromaVectorStore
@@ -13,7 +13,7 @@ from backend.agents.agent.get_llm import get_embedding_model
 
 load_dotenv('.env')
 
-COLLECTION_NAME = os.getenv('CHROMA_COLLECTION', 'default_collection')
+COLLECTION_NAME = os.getenv('CHROMA_COLLECTION', 'vector_store_collection')
 PERSIST_DIR = os.getenv('CHROMA_PERSIST_DIR', './chroma_db')
 
 
@@ -24,9 +24,8 @@ class VectorStoreManager(metaclass=singleMeta):
     def __init__(self):
         os.makedirs(PERSIST_DIR, exist_ok=True)
 
-        # 配置 DashScope Embedding（通过 OpenAI 兼容接口）
-        embed_model = get_embedding_model()
-        Settings.embed_model = embed_model
+        # 显式持有 embedding 模型实例（DashScope 封装）
+        self.embed_model = get_embedding_model()
 
         # 初始化 Chroma 向量存储
         self.vector_store = ChromaVectorStore.from_params(
@@ -36,9 +35,11 @@ class VectorStoreManager(metaclass=singleMeta):
         self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
 
         # 缓存 index，整个生命周期复用，避免每次操作重建
+        # 显式绑定 embed_model，不依赖全局 Settings
         self._index = VectorStoreIndex.from_vector_store(
             self.vector_store,
-            storage_context=self.storage_context
+            storage_context=self.storage_context,
+            embed_model=self.embed_model,
         )
 
     async def add_document(self, text: str, metadata: dict = None) -> bool:
@@ -89,7 +90,8 @@ class VectorStoreManager(metaclass=singleMeta):
 
         query_engine = self._index.as_query_engine(
             similarity_top_k=top_k,
-            filters=filters
+            filters=filters,
+            embed_model=self.embed_model,
         )
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
