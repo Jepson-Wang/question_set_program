@@ -87,7 +87,7 @@ async def analyse(request: TextRequest, token: str = None, user: User = Depends(
         }
 
         app = get_app()
-        result = app.invoke(state)
+        result = await app.ainvoke(state)
 
         # 写入记忆：保存原始用户文本（不含历史上下文），避免记忆污染
         memory_unit = MemoryUnit(text, result.get('final_result', ''))
