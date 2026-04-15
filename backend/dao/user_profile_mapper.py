@@ -6,8 +6,8 @@ from backend.model import AsyncSessionLocal  # 导入会话工厂
 from backend.model.user_profile import UserProfile
 from typing import Optional, Dict, Any, List
 
-from backend.schemas.DTO.user_profile_update_DTO import UserProfileUpdateDTO
-from backend.schemas.VO.user_profile_VO import UserProfileVO
+from backend.schemas.request.user_profile_update_request import UserProfileUpdateRequest
+from backend.schemas.response.user_profile_response import UserProfileResponse
 from fastapi import Depends
 
 class UserProfileMapper:
@@ -34,7 +34,7 @@ class UserProfileMapper:
                 await session.rollback()
                 raise e
 
-    async def get_by_user_id(self, user_id: int) -> Optional[UserProfileVO]:
+    async def get_by_user_id(self, user_id: int) -> Optional[UserProfileResponse]:
         """根据用户ID获取画像"""
         async with self.session_factory() as session:
             stmt = select(UserProfile).where(UserProfile.user_id == user_id)
@@ -42,9 +42,9 @@ class UserProfileMapper:
             user_profile = result.scalar_one_or_none()
             if not user_profile:
                 return None
-            return UserProfileVO.model_validate(user_profile)
+            return UserProfileResponse.model_validate(user_profile)
 
-    async def update_user_profile(self, profile_dto: UserProfileUpdateDTO) -> Optional[UserProfileVO]:
+    async def update_user_profile(self, profile_dto: UserProfileUpdateRequest) -> Optional[UserProfileResponse]:
         """更新用户画像"""
         async with self.session_factory() as session:
             try:
@@ -62,25 +62,26 @@ class UserProfileMapper:
 
                 await session.commit()
                 await session.refresh(user_profile)
-                return UserProfileVO.model_validate(user_profile)
+                return UserProfileResponse.model_validate(user_profile)
             except SQLAlchemyError as e:
                 await session.rollback()
                 raise e
 
-    async def delete_memory(self , user_id: int) -> bool:
+    async def delete_memory(self, user_id: int) -> bool:
         """
-        删除用户画像
-        :param user_id:
-        :return:
+        删除用户画像。必须在同一个 session 内查询 ORM 对象再删除，
+        不能用 get_by_user_id 的返回值（那是 DTO，不是 ORM 实体）。
         """
         async with self.session_factory() as session:
             try:
-                user_profile = await self.get_by_user_id(user_id)
-                if user_profile:
-                    await session.delete(user_profile)
-                    await session.commit()
-                    return True
-                return False
+                stmt = select(UserProfile).where(UserProfile.user_id == user_id)
+                result = await session.execute(stmt)
+                user_profile = result.scalar_one_or_none()
+                if user_profile is None:
+                    return False
+                await session.delete(user_profile)
+                await session.commit()
+                return True
             except SQLAlchemyError as e:
                 await session.rollback()
                 raise e

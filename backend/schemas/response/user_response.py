@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 
-class UserResponseVO(BaseModel):
+
+class UserResponse(BaseModel):
     id: int
     username: str
     user_privilege: int

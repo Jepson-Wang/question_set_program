@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 
-class UserRequestDTO(BaseModel):
+
+class UserRequest(BaseModel):
     username: str
     password: str
-
