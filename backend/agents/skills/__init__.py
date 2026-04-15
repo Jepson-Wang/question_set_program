@@ -2,12 +2,18 @@ from backend.agents.skills.common_skill import CommonSKill
 from backend.agents.skills.extract_knowledge_skill import ExtractKnowledgeSkill
 from backend.agents.skills.query_memory_skill import QueryMemorySkill
 from backend.agents.skills.question_set_skill import QuestionSetSkill
+from backend.agents.skills.user_profile_save_skill import UserProfileSaveSkill
+from backend.agents.skills.user_profile_query_skill import UserProfileQuerySkill
+from backend.agents.skills.user_profile_delete_skill import UserProfileDeleteSkill
 
 SKILLS = [
     CommonSKill(),
     ExtractKnowledgeSkill(),
     QueryMemorySkill(),
     QuestionSetSkill(),
+    UserProfileSaveSkill(),
+    UserProfileQuerySkill(),
+    UserProfileDeleteSkill(),
 ]
 
 SKILL_MAP = {skill.name: skill for skill in SKILLS}
