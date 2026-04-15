@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from backend.schemas.token_schema import Token
-from backend.schemas.VO.user_response_VO import UserResponseVO
+from backend.schemas.response.user_response import UserResponse
 from backend.services.login_service.login_service import loginService
 
 login_router = APIRouter(prefix='/login', tags=['login'])
@@ -26,7 +26,7 @@ async def login_user(request: LoginRequest):
     return result
 
 
-@login_router.post('/register', response_model=UserResponseVO)
+@login_router.post('/register', response_model=UserResponse)
 async def register_user(request: LoginRequest):
     result = await login_service.register(request.username, request.password)
     if result.get("code") != 200:
