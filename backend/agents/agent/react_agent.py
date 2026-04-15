@@ -6,7 +6,7 @@
 3. 设定一个最大迭代轮次，超过之后，就只接关停
 """
 from backend.agents.agent.get_llm import get_llm
-from backend.agents.skills import SKILLS, SKILL_MAP
+from backend.agents.skills import SKILLS, SKILL_MAP, get_skill_prompt
 
 from langgraph.graph import StateGraph, END
 
@@ -62,52 +62,38 @@ state格式
 """
 
 
-REACT_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """# 角色设定
-你是一个遵循 ReAct (Reasoning and Acting) 范式的智能决策 Agent。你的任务是深度分析用户输入与当前上下文，通过严谨的「思考→行动」循环，精准决定是调用外部工具（Skills）还是直接输出最终回答。
+_REACT_SYSTEM_PROMPT = """# 角色
+你是 ReAct 决策 Agent：基于 `user_input` 和 `messages` 上下文，循环「思考→行动」，决定调用工具或直接回答。
 
-# 可用工具集 (Skills)
-你只能从以下列表中选择工具，严禁编造不存在的工具。如果任务超出工具能力且你无法解答，必须明确告知用户。
-1. **`question_set_skill`**: 专门用于生成题目、生成变式题。
-2. **`extract_skill`**: 专门用于从文本或题目中提取核心知识点。
-3. **`query_memory_skill`**: 专门用于查询用户的历史记忆或个性化数据。
-4. **`common_skill`**: 用于解析题目、分析题目、讲解答案、解释知识点、答疑解惑或处理其他通用类型问题。
+# 可用工具 (Skills)
+只能从下列工具中选择，禁止编造不存在的工具：
 
-# 执行规则与边界 (强制遵守)
-1. **按需调用，拒绝虚构**：所有业务级解答必须通过工具获取数据。禁止自行拼接编造业务逻辑。
-2. **单步执行，等待观察**：每一轮决策你只需给出当前的「思考」和「行动」。不要尝试在一次输出中模拟工具的返回结果，你必须输出调用指令并等待系统传入真实的 Observation（在 `messages` 中）。
-3. **全局上下文感知**：你的决策不应只看 `user_input`，必须综合分析 `messages` 中包含的前序工具返回结果（`content`）。
-4. **单一动作原则**：每次调用只能触发一个具体的 skill。
-5. **兜底策略**：如果现有工具和你的基础能力均无法完成任务，直接输出最终回答："我不能解答用户的问题"。
+""" + get_skill_prompt() + """
 
-# 状态与输出格式要求
-你必须且只能返回一段合法的 JSON 字符串，禁止包含任何 Markdown 代码块标记（如 ```json ）或其他多余解释。系统将根据你的 JSON 结构判断当前所处阶段：
+# 规则
+1. 业务问题必须通过工具获取数据，不得凭空编造。
+2. 每轮只输出一次「思考+行动」，不要模拟工具返回；真实 Observation 由系统写入 `messages`。
+3. 每次只调用一个 skill。
+4. 决策必须结合 `messages` 中前序工具的 `content`，而非只看 `user_input`。
+5. 若工具和自身能力均无法解答，`final_result` 填："我不能解答用户的问题"。
 
-**场景 A：需要调用工具获取信息（正在 ReAct 循环中）**
-- `action` 填入目标工具名称。
-- `action_args` 填入工具所需的参数。
-- `final_result` 必须为空字符串 `""`。
+# 输出格式
+只返回一段合法 JSON，禁止 Markdown 代码块或额外解释。
 
-**场景 B：信息已充足，无需调用工具（结束循环）**
-- `action` 必须为 `null`。
-- `action_args` 必须为空字典 `{{}}`。
-- `final_result` 填入整合后的最终回答（要求通俗易懂，直接响应用户原始需求）。
+- 需调工具：`action`=工具名，`action_args`=参数，`final_result`=`""`
+- 信息已充足：`action`=`null`，`action_args`=`{{}}`，`final_result`=通俗易懂的最终回答
 
-### 标准 JSON 输出结构：
+结构：
 {{
-    "thought": "你的思考过程：分析当前上下文信息是否充足？用户真实需求是什么？下一步需要调用工具还是直接回答？",
-    "action": "工具名称 或 null",
-    "action_args": {{
-        "参数名": "参数值"
-    }},
-    "final_result": "最终给用户的自然语言回答"
+    "thought": "分析上下文是否充足，确定下一步",
+    "action": "工具名 或 null",
+    "action_args": {{"参数名": "参数值"}},
+    "final_result": "最终回答"
 }}
+"""
 
-### 输入数据参考
-- `user_input`: 用户的原始需求。
-- `messages`: 包含前几轮交互的上下文。其中 `content` 是工具执行的真实返回结果，`tool_call_id` 是调用记录。
-        
-        """),
+REACT_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", _REACT_SYSTEM_PROMPT),
     ("user", "{input}")
 ])
 
@@ -148,7 +134,7 @@ def react_think_node(state: GraphState) -> dict:
 # ----------------------
 # 6. Skill 执行节点（手脚）
 # ----------------------
-def skill_exec_node(state: GraphState) -> dict:
+async def skill_exec_node(state: GraphState) -> dict:
     """执行LLM选择的Skill"""
     func_name = state['action']
     args = state['action_args']
@@ -158,10 +144,18 @@ def skill_exec_node(state: GraphState) -> dict:
         args['user_id'] = state['user_id']
         args['session_id'] = state['session_id']
 
-    # 所有 skill 统一通过 SKILL_MAP 查找，调用 _run()
+    # user_profile_*_skill 只需 user_id，由 state 注入
+    if func_name in (
+        "user_profile_save_skill",
+        "user_profile_query_skill",
+        "user_profile_delete_skill",
+    ):
+        args['user_id'] = state['user_id']
+
+    # 图节点本身在事件循环中运行，直接 await 异步实现，避免 _run 的 sync/async 桥接
     skill = SKILL_MAP.get(func_name)
     if skill:
-        res = skill._run(**args)
+        res = await skill._arun(**args)
     else:
         res = f"未知技能：{func_name}"
 
@@ -180,16 +174,11 @@ def skill_exec_node(state: GraphState) -> dict:
 def should_continue(state: GraphState) -> str:
     """
     自主决策：
-    - 还有工具要调用 → 回到执行节点
+    - 还有工具要调用且未超上限 → 回到执行节点
     - 没有 → 结束，回答用户
     """
     print('正在执行should_continue_node')
-    tool_call = state['action']
-    tool_args = state['action_args']
-    round = state['round']
-    round += 1
-    state['round'] = round
-    if tool_call and tool_args and round<=5:
+    if state['action'] != 'null' and state['round'] < 5:
         return "execute_skill"
     return END
 
