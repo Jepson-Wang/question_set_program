@@ -21,13 +21,13 @@ class MemoryManager(metaclass=singleMeta):
         self.short_term_memory = short_term_memory
         self.vector_memory = vector_memory
 
-    async def get_memory_for_planner(self, user_id: int, session_id: int) -> dict[str,list[dict[str,Any]]]:
-        """获取规划器需要的记忆（短期+长期）"""
+    async def get_memory_for_planner(self, user_id: int, session_id: int) -> dict[str, Any]:
+        """获取规划器需要的记忆（短期列表 + 单个长期画像）"""
         short_memory = await self.short_term_memory.get_latest_memories(user_id, session_id)
         long_memory = await self.long_term_memory.get_by_user_id(user_id)
         return {
-            "short_memory": short_memory,
-            "long_memory": long_memory
+            "short_memory": short_memory,  # list[dict]
+            "long_memory": long_memory,    # UserProfileResponse | None
         }
 
     async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit):
