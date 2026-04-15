@@ -59,16 +59,30 @@ class _LRUTTLCache:
         self._cleaner.start()
 
     def _background_cleanup(self):
-        """守护线程：每隔 cleanup_interval 秒扫描全表，删除所有过期条目。"""
+        """守护线程：每隔 cleanup_interval 秒扫描全表，删除所有过期条目。
+        三阶段持锁策略，将主线程阻塞时间压缩到 O(1) 每次删除：
+          阶段1 [持锁] 快照全表 items，微秒级后立即释放锁
+          阶段2 [无锁] 在快照上计算过期 key，主线程完全不受影响
+          阶段3 [逐个持锁] 每次持锁 O(1) 删一个 key，sleep(0) 主动让出 GIL
+        """
         while not self._stop_event.wait(self.cleanup_interval):
             now = time.monotonic()
+
+            # 阶段1：快照（持锁时间 = 一次 list() 拷贝，微秒级）
             with self._lock:
-                expired_keys = [
-                    k for k, (_, last_access) in self._cache.items()
-                    if now - last_access > self.ttl
-                ]
-                for k in expired_keys:
-                    del self._cache[k]
+                snapshot = list(self._cache.items())
+
+            # 阶段2：计算过期 key（无锁，主线程不受影响）
+            expired = [k for k, (_, ts) in snapshot if now - ts > self.ttl]
+
+            # 阶段3：逐个删除，每次持锁 O(1)
+            for k in expired:
+                with self._lock:
+                    entry = self._cache.get(k)
+                    # 二次检查：快照后该 key 可能被 get() 刷新了时间戳
+                    if entry and now - entry[1] > self.ttl:
+                        del self._cache[k]
+                time.sleep(0)  # 主动让出 GIL，给主线程机会运行
 
     def get(self, key):
         """返回 (value, hit)。命中过期项时立即惰性删除。"""
