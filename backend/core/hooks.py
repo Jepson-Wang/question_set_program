@@ -1,4 +1,5 @@
 from backend.model import engine, Base
+from backend.utils.redis_client import close_redis
 
 
 async def startup_event():
@@ -13,4 +14,5 @@ async def shutdown_event():
     """应用关闭时释放资源"""
     print("应用关闭中，正在释放数据库连接...")
     await engine.dispose()
+    await close_redis()
     print("数据库连接已释放")

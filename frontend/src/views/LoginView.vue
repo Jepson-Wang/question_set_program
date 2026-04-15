@@ -34,6 +34,11 @@
           />
         </el-form-item>
 
+        <el-form-item label-width="22px" prop="agree">
+        <el-checkbox size="large" v-model="loginForm.agree">
+                  我已同意隐私条款和服务条款
+        </el-checkbox>
+        </el-form-item>
         <el-form-item>
           <el-button
             type="primary"
@@ -58,16 +63,28 @@
 import { reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { loginApi } from '../api/auth'
-import { setToken, setTokenType } from '../utils/auth'
-
+import { setToken } from '../utils/auth'
+import { getUserLoginAPI } from '../api/user'
+//写死数据，一会去弄个user去注册页注册个
+const user = ref({
+  username:'admin',
+  password:123456
+})
+//调登录接口
+const getUserLogin = async()=>{
+  const res = await getUserLoginAPI()
+  const {username,password }= res.result.username
+  user.value.username = username,
+  user.value.password = password
+}
 const router = useRouter()
-const formRef = ref()
+const formRef = ref(null)
 
 // 登录表单数据
 const loginForm = reactive({
-  username: '',
-  password: ''
+  username: 'admin',
+  password: '12345',
+  agree: false
 })
 
 // 表单校验规则
@@ -78,54 +95,60 @@ const rules = {
   ],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
-    { min: 6,max:14, message: '6-14个字符', trigger: 'blur' },
-    { pattern: /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{6,14}$/, message: '密码必须包含字母和数字', trigger: 'blur' }
+    { min: 6, message: '密码长度不能少于 6 位', trigger: 'blur' }
+  ],
+  agree:[{
+        validator:(rule,value,callback)=>{
+      if(value){
+        callback()
+      }
+      else{
+       callback(new Error("请勾选隐私条款和服务条款"))
+      }
+    },
+        trigger: 'change'
+  }
+
   ]
+
 }
 
 // 点击登录
 const handleLogin = async () => {
   try {
-    // 先做表单校验
-    await formRef.value.validate((valid)=>{
-      if (valid){
-        //执行登录逻辑
-      }
-    })
-
-    // 调用登录接口
-    const res = await loginApi({
-      username: loginForm.username,
-      password: loginForm.password
-    })
-
-    console.log('登录返回结果：', res)
-
-    // 后端最新说会返回 access_token 和 token_type
-    const accessToken = res.access_token
-    const tokenType = res.token_type
-
-    // 登录成功
-    if (accessToken) {
-      // 保存 token
-      setToken(accessToken)
-
-      // 保存 token_type
-      setTokenType(tokenType)
-
-      ElMessage.success('登录成功')
-
-      // 跳转到聊天页
-      router.push('/chat')
-    } else {
-      ElMessage.error(res.msg || '登录失败')
+    // 先做表单校验，
+/*   校验通过：await 结束，继续执行下面的登录逻辑
+校验失败：validate() 抛异常，进入 catch 块 */
+    await formRef.value.validate()
+  if( loginForm.username === user.value.username &&loginForm.password ===user.value.password.toString()){
+          // 现在先临时模拟登录成功
+            setToken('mock-token')
+          //提示用户
+          ElMessage({ type: "success", message: "登录成功" });
+          // 跳转到聊天页
+          router.push('/chat')
+    }   
+    else{
+      ElMessage({  message: "检查账号或者密码" });
     }
-  } catch (error) {
-    console.log('登录请求失败：', error)
-    ElMessage.error('请求失败，请检查后端服务是否启动')
+  }catch (error) {
+    console.log('表单校验未通过', error)
   }
 }
-
+  // 一会长这样时代的
+/*   const doLogin = () => {
+  fromRef.value.validate(async (valid) => {
+    if (valid) {
+      //执行登录逻辑
+      await UserStore.getUserInfo(form.value);
+      //成功写的地方
+      //提示用户
+      ElMessage({ type: "success", message: "登录成功" });
+      //  跳转路由
+      router.replace("/");
+    }
+  });
+}; */
 // 去注册页
 const goRegister = () => {
   router.push('/register')
