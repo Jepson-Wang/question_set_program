@@ -17,8 +17,8 @@ class UserProfileSaveInput(BaseModel):
     preferences: Optional[dict] = Field(default=None, description="长期偏好，JSON 对象")
 
 
-class UserProfileSaveSkill(BaseTool):
-    name: str = "user_profile_save_skill"
+class UserProfileSaveTool(BaseTool):
+    name: str = "user_profile_save_tool"
     description: str = (
         "保存当前用户的长期画像：画像不存在则新建，已存在则按传入字段做局部更新。"
         "用户明确提到个人学情信息（年级/学科/薄弱知识点/长期偏好）时调用"

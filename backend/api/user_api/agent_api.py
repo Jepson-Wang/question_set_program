@@ -109,8 +109,8 @@ async def analyse(request: TextRequest, token: str = None, user: User = Depends(
 async def _stream_generator(text: str, user_id: int, session_id: int):
     """
     流式执行 ReAct 图，按 SSE 格式逐步推送：
-    - thinking：LLM 决定调用哪个 skill
-    - observation：skill 执行结果
+    - thinking：LLM 决定调用哪个 tool
+    - observation：tool 执行结果
     - result：最终回答
     """
     memory_data = await memory_manager.get_memory_for_planner(user_id, session_id)
@@ -157,9 +157,9 @@ async def _stream_generator(text: str, user_id: int, session_id: int):
                 payload = json.dumps({'type': 'result', 'content': fr}, ensure_ascii=False)
                 yield f"data: {payload}\n\n"
 
-        # execute_skill 节点更新：推送 skill 执行结果
-        elif 'execute_skill' in chunk:
-            update = chunk['execute_skill']
+        # execute_tool 节点更新：推送 tool 执行结果
+        elif 'execute_tool' in chunk:
+            update = chunk['execute_tool']
             messages = update.get('messages', [])
             if messages:
                 obs = messages[-1].content

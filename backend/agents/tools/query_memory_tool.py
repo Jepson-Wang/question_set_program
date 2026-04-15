@@ -11,8 +11,8 @@ class QueryMemoryInput(BaseModel):
     limit: int = Field(default=5, description="返回的记忆条数")
 
 
-class QueryMemorySkill(BaseTool):
-    name: str = "query_memory_skill"
+class QueryMemoryTool(BaseTool):
+    name: str = "query_memory_tool"
     description: str = "查询当前用户的历史对话记忆，用于了解用户过去的问题、偏好或上下文"
     args_schema: Type[BaseModel] = QueryMemoryInput
 

@@ -10,8 +10,8 @@ from pydantic import BaseModel,Field
 class QuestionSetInput(BaseModel):
     query: str = Field(description="用户的题目请求")
 
-class QuestionSetSkill(BaseTool):
-    name :str = "question_set_skill"
+class QuestionSetTool(BaseTool):
+    name :str = "question_set_tool"
     description :str = "根据已有的题目生成变式题"
     args_schema : Type[BaseModel] = QuestionSetInput
 
@@ -30,7 +30,7 @@ class QuestionSetSkill(BaseTool):
             return f"【题目生成】生成变式题失败：{str(e)}"
 
     async def _arun(self, query: str) -> str:
-        """执行题目生成技能"""
+        """执行题目生成工具"""
         try:
             extract = await async_extract_tool(query)
             new_input = {

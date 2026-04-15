@@ -7,9 +7,9 @@ from pydantic import BaseModel, Field
 class CommonInput(BaseModel):
     query : str = Field(description="用户的查询内容")
 
-class CommonSKill(BaseTool):
-    name :str = "common_skill"
-    description : str = "通用技能，处理基本的用户请求和信息查询，包括解题步骤、思路、方法、答案等"
+class CommonTool(BaseTool):
+    name :str = "common_tool"
+    description : str = "通用工具，处理基本的用户请求和信息查询，包括解题步骤、思路、方法、答案等"
     args_schema : Type[BaseModel] = CommonInput
 
     def _run(self, query: str) -> str:
@@ -17,7 +17,6 @@ class CommonSKill(BaseTool):
         return result
 
     async def _arun(self, query: str) -> str:
-        """执行通用技能"""
-        # 使用 common_agent 处理查询
+        """执行通用工具"""
         result = await async_common_tool(query)
         return result

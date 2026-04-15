@@ -13,8 +13,8 @@ class UserProfileDeleteInput(BaseModel):
     pass
 
 
-class UserProfileDeleteSkill(BaseTool):
-    name: str = "user_profile_delete_skill"
+class UserProfileDeleteTool(BaseTool):
+    name: str = "user_profile_delete_tool"
     description: str = "删除当前用户的长期画像。仅在用户明确要求清空个人资料时调用"
     args_schema: Type[BaseModel] = UserProfileDeleteInput
 

@@ -13,8 +13,8 @@ class UserProfileQueryInput(BaseModel):
     pass
 
 
-class UserProfileQuerySkill(BaseTool):
-    name: str = "user_profile_query_skill"
+class UserProfileQueryTool(BaseTool):
+    name: str = "user_profile_query_tool"
     description: str = (
         "查询当前用户的长期画像（年级、学科、薄弱知识点、长期偏好），用于个性化回答"
         "添加或更新用户画像前必须调用"
