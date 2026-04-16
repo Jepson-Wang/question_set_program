@@ -17,57 +17,70 @@
 """
 from datetime import datetime
 
-from backend.agents.memory.short_term_memory import ShortTermMemory, get_short_term_memory
-from backend.dao.user_profile_mapper import UserProfileMapper
-from backend.model.user_profile import UserProfile
-from backend.schemas.DTO.LTMRequestDTO import LTMRequestDTO
-from backend.schemas.DTO.user_profile_update_DTO import UserProfileUpdateDTO
-from backend.dao.user_profile_mapper import get_user_profile_mapper
 from fastapi import Depends
+
+from backend.agents.memory.short_term_memory import ShortTermMemory, get_short_term_memory
+from backend.dao.user_profile_mapper import UserProfileMapper, get_user_profile_mapper
+from backend.model.user_profile import UserProfile
+from backend.schemas.request.ltm_request import LTMRequest
+from backend.schemas.request.user_profile_update_request import UserProfileUpdateRequest
+from backend.schemas.response.user_profile_response import UserProfileResponse
+
 
 class LongTermMemory:
     def __init__(self,
-                 user_profile_mapper:UserProfileMapper,
-                 short_term_memory:ShortTermMemory):
+                 user_profile_mapper: UserProfileMapper,
+                 short_term_memory: ShortTermMemory):
         self.user_profile_mapper = user_profile_mapper
         self.short_term_memory = short_term_memory
 
-    async def add_or_update(self,request:LTMRequestDTO) -> None:
-        model = await self.user_profile_mapper.get_by_user_id(request.user_id)
-        user_profile = UserProfileUpdateDTO.model_validate(model)
-        if model is None:
-            user_profile = UserProfile(
+    async def add_or_update(self, request: LTMRequest) -> None:
+        """
+        若用户画像不存在则创建，存在则部分更新（只覆盖 request 中非 None 的字段）。
+        """
+        existing = await self.user_profile_mapper.get_by_user_id(request.user_id)
+
+        if existing is None:
+            # 新建：weak_points/preferences 是 NOT NULL 的 JSON 字段，用空 dict 兜底
+            new_profile = UserProfile(
                 user_id=request.user_id,
                 grade=request.grade or "",
-                subject=request.subject or "",
-                preferences=request.preferences or "",
-                weak_points=request.weak_points or [],
+                subject=request.subject or "数学",
+                preferences=request.preferences or {},
+                weak_points=request.weak_points or {},
                 create_time=datetime.now(),
-                update_time=datetime.now()
+                update_time=datetime.now(),
             )
-            await self.user_profile_mapper.create_memory(user_profile)
-        else:
-            user_profile.grade = request.grade or None
-            user_profile.subject = request.subject or None
-            user_profile.preferences = request.preferences or None
-            user_profile.weak_points = request.weak_points or None
-            user_profile.update_time = datetime.now()
-            await self.user_profile_mapper.update_user_profile(user_profile)
+            await self.user_profile_mapper.create_memory(new_profile)
+            return
 
-    async def get_by_user_id(self,user_id:int) -> UserProfile | None:
+        # 部分更新：只传入非 None 字段，mapper 内部通过 exclude_none 过滤
+        update_dto = UserProfileUpdateRequest(
+            user_id=request.user_id,
+            grade=request.grade,
+            subject=request.subject,
+            preferences=request.preferences,
+            weak_points=request.weak_points,
+            update_time=datetime.now(),
+        )
+        await self.user_profile_mapper.update_user_profile(update_dto)
+
+    async def get_by_user_id(self, user_id: int) -> UserProfileResponse | None:
         return await self.user_profile_mapper.get_by_user_id(user_id)
 
-    async def delete(self,user_id:int) -> None:
-        await self.user_profile_mapper.delete_memory(user_id)
+    async def delete(self, user_id: int) -> bool:
+        return await self.user_profile_mapper.delete_memory(user_id)
 
-    async def get_from_stm(self,user_id:int , session_id:str) -> list[str] | None:
-        memories = await self.short_term_memory.get_latest_memories(user_id,session_id=session_id,limit=5)
-        user_memory = list()
-        for memory in memories:
-            user_memory.append(memory["memory"]["user_memory"])
-        return user_memory
+    async def get_from_stm(self, user_id: int, session_id: int) -> list[str]:
+        """从短期记忆中提取用户发言列表，供画像生成使用。"""
+        memories = await self.short_term_memory.get_latest_memories(
+            user_id, session_id=session_id, limit=5
+        )
+        return [memory["memory"]["user_memory"] for memory in memories]
 
-async def get_long_term_memory(user_profile_mapper:UserProfileMapper = Depends(get_user_profile_mapper),
-                               short_term_memory:ShortTermMemory = Depends(get_short_term_memory)) -> LongTermMemory:
-        long_term_memory = LongTermMemory(user_profile_mapper,short_term_memory)
-        return long_term_memory
+
+async def get_long_term_memory(
+    user_profile_mapper: UserProfileMapper = Depends(get_user_profile_mapper),
+    short_term_memory: ShortTermMemory = Depends(get_short_term_memory),
+) -> LongTermMemory:
+    return LongTermMemory(user_profile_mapper, short_term_memory)

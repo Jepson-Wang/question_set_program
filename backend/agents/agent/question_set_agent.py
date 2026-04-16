@@ -1,7 +1,8 @@
 import json
 import os
 
-from backend.agents.agent.tools import GraphState, extract_text_from_response, get_llm
+from backend.agents.agent.tools import GraphState
+from backend.agents.agent.get_llm import get_llm
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
@@ -48,33 +49,64 @@ def build_question_set_agent(streaming: bool = False) -> CompiledStateGraph[Grap
         agent = get_llm(model=model, streaming=streaming)
     return agent
 
-def question_set_node(state: GraphState) -> GraphState:
+def question_set_tool(text:dict) -> dict:
     """
     负责根据提用户输入的题目和根据题目的知识点和难度，生成一个新题
     :param state:
     :return:
     """
 
-    print('正在初始化question_set_agent')
-    user_input = state['input']
-    extract_input = state['extract']
+    try:
+        #从text中获取到用户输入
+        user_input = text['input']
+        #从text中获取到难度要求
+        difficulty = text['extract']['difficulty']
+        #从text中获取到提取到的知识点
+        knowledge_points = text['extract']['knowledge_points']
 
-    # 进行大模型调用相关操作
-    question_set_agent = build_question_set_agent()
-    question_set_chain = QUESTION_SET_PROMPT | question_set_agent
-    # 构造更明确的输入提示
-    enhanced_input = f"请基于以下参考题目生成一道变式题：\n\n{user_input}\n\n知识点要求：{extract_input}"
-    response = question_set_chain.invoke({'input': enhanced_input})
-    # 将生成的题目返回给state
-    state['result'] = extract_text_from_response(response)
-    return state
+        # 进行大模型调用相关操作
+        question_set_agent = build_question_set_agent()
+        question_set_chain = QUESTION_SET_PROMPT | question_set_agent
+        # 构造更明确的输入提示
+        enhanced_input = f"""请基于以下参考题目生成一道变式题：{user_input}\n
+        知识点要求：{knowledge_points}\n
+        难度要求：{difficulty}"""
+        response = question_set_chain.invoke({'input': enhanced_input})
+        # 将生成的题目返回给state
+        result = {
+            'result': response.content,
+            'difficulty': difficulty,
+            'knowledge_points': knowledge_points,
+        }
+        return result
+    except Exception as e:
+        return {'error': str(e)}
 
-async def async_question_set_node(state: GraphState) -> GraphState:
-    user_input = state['input']
-    extract_input = state['extract']
-    question_set_agent = build_question_set_agent(streaming=True)
-    question_set_chain = QUESTION_SET_PROMPT | question_set_agent
-    enhanced_input = f"请基于以下参考题目生成一道变式题：\n\n{user_input}\n\n知识点要求：{extract_input}"
-    response = await question_set_chain.ainvoke({'input': enhanced_input})
-    state['result'] = extract_text_from_response(response)
-    return state
+async def async_question_set_tool(text: dict) -> dict:
+    try:
+        #从text中获取到用户输入
+        user_input = text['input']
+        #从text中获取到难度要求
+        difficulty = text['extract']['difficulty']
+        #从text中获取到提取到的知识点
+        knowledge_points = text['extract']['knowledge_points']
+        #构建生成题目的Agent
+        question_set_agent = build_question_set_agent(streaming=False)
+        question_set_chain = QUESTION_SET_PROMPT | question_set_agent
+        # 构造更明确的输入提示
+        enhanced_input = f"""请基于以下参考题目生成一道变式题：{user_input}\n
+        知识点要求：{knowledge_points}
+        难度要求：{difficulty}"""
+        # 进行大模型调用相关操作
+        response = await question_set_chain.ainvoke({'input': enhanced_input})
+        # 将生成的题目返回给text
+        result = {
+            'result': response.content,
+            'difficulty': difficulty,
+            'knowledge_points': knowledge_points,
+        }
+        return result
+    except Exception as e:
+        return {'error': str(e)}
+    
+    

@@ -1,7 +1,7 @@
 import json
 import os
 
-from backend.agents.agent.tools import GraphState, extract_text_from_response, get_llm
+from backend.agents.agent.tools import GraphState, get_llm
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 

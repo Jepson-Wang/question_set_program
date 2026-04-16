@@ -11,6 +11,21 @@ url = os.getenv("SQL_DATABASE_URL")
 
 SQLALCHEMY_DATABASE_URL = url
 
+if not SQLALCHEMY_DATABASE_URL:
+    raise RuntimeError(
+        f"SQL_DATABASE_URL is empty. Please check {str(_env_path)} (backend/.env)."
+    )
+
+# 兼容：如果配置了同步驱动 pymysql，但代码使用的是 create_async_engine，
+# 会导致 "asyncio extension requires an async driver to be used"。
+# 目前 requirements.txt 已安装 asyncmy，因此这里自动替换为 mysql+asyncmy。
+if SQLALCHEMY_DATABASE_URL and SQLALCHEMY_DATABASE_URL.startswith("mysql+pymysql://"):
+    SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace(
+        "mysql+pymysql://",
+        "mysql+asyncmy://",
+        1,
+    )
+
 # 创建异步引擎（管理连接池）
 engine = create_async_engine(
     SQLALCHEMY_DATABASE_URL,

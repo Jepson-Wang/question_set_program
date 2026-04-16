@@ -1,7 +1,8 @@
 import json
 import os
 
-from backend.agents.agent.tools import GraphState, extract_text_from_response, get_llm
+from backend.agents.agent.tools import GraphState
+from backend.agents.agent.get_llm import get_llm
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
@@ -42,22 +43,23 @@ def build_extract_agent() -> CompiledStateGraph[GraphState] | None:
 
     return agent
 
-def extract_node(state: GraphState) -> GraphState:
+def extract_tool(text: str) -> dict:
     """
     负责提取请求中知识点和难度
-    :param state:
+    :param text:
     :return:
     """
 
     print('正在初始化extract_agent')
-    system_input = state['input']
+    system_input = text
     # 调用用户请求进行提取操作
     extract_agent = build_extract_agent()
     extract_chain = EXTRACT_PROMPT | extract_agent
     response = extract_chain.invoke({'input': system_input})
     # 将提取到的知识点和难度返回给state
-    response_text = extract_text_from_response(response)
+    response_text = response.content
 
+    
     # 尝试解析 JSON 格式的响应
     try:
         # 尝试从文本中提取 JSON
@@ -66,29 +68,40 @@ def extract_node(state: GraphState) -> GraphState:
             json_end = response_text.rfind('}') + 1
             json_str = response_text[json_start:json_end]
             parsed = json.loads(json_str)
-            state['extract'] = parsed
+            extract = {
+                'knowledge_points': parsed.get('knowledge_points', []),
+                'difficulty': parsed.get('difficulty', '未知')
+            }
         elif isinstance(response, dict):
-            state['extract'] = response
+            extract = response
         else:
-            state['extract'] = {}
+            extract = {}
     except:
-        state['extract'] = {}
-    return state
+        extract = {}
+    return extract
 
-async def async_extract_node(state: GraphState) -> GraphState:
-    system_input = state['input']
+async def async_extract_tool(text : str) -> dict:
+    system_input = text
     extract_agent = build_extract_agent()
     extract_chain = EXTRACT_PROMPT | extract_agent
     response = await extract_chain.ainvoke({'input': system_input})
-    response_text = extract_text_from_response(response)
+    response_text = response.content
     try:
         if '{' in response_text and '}' in response_text:
             json_start = response_text.find('{')
             json_end = response_text.rfind('}') + 1
             parsed = json.loads(response_text[json_start:json_end])
-            state['extract'] = parsed
+            return {
+                'knowledge_points': parsed.get('knowledge_points', []),
+                'difficulty': parsed.get('difficulty', '未知')
+            }
         else:
-            state['extract'] = {}
+            return {
+                'knowledge_points': [],
+                'difficulty': '未知'
+            }
     except:
-        state['extract'] = {}
-    return state
+        return {
+            'knowledge_points': [],
+            'difficulty': '未知'
+        }
