@@ -8,6 +8,9 @@ from langgraph.graph.state import CompiledStateGraph
 from dotenv import load_dotenv
 
 from backend.core.single_tool import singleton_method
+from backend.middleware.logging import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
@@ -54,7 +57,7 @@ def planner_node(state: GraphState) -> GraphState:
     :return:
     """
 
-    print('正在初始化planner_agent')
+    logger.info("正在初始化planner_agent")
     user_input = state['input']
     planner_agent = build_planner_agent()
     planner_chain = PLANNER_PROMPT | planner_agent
@@ -82,7 +85,7 @@ def planner_node(state: GraphState) -> GraphState:
 
     state['route'] = route
 
-    print(route)
+    logger.debug("路由决策: %s", route)
 
     return state
 

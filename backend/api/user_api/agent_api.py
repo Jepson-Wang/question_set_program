@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
-import logging
 from typing import Optional
 
 from backend.agents.memory.long_term_memory import LongTermMemory
@@ -16,9 +15,6 @@ from backend.api.dependencies import get_current_user
 from backend.model.user import User
 from backend.agents.agent.tools import GraphState
 from backend.agents.agent.react_agent import get_app
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 class TextRequest(BaseModel):
@@ -162,8 +158,15 @@ async def _stream_generator(text: str, user_id: int, session_id: int):
             update = chunk['execute_tool']
             messages = update.get('messages', [])
             if messages:
-                obs = messages[-1].content
-                payload = json.dumps({'type': 'observation', 'content': obs}, ensure_ascii=False)
+                last_msg = messages[-1]
+                obs = last_msg.content
+                if last_msg.tool_call_id.startswith("load_skill_tool_"):
+                    payload = json.dumps(
+                        {'type': 'skill_loaded', 'content': obs},
+                        ensure_ascii=False
+                    )
+                else:
+                    payload = json.dumps({'type': 'observation', 'content': obs}, ensure_ascii=False)
                 yield f"data: {payload}\n\n"
 
     # 流结束后写入记忆

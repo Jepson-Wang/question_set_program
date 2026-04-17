@@ -7,6 +7,8 @@
 """
 from backend.agents.agent.get_llm import get_llm
 from backend.agents.tools import TOOLS, TOOL_MAP, get_tool_prompt
+from backend.agents.skills import get_skill_list_prompt
+from backend.middleware.logging import get_logger
 
 from langgraph.graph import StateGraph, END
 
@@ -17,49 +19,7 @@ from backend.agents.agent.tools import GraphState
 
 from langchain_core.prompts import ChatPromptTemplate
 
-
-"""
-大模型返回结果示例
-thought: 用户希望了解我的身份和功能，属于通用性介绍类问题，应调用 common_tool 进行解答。
-action: common_tool
-action_args: {
-    "user_query": "你好，介绍一下自己"
-}
-Observation: 等待工具返回结果
-"""
-
-"""1. ReAct Node接收state中的input
-2. 通过大模型返回结果
-3. 将结果进行处理，需要将结果存入state中，供大模型下一轮使用，但貌似ReAct调用的结果不需要放入，因为无关紧要
-4. 传给执行node，执行相关逻辑,并将结果存入state"""
-
-"""
-state格式
-{
-    'user_input' : str,
-
-    user_id : int,
-    session_id : int,
-
-    'thought' : str
-    'action' : str,
-    'action_args' : ,
-    'messages' : list[ToolMessage]，  #用于存前几轮的observation
-    'round' : int,
-
-    final_result : str
-}
-"""
-
-"""
-思考：
-1.  应该将state中的memory字段删除，转而append到observation中
-    原因： memory后续我要封装成一个tool，交给大模型自主决策
-
-2.  我的各个node应该更新state中的哪个字段：
-    react node，更新thought,action,action_args，round,final_result字段
-    tool node 更新messages字段
-"""
+logger = get_logger(__name__)
 
 
 _REACT_SYSTEM_PROMPT = """# 角色
@@ -70,18 +30,24 @@ _REACT_SYSTEM_PROMPT = """# 角色
 
 """ + get_tool_prompt() + """
 
+# 可用 Skill（能力包，按需加载）
+Skill 是存放在文件中的程序化剧本，不是可执行工具。当用户诉求命中某个 Skill 的触发词时，先用 `load_skill_tool` 加载对应 Skill 的剧本，再根据剧本指引决定下一步调哪个业务工具或直接作答。
+
+""" + get_skill_list_prompt() + """
+
 # 规则
 1. 业务问题必须通过工具获取数据，不得凭空编造。
 2. 每轮只输出一次「思考+行动」，不要模拟工具返回；真实 Observation 由系统写入 `messages`。
 3. 每次只调用一个 tool。
 4. 决策必须结合 `messages` 中前序工具的 `content`，而非只看 `user_input`。
-5. 若工具和自身能力均无法解答，`final_result` 填："我不能解答用户的问题"。
+5. 命中 Skill 触发词时，优先用 `load_skill_tool` 加载剧本，再进入业务工具调用。
+6. 若工具和自身能力均无法解答，`final_result` 填："我不能解答用户的问题"。
 
 # 输出格式
 只返回一段合法 JSON，禁止 Markdown 代码块或额外解释。
 
 - 需调工具：`action`=工具名，`action_args`=参数，`final_result`=`""`
-- 信息已充足：`action`=`null`，`action_args`=`{{}}`，`final_result`=通俗易懂的最终回答
+- 信息已充足：`action`=''，`action_args`=`{{}}`，`final_result`=通俗易懂的最终回答
 
 结构：
 {{
@@ -112,16 +78,13 @@ def react_think_node(state: GraphState) -> dict:
     response = json.loads(response_content)
 
     round = state['round'] + 1
-    print('轮次:',round)
-    print('输入:',llm_input)
-    print('思考结果:',response["thought"])
-    print('调用tool:',response["action"])
-    print('调用tool参数:',response["action_args"])
-    print('messages:',state['messages'])
-    print('最终回答final_result:',response["final_result"])
-    print('\n\n')
-
-    print()
+    logger.info("轮次: %s", round)
+    logger.debug("输入: %s", llm_input)
+    logger.debug("思考结果: %s", response["thought"])
+    logger.info("调用tool: %s", response["action"])
+    logger.debug("调用tool参数: %s", response["action_args"])
+    logger.debug("messages: %s", state['messages'])
+    logger.info("最终回答final_result: %s", response["final_result"])
 
     return {
         'thought' : response["thought"],
@@ -177,8 +140,8 @@ def should_continue(state: GraphState) -> str:
     - 还有工具要调用且未超上限 → 回到执行节点
     - 没有 → 结束，回答用户
     """
-    print('正在执行should_continue_node')
-    if state['action'] != None and state['round'] < 5:
+    logger.debug("正在执行should_continue_node")
+    if state['action'] != '' and state['round'] < 5:
         return "execute_tool"
     return END
 

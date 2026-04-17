@@ -10,6 +10,9 @@ from backend.agents.memory.long_term_memory import LongTermMemory
 from backend.agents.memory.short_term_memory import ShortTermMemory, MemoryUnit
 from backend.agents.memory.vector_store_manager import VectorStoreManager
 from backend.core.single_tool import singleMeta
+from backend.middleware.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class MemoryManager(metaclass=singleMeta):
@@ -78,7 +81,7 @@ class MemoryManager(metaclass=singleMeta):
                         await asyncio.sleep(0.5)
                         result = await self.vector_memory.add_document(memory_dict['memory'], metadata)
                         if not result:
-                            print(f'添加第{index}条记忆到向量数据库失败')
+                            logger.error("添加第%s条记忆到向量数据库失败", index)
                             continue
 
                 # 3. 删除最旧的 delete_size 条短期记忆
@@ -88,7 +91,7 @@ class MemoryManager(metaclass=singleMeta):
                 await self.short_term_memory.add_memory(user_id, session_id, memory)
 
         except Exception as e:
-            print(f"更新记忆失败：{e}")
+            logger.error("更新记忆失败：%s", e, exc_info=True)
 
 
     #TODO 完成记忆模块的clear功能

@@ -10,6 +10,9 @@ from llama_index.vector_stores.chroma import ChromaVectorStore
 from dotenv import load_dotenv
 
 from backend.agents.agent.get_llm import get_embedding_model
+from backend.middleware.logging import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv('.env')
 
@@ -52,7 +55,7 @@ class VectorStoreManager(metaclass=singleMeta):
             await loop.run_in_executor(None, partial(self._index.insert, document))
             return True
         except Exception as e:
-            print(f"Error adding document: {e}")
+            logger.error("Error adding document: %s", e, exc_info=True)
             return False
 
     async def delete_document(self, doc_id: str) -> bool:
@@ -62,7 +65,7 @@ class VectorStoreManager(metaclass=singleMeta):
             await loop.run_in_executor(None, partial(self.vector_store.delete, doc_id))
             return True
         except Exception as e:
-            print(f"Error deleting document: {e}")
+            logger.error("Error deleting document: %s", e, exc_info=True)
             return False
 
     async def update_document(self, doc_id: str, text: str, metadata: dict = None) -> bool:
@@ -77,7 +80,7 @@ class VectorStoreManager(metaclass=singleMeta):
             await loop.run_in_executor(None, partial(self._index.insert, document))
             return True
         except Exception as e:
-            print(f"Error updating document: {e}")
+            logger.error("Error updating document: %s", e, exc_info=True)
             return False
 
     async def query(self, query_text: str, user_id: int = None, top_k: int = 5):

@@ -7,8 +7,11 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.state import CompiledStateGraph
 
 from backend.core.single_tool import singleton_method
+from backend.middleware.logging import get_logger
 
 from dotenv import load_dotenv
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
@@ -50,7 +53,7 @@ def extract_tool(text: str) -> dict:
     :return:
     """
 
-    print('正在初始化extract_agent')
+    logger.info("正在初始化extract_agent")
     system_input = text
     # 调用用户请求进行提取操作
     extract_agent = build_extract_agent()
