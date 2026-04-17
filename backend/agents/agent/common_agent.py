@@ -6,6 +6,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 
 from backend.core.single_tool import singleton_method
+from backend.middleware.logging import get_logger
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
@@ -38,7 +41,7 @@ def common_tool(text: str) -> str:
     :return:
     """
 
-    print('正在初始化common_agent')
+    logger.info("正在初始化common_agent")
 
     # 进行大模型调用相关操作
     common_agent = build_common_agent()

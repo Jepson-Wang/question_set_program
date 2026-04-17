@@ -7,6 +7,9 @@ from pydantic import BaseModel
 from backend.agents.memory.long_term_memory import LongTermMemory
 from backend.agents.memory.short_term_memory import get_short_term_memory
 from backend.dao.user_profile_mapper import get_user_profile_mapper
+from backend.middleware.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class UserProfileQueryInput(BaseModel):
@@ -23,7 +26,7 @@ class UserProfileQueryTool(BaseTool):
 
     def _run(self, user_id: Optional[int] = None) -> str:
         try:
-            print(f"查询用户画像，user_id: {user_id}")
+            logger.info("查询用户画像，user_id: %s", user_id)
             loop = asyncio.get_event_loop()
             return loop.run_until_complete(self._arun(user_id=user_id))
         except RuntimeError:
@@ -42,7 +45,7 @@ class UserProfileQueryTool(BaseTool):
                 return f"【用户画像】用户 {user_id} 尚未创建画像"
 
             data = profile.model_dump()
-            print('用户画像查询成功')
+            logger.info("用户画像查询成功")
             return (
                 f"【用户画像】用户 {user_id} 的画像：\n"
                 f"年级：{data.get('grade', '未知')}\n"

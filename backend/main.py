@@ -1,12 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-
-
+from backend.middleware.logging import setup_logging, LoggingMiddleware
 from backend.api.user_api.agent_api import agent_router
 from backend.api.user_api.login_api import login_router
 from backend.core.hooks import startup_event, shutdown_event
 
+setup_logging()
 
 app = FastAPI(
     debug=True,
@@ -14,6 +14,7 @@ app = FastAPI(
     openapi_url="/api"
 )
 
+app.add_middleware(LoggingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

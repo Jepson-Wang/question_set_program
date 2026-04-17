@@ -1,41 +1,18 @@
-import json
 import os
+
+from langchain_core.messages import SystemMessage, HumanMessage
+from langgraph.graph.state import CompiledStateGraph
 
 from backend.agents.agent.tools import GraphState
 from backend.agents.agent.get_llm import get_llm
-from langchain_core.prompts import ChatPromptTemplate
-from langgraph.graph.state import CompiledStateGraph
+from backend.agents.skills import load_skill
+from backend.agents.skills.skill_runner import run_validator
+from backend.core.single_tool import singleton_method
 
 from dotenv import load_dotenv
 
-from backend.core.single_tool import singleton_method
-
 load_dotenv()
 
-QUESTION_SET_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """
-    你是一名拥有5年教学经验的数学一线教师，熟悉人教版数学教材的所有知识点和题型。
-    核心任务：基于学生提供的参考题目，生成变式题（类似但不相同的题目）。
-    约束规则：
-    1. 题型必须严格匹配人教版数学教材，禁止超纲；
-    2. 生成的题目要贴合中小学生的认知，避免产生理解困难；
-    3. 输出总长度控制在200字以内。
-    4. 输出的题目有多种题型，如选择题、填空题、解方程等，根据题型不同，输出不同的格式。
-    5. 生成的题目要与原题相似但不相同，保持相同的解题思路和知识点，但改变数值、条件或表达方式。
-    6. 生成的题目要有足够的随机性，不能完全重复原题。
-    7. 确保生成的题目有明确的答案。
-    8. 无论输入如何，都必须生成具体的数学题目，不能要求用户提供更多信息。
-    输出格式：严格按照题型，题干，答案的格式输出
-    参考示例：
-    输入：解方程 2x+9=5x-3 难度：困难  知识点：一元一次方程
-    输出：
-    解方程
-    解方程2 [3-4 (x-1/2)] + 9 = 5 [2x-(x+1)] - 3
-    答案：x=27/13；
-
-    """),
-    ("user", "{input}")  # 使用"user"角色而不是"human"
-])
 
 @singleton_method
 def build_question_set_agent(streaming: bool = False) -> CompiledStateGraph[GraphState] | None:
@@ -49,64 +26,71 @@ def build_question_set_agent(streaming: bool = False) -> CompiledStateGraph[Grap
         agent = get_llm(model=model, streaming=streaming)
     return agent
 
-def question_set_tool(text:dict) -> dict:
-    """
-    负责根据提用户输入的题目和根据题目的知识点和难度，生成一个新题
-    :param state:
-    :return:
-    """
 
+def question_set_tool(text: dict) -> dict:
+    """
+    负责根据用户输入的题目和根据题目的知识点和难度，生成一个新题
+    """
     try:
-        #从text中获取到用户输入
         user_input = text['input']
-        #从text中获取到难度要求
         difficulty = text['extract']['difficulty']
-        #从text中获取到提取到的知识点
         knowledge_points = text['extract']['knowledge_points']
 
-        # 进行大模型调用相关操作
-        question_set_agent = build_question_set_agent()
-        question_set_chain = QUESTION_SET_PROMPT | question_set_agent
-        # 构造更明确的输入提示
-        enhanced_input = f"""请基于以下参考题目生成一道变式题：{user_input}\n
-        知识点要求：{knowledge_points}\n
-        难度要求：{difficulty}"""
-        response = question_set_chain.invoke({'input': enhanced_input})
-        # 将生成的题目返回给state
-        result = {
-            'result': response.content,
+        enhanced_input = (
+            f"请基于以下参考题目生成一道变式题：{user_input}\n"
+            f"知识点要求：{knowledge_points}\n"
+            f"难度要求：{difficulty}"
+        )
+
+        system_body = load_skill("question_variant")
+        llm = build_question_set_agent()
+        response = llm.invoke([
+            SystemMessage(content=system_body),
+            HumanMessage(content=enhanced_input),
+        ])
+
+        result_text = response.content
+        is_valid, reason = run_validator("question_variant", result_text)
+        if not is_valid:
+            return {'error': f"生成题目未通过校验：{reason}"}
+
+        return {
+            'result': result_text,
             'difficulty': difficulty,
             'knowledge_points': knowledge_points,
         }
-        return result
     except Exception as e:
         return {'error': str(e)}
+
 
 async def async_question_set_tool(text: dict) -> dict:
     try:
-        #从text中获取到用户输入
         user_input = text['input']
-        #从text中获取到难度要求
         difficulty = text['extract']['difficulty']
-        #从text中获取到提取到的知识点
         knowledge_points = text['extract']['knowledge_points']
-        #构建生成题目的Agent
-        question_set_agent = build_question_set_agent(streaming=False)
-        question_set_chain = QUESTION_SET_PROMPT | question_set_agent
-        # 构造更明确的输入提示
-        enhanced_input = f"""请基于以下参考题目生成一道变式题：{user_input}\n
-        知识点要求：{knowledge_points}
-        难度要求：{difficulty}"""
-        # 进行大模型调用相关操作
-        response = await question_set_chain.ainvoke({'input': enhanced_input})
-        # 将生成的题目返回给text
-        result = {
-            'result': response.content,
+
+        enhanced_input = (
+            f"请基于以下参考题目生成一道变式题：{user_input}\n"
+            f"知识点要求：{knowledge_points}\n"
+            f"难度要求：{difficulty}"
+        )
+
+        system_body = load_skill("question_variant")
+        llm = build_question_set_agent(streaming=False)
+        response = await llm.ainvoke([
+            SystemMessage(content=system_body),
+            HumanMessage(content=enhanced_input),
+        ])
+
+        result_text = response.content
+        is_valid, reason = run_validator("question_variant", result_text)
+        if not is_valid:
+            return {'error': f"生成题目未通过校验：{reason}"}
+
+        return {
+            'result': result_text,
             'difficulty': difficulty,
             'knowledge_points': knowledge_points,
         }
-        return result
     except Exception as e:
         return {'error': str(e)}
-    
-    
