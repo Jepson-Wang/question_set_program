@@ -1,4 +1,5 @@
-.env
+backend/.env
 .idea/
 *.env
 __pycache__/
+backend/logs/
