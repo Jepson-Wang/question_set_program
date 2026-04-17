@@ -7,13 +7,11 @@ from sqlalchemy.orm.decl_api import declarative_base
 
 load_dotenv()
 
-url = os.getenv("SQL_DATABASE_URL")
-
-SQLALCHEMY_DATABASE_URL = url
+SQLALCHEMY_DATABASE_URL = os.getenv("SQL_DATABASE_URL")
 
 if not SQLALCHEMY_DATABASE_URL:
     raise RuntimeError(
-        f"SQL_DATABASE_URL is empty. Please check {str(_env_path)} (backend/.env)."
+        f"SQL_DATABASE_URL is empty. Please check {str(SQLALCHEMY_DATABASE_URL)} (backend/.env)."
     )
 
 # 兼容：如果配置了同步驱动 pymysql，但代码使用的是 create_async_engine，
@@ -29,7 +27,7 @@ if SQLALCHEMY_DATABASE_URL and SQLALCHEMY_DATABASE_URL.startswith("mysql+pymysql
 # 创建异步引擎（管理连接池）
 engine = create_async_engine(
     SQLALCHEMY_DATABASE_URL,
-    echo=True,  # 打印 SQL 语句（开发开启，生产关闭）
+    echo=False,  # 打印 SQL 语句（开发开启，生产关闭）
     pool_pre_ping=True,  # 自动校验连接有效性
     pool_size=10,  # 连接池大小（生产按需调整）
 )
