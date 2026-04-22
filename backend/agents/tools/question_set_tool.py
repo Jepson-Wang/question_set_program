@@ -12,7 +12,10 @@ class QuestionSetInput(BaseModel):
 
 class QuestionSetTool(BaseTool):
     name :str = "question_set_tool"
-    description :str = "根据已有的题目生成变式题"
+    description :str = (
+        "根据已有的题目生成变式题"
+        "不要连续多次调用该工具，否则会导致最终结果无法返回"
+    )
     args_schema : Type[BaseModel] = QuestionSetInput
 
     def _run(self, query: str) -> str:
