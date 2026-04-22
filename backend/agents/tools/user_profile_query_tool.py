@@ -1,4 +1,3 @@
-import asyncio
 from typing import Type, Optional
 
 from langchain_core.tools import BaseTool
@@ -24,15 +23,8 @@ class UserProfileQueryTool(BaseTool):
     )
     args_schema: Type[BaseModel] = UserProfileQueryInput
 
-    def _run(self, user_id: Optional[int] = None) -> str:
-        try:
-            logger.info("查询用户画像，user_id: %s", user_id)
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self._arun(user_id=user_id))
-        except RuntimeError:
-            return "【用户画像】查询失败：无法在当前事件循环中执行"
-
     async def _arun(self, user_id: Optional[int] = None) -> str:
+        logger.info("查询用户画像，user_id: %s", user_id)
         if user_id is None:
             return "【用户画像】查询失败：缺少 user_id"
         try:

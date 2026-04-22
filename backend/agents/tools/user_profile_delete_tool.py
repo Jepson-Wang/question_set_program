@@ -1,4 +1,3 @@
-import asyncio
 from typing import Type, Optional
 
 from langchain_core.tools import BaseTool
@@ -17,13 +16,6 @@ class UserProfileDeleteTool(BaseTool):
     name: str = "user_profile_delete_tool"
     description: str = "删除当前用户的长期画像。仅在用户明确要求清空个人资料时调用"
     args_schema: Type[BaseModel] = UserProfileDeleteInput
-
-    def _run(self, user_id: Optional[int] = None) -> str:
-        try:
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(self._arun(user_id=user_id))
-        except RuntimeError:
-            return "【用户画像】删除失败：无法在当前事件循环中执行"
 
     async def _arun(self, user_id: Optional[int] = None) -> str:
         if user_id is None:

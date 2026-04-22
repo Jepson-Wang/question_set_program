@@ -3,6 +3,7 @@ import os
 from functools import partial
 
 from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import Document
 from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
 from llama_index.vector_stores.chroma import ChromaVectorStore
@@ -17,7 +18,9 @@ logger = get_logger(__name__)
 load_dotenv('.env')
 
 COLLECTION_NAME = os.getenv('CHROMA_COLLECTION', 'vector_store_collection')
-PERSIST_DIR = os.getenv('CHROMA_PERSIST_DIR', './chroma_db')
+PERSIST_DIR = os.getenv('VECTOR_MEMORY_DIR', './vector_memory')
+CHUNK_SIZE = int(os.getenv('CHROMA_CHUNK_SIZE', '512'))
+CHUNK_OVERLAP = int(os.getenv('CHROMA_CHUNK_OVERLAP', '48'))
 
 
 from backend.core.single_tool import singleMeta
@@ -37,12 +40,20 @@ class VectorStoreManager(metaclass=singleMeta):
         )
         self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
 
+        # 显式指定切分器：chunk_size / chunk_overlap 由环境变量控制，
+        # 避免依赖 LlamaIndex 全局 Settings 的默认值(1024/20)
+        self.node_parser = SentenceSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+        )
+
         # 缓存 index，整个生命周期复用，避免每次操作重建
-        # 显式绑定 embed_model，不依赖全局 Settings
+        # 显式绑定 embed_model + transformations，不依赖全局 Settings
         self._index = VectorStoreIndex.from_vector_store(
             self.vector_store,
             storage_context=self.storage_context,
             embed_model=self.embed_model,
+            transformations=[self.node_parser],
         )
 
     async def add_document(self, text: str, metadata: dict = None) -> bool:
@@ -51,7 +62,7 @@ class VectorStoreManager(metaclass=singleMeta):
             if metadata is None:
                 metadata = {}
             document = Document(text=text, metadata=metadata)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, partial(self._index.insert, document))
             return True
         except Exception as e:
@@ -61,7 +72,7 @@ class VectorStoreManager(metaclass=singleMeta):
     async def delete_document(self, doc_id: str) -> bool:
         """从向量库中删除文档"""
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, partial(self.vector_store.delete, doc_id))
             return True
         except Exception as e:
@@ -76,7 +87,7 @@ class VectorStoreManager(metaclass=singleMeta):
             metadata = {}
         document = Document(text=text, metadata=metadata, doc_id=doc_id)
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, partial(self._index.insert, document))
             return True
         except Exception as e:
@@ -94,9 +105,9 @@ class VectorStoreManager(metaclass=singleMeta):
         query_engine = self._index.as_query_engine(
             similarity_top_k=top_k,
             filters=filters,
-            embed_model=self.embed_model,
+            embed_model=self.embed_model
         )
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
             None, partial(query_engine.query, query_text)
         )

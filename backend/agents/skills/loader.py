@@ -118,6 +118,22 @@ def get_skill_list_prompt() -> str:
     return "\n".join(lines)
 
 
+def match_triggers(user_input: str) -> list[str]:
+    """
+    字面子串匹配：扫描 user_input，返回所有触发词命中的 Skill 名列表。
+    用于 ReAct 主循环在 LLM 推理前做客观兜底，防止语义漏触发。
+    """
+    if not user_input:
+        return []
+    hit: list[str] = []
+    for meta in list_skills():
+        for trig in meta["triggers"]:
+            if trig and trig in user_input:
+                hit.append(meta["name"])
+                break
+    return hit
+
+
 def load_skill_code(name: str, tag: str = "validator") -> str | None:
     """提取 SKILL.md 里指定 tag 的 fenced code block 内容。"""
     _, body = _read_skill_file(name)
