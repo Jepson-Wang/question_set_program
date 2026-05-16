@@ -15,6 +15,9 @@ class QueryMemoryTool(BaseTool):
     description: str = "查询当前用户的历史对话记忆，用于了解用户过去的问题、偏好或上下文"
     args_schema: Type[BaseModel] = QueryMemoryInput
 
+    def _run(self, *args, **kwargs):
+        raise NotImplementedError("QueryMemoryTool 仅支持异步调用，请使用 _arun")
+
     async def _arun(self, user_id: Optional[int] = None, session_id: Optional[int] = None, limit: int = 5) -> str:
         """异步执行记忆查询"""
         try:

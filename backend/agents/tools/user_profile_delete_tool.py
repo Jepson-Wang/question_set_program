@@ -17,6 +17,9 @@ class UserProfileDeleteTool(BaseTool):
     description: str = "删除当前用户的长期画像。仅在用户明确要求清空个人资料时调用"
     args_schema: Type[BaseModel] = UserProfileDeleteInput
 
+    def _run(self, *args, **kwargs):
+        raise NotImplementedError("UserProfileDeleteTool 仅支持异步调用，请使用 _arun")
+
     async def _arun(self, user_id: Optional[int] = None) -> str:
         if user_id is None:
             return "【用户画像】删除失败：缺少 user_id"

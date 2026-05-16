@@ -2,7 +2,7 @@ import asyncio
 import os
 from functools import partial
 
-from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.core import VectorStoreIndex
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import Document
 from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
@@ -38,7 +38,6 @@ class VectorStoreManager(metaclass=singleMeta):
             collection_name=COLLECTION_NAME,
             persist_dir=PERSIST_DIR
         )
-        self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
 
         # 显式指定切分器：chunk_size / chunk_overlap 由环境变量控制，
         # 避免依赖 LlamaIndex 全局 Settings 的默认值(1024/20)
@@ -51,9 +50,9 @@ class VectorStoreManager(metaclass=singleMeta):
         # 显式绑定 embed_model + transformations，不依赖全局 Settings
         self._index = VectorStoreIndex.from_vector_store(
             self.vector_store,
-            storage_context=self.storage_context,
             embed_model=self.embed_model,
             transformations=[self.node_parser],
+            use_async=True,
         )
 
     async def add_document(self, text: str, metadata: dict = None) -> bool:
@@ -63,7 +62,7 @@ class VectorStoreManager(metaclass=singleMeta):
                 metadata = {}
             document = Document(text=text, metadata=metadata)
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, partial(self._index.insert, document))
+            await loop.run_in_executor(None, partial(self._index.insert), document)
             return True
         except Exception as e:
             logger.error("Error adding document: %s", e, exc_info=True)
@@ -73,7 +72,7 @@ class VectorStoreManager(metaclass=singleMeta):
         """从向量库中删除文档"""
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, partial(self.vector_store.delete, doc_id))
+            await loop.run_in_executor(None, partial(self.vector_store.delete), doc_id)
             return True
         except Exception as e:
             logger.error("Error deleting document: %s", e, exc_info=True)
@@ -88,7 +87,7 @@ class VectorStoreManager(metaclass=singleMeta):
         document = Document(text=text, metadata=metadata, doc_id=doc_id)
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, partial(self._index.insert, document))
+            await loop.run_in_executor(None, partial(self._index.insert), document)
             return True
         except Exception as e:
             logger.error("Error updating document: %s", e, exc_info=True)
@@ -109,6 +108,6 @@ class VectorStoreManager(metaclass=singleMeta):
         )
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
-            None, partial(query_engine.query, query_text)
+            None, partial(query_engine.query), query_text
         )
         return response

@@ -23,6 +23,9 @@ class UserProfileQueryTool(BaseTool):
     )
     args_schema: Type[BaseModel] = UserProfileQueryInput
 
+    def _run(self, *args, **kwargs):
+        raise NotImplementedError("UserProfileQueryTool 仅支持异步调用，请使用 _arun")
+
     async def _arun(self, user_id: Optional[int] = None) -> str:
         logger.info("查询用户画像，user_id: %s", user_id)
         if user_id is None:

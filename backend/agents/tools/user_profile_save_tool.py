@@ -24,6 +24,9 @@ class UserProfileSaveTool(BaseTool):
     )
     args_schema: Type[BaseModel] = UserProfileSaveInput
 
+    def _run(self, *args, **kwargs):
+        raise NotImplementedError("UserProfileSaveTool 仅支持异步调用，请使用 _arun")
+
     async def _arun(
         self,
         user_id: Optional[int] = None,
