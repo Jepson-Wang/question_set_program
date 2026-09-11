@@ -2,8 +2,8 @@ from typing import Type
 
 from langchain_core.tools import BaseTool
 
-from backend.agents.agent.extract_agent import async_extract_tool, extract_tool
-from backend.agents.agent.question_set_agent import async_question_set_tool, question_set_tool
+from backend.agents.agent.extract_agent import async_extract_tool
+from backend.agents.agent.question_set_agent import async_question_set_tool
 from pydantic import BaseModel,Field
 
 
@@ -18,19 +18,8 @@ class QuestionSetTool(BaseTool):
     )
     args_schema : Type[BaseModel] = QuestionSetInput
 
-    def _run(self, query: str) -> str:
-        try:
-            extract = extract_tool(query)
-            new_input = {
-                'input': query,
-                'extract': extract
-            }
-            result = question_set_tool(new_input)
-            if 'error' in result:
-                return f"【题目生成】生成变式题失败：{result['error']}"
-            return f"【题目生成】已生成变式题：\n{result['result']}"
-        except Exception as e:
-            return f"【题目生成】生成变式题失败：{str(e)}"
+    def _run(self, *args, **kwargs):
+        raise NotImplementedError("QuestionSetTool 仅支持异步调用，请使用 _arun")
 
     async def _arun(self, query: str) -> str:
         """执行题目生成工具"""

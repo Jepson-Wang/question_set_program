@@ -1,6 +1,6 @@
 from typing import Type, Any
 
-from backend.agents.agent.common_agent import async_common_tool, common_tool
+from backend.agents.agent.common_agent import async_common_tool
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
@@ -12,9 +12,8 @@ class CommonTool(BaseTool):
     description : str = "通用工具，处理基本的用户请求和信息查询，包括解题步骤、思路、方法、答案等"
     args_schema : Type[BaseModel] = CommonInput
 
-    def _run(self, query: str) -> str:
-        result = common_tool(query)
-        return result
+    def _run(self, *args, **kwargs):
+        raise NotImplementedError("CommonTool 仅支持异步调用，请使用 _arun")
 
     async def _arun(self, query: str) -> str:
         """执行通用工具"""

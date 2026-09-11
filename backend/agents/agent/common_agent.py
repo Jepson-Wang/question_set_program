@@ -34,24 +34,6 @@ def build_common_agent(streaming: bool = False) :
         agent = get_llm(model=model, streaming=streaming)
     return agent
 
-def common_tool(text: str) -> str:
-    """
-    负责其他一般性回答
-    :param text: 用户的查询内容
-    :return:
-    """
-
-    logger.info("正在初始化common_agent")
-
-    # 进行大模型调用相关操作
-    common_agent = build_common_agent()
-    common_chain = COMMON_PROMPT | common_agent
-    # 注意：这里必须调用 prompt-chain，而不是直接调用 llm
-    # 否则会把 {'input': ...} 作为无效输入类型传给 ChatOpenAI
-    response = common_chain.invoke({'input': text})
-    # 返回纯文本：上游 CommonTool 声明返回 str，直接返回 AIMessage 会污染 ToolMessage
-    return response.content
-
 async def async_common_tool(text: str) -> str:
     common_agent = build_common_agent(streaming=True)
     common_chain = COMMON_PROMPT | common_agent
