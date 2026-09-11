@@ -9,6 +9,7 @@ from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
 from backend.core.config import load_env
+from backend.core.executors import get_vector_executor
 
 from backend.agents.agent.get_llm import get_embedding_model
 from backend.middleware.logging import get_logger
@@ -62,7 +63,7 @@ class VectorStoreManager(metaclass=singleMeta):
                 metadata = {}
             document = Document(text=text, metadata=metadata)
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, partial(self._index.insert), document)
+            await loop.run_in_executor(get_vector_executor(), partial(self._index.insert), document)
             return True
         except Exception as e:
             logger.error("Error adding document: %s", e, exc_info=True)
@@ -72,7 +73,7 @@ class VectorStoreManager(metaclass=singleMeta):
         """从向量库中删除文档"""
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, partial(self.vector_store.delete), doc_id)
+            await loop.run_in_executor(get_vector_executor(), partial(self.vector_store.delete), doc_id)
             return True
         except Exception as e:
             logger.error("Error deleting document: %s", e, exc_info=True)
@@ -87,7 +88,7 @@ class VectorStoreManager(metaclass=singleMeta):
         document = Document(text=text, metadata=metadata, doc_id=doc_id)
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, partial(self._index.insert), document)
+            await loop.run_in_executor(get_vector_executor(), partial(self._index.insert), document)
             return True
         except Exception as e:
             logger.error("Error updating document: %s", e, exc_info=True)
@@ -108,6 +109,6 @@ class VectorStoreManager(metaclass=singleMeta):
         )
         loop = asyncio.get_running_loop()
         response = await loop.run_in_executor(
-            None, partial(query_engine.query), query_text
+            get_vector_executor(), partial(query_engine.query), query_text
         )
         return response
