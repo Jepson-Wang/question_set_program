@@ -139,7 +139,7 @@ def _parse_react_response(content) -> dict:
     }
 
 
-def react_think_node(state: GraphState) -> dict:
+async def react_think_node(state: GraphState) -> dict:
     """LLM思考：是否调用Tool、调用哪个"""
     hint_skills = match_triggers(state['user_input'])
     system_text = build_react_system_prompt(hint_skills)
@@ -151,7 +151,7 @@ def react_think_node(state: GraphState) -> dict:
         "session_id": state['session_id'],
     }
     llm = get_llm().bind_tools(TOOLS)
-    response_message = llm.invoke([
+    response_message = await llm.ainvoke([
         SystemMessage(content=system_text),
         HumanMessage(content=json.dumps(llm_input, ensure_ascii=False, default=str)),
     ])
