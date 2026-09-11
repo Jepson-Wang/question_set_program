@@ -211,8 +211,18 @@ if evicted:
 
 改法：让这些 `_run` 统一 `raise NotImplementedError`（与 `QueryMemoryTool`、`UserProfile*Tool` 保持一致），删掉三个同步 agent 函数。减少一半维护面，也消除"同步版本悄悄被调用从而阻塞事件循环"的风险。
 
-**4. `get_llm.py` 模块级读取环境变量**
-第 13-16 行在模块导入时 `os.getenv`，但该模块自身不调 `load_dotenv()`，依赖其他模块先完成加载。导入顺序一变就会拿到 `None` 或默认值。改法：在 `get_llm.py` 顶部显式 `load_dotenv()`。
+**4. 环境变量加载不可靠（范围比初稿大）**
+项目里有 11 处 `load_dotenv`，三种写法，没有一种可靠：
+
+- `load_dotenv()` 不传参（`model/__init__.py`、`agents/agent/tools.py`、三个 `*_agent.py` 等）——从**当前工作目录**逐级上找，只在 cwd 恰好是 `backend/` 时成立
+- `load_dotenv('.env')`（`vector_store_manager.py`、`extract_memory_agent.py`）——相对 cwd，更脆
+- **完全不加载**（`get_llm.py`、`utils/redis_client.py`）——靠"别的模块碰巧先被导入"
+
+失败方式很隐蔽：`os.getenv` 静默返回 `None`，然后以一个和根因无关的面目炸掉。实测：从仓库根目录 import `redis_client` 并 ping，报的是 `AuthenticationError: Authentication required`——真实原因却是 `.env` 没被加载，密码读成了 `None`。
+
+改法：新建 `backend/core/config.py` 作为单一入口，用**绝对路径**（`Path(__file__).resolve().parents[1] / ".env"`）幂等加载，所有读 env 的模块统一调 `load_env()`。该模块只依赖 `pathlib` 和 `dotenv`，不 import 任何项目模块，因此不会成环。
+
+`load_dotenv` 默认不覆盖已存在的真实环境变量，这个行为要保留——容器/CI 注入的配置应当优先于 `.env` 文件。
 
 **不在本次范围**：`DashScopeEmbedding` 内部用同步 `OpenAI` client。它在线程池里跑，属于"线程内的同步 HTTP"，不阻塞事件循环。改用 LlamaIndex 的 `ainsert` 需要确认版本 API，收益有限，标记为后续可选优化。
 
@@ -228,5 +238,6 @@ if evicted:
 6. 同一偏好首次出现只进候选池，第二次出现才写入 MySQL 画像。
 7. 写入 `weak_points` 中的新知识点，不会冲掉已有的其他知识点。
 8. 事件循环中不存在同步 LLM 调用（`react_think_node` 为 async）。
+8b. 在任意工作目录下导入任意模块，环境变量都能正确读到（不再依赖 cwd 或导入顺序）。
 9. 词表外的画像键被转存到 `notes`，既不进候选池也不被丢弃。
 10. `notes` 追加写入、去重、超过 50 条时丢弃最旧的，且不出现在 system prompt 中。

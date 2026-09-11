@@ -41,6 +41,7 @@ Task 0 是测试基建，必须最先做。
 |---|---|
 | `backend/tests/conftest.py` | pytest fixture：测试用 Redis 客户端（db 15）、自动清库 |
 | `backend/pytest.ini` | pytest 配置，开启 asyncio 自动模式 |
+| `backend/core/config.py` | 环境变量的单一加载入口（绝对路径、幂等） |
 | `backend/core/executors.py` | 集中管理进程级线程池，提供获取与关停入口 |
 | `backend/agents/memory/profile_candidates.py` | 画像候选池：偏好频次统计与晋升判定 |
 | `backend/agents/skills/profile_schema/SKILL.md` | 画像维度词表（热加载，改词表不用改代码） |
@@ -50,6 +51,7 @@ Task 0 是测试基建，必须最先做。
 | `backend/tests/test_vector_retrieve.py` | 向量检索阈值过滤与降级的测试 |
 | `backend/tests/test_react_agent_async.py` | ReAct 节点异步化与画像注入的测试 |
 | `backend/tests/test_tools_sync_disabled.py` | 同步 `_run` 路径已禁用的测试 |
+| `backend/tests/test_config_env.py` | 环境变量加载与工作目录无关性的测试 |
 | `backend/tests/test_profile_merge.py` | JSON 字段合并与 notes 追加的测试 |
 | `backend/tests/test_profile_schema_skill.py` | 词表加载与词表外键分流的测试 |
 | `backend/tests/test_recall_injection.py` | 向量召回格式化与工具注入的测试 |
@@ -62,7 +64,9 @@ Task 0 是测试基建，必须最先做。
 | `backend/agents/memory/memory_manager.py` | 归档转后台任务，新增 ack / 启动恢复 / 关停 |
 | `backend/agents/memory/vector_store_manager.py` | 新增 `retrieve()`，改用专属线程池 |
 | `backend/agents/agent/react_agent.py` | 节点改 async；system prompt 增加画像段 |
-| `backend/agents/agent/get_llm.py` | 显式 `load_dotenv` |
+| `backend/agents/agent/get_llm.py` | 改调 `load_env()`（原本完全不加载 .env） |
+| `backend/utils/redis_client.py` | 改调 `load_env()`（原本完全不加载 .env） |
+| `backend/model/__init__.py`、`agents/agent/tools.py`、三个 `*_agent.py` | 旧的 `load_dotenv()` 统一换成 `load_env()` |
 | `backend/agents/agent/tools.py` | `GraphState` 新增 `profile_text` 字段 |
 | `backend/agents/agent/common_agent.py` | 删除同步 `common_tool` |
 | `backend/agents/agent/extract_agent.py` | 删除同步 `extract_tool` |
@@ -213,66 +217,269 @@ git commit -m "test: 搭建 pytest 异步测试基建并修正 requirements 编�
 
 ---
 
-## Task 1: get_llm 显式加载环境变量
+## Task 1: 环境变量的单一加载入口
+
+现在项目里有 11 处 `load_dotenv`，三种写法，没有一种是可靠的：
+
+| 写法 | 出现位置 | 问题 |
+|---|---|---|
+| `load_dotenv()` 不传参 | `model/__init__.py`、`agents/agent/tools.py`、`common_agent.py`、`extract_agent.py`、`question_set_agent.py` 等 | 从**当前工作目录**逐级上找 `.env`。只在 cwd 恰好是 `backend/` 或其子目录时成立 |
+| `load_dotenv('.env')` | `vector_store_manager.py`、`extract_memory_agent.py` | 相对当前工作目录，比上一种更脆 |
+| **完全不加载** | `get_llm.py`、`utils/redis_client.py` | 靠「别的模块碰巧先被导入」。现在能跑纯属 `model/__init__.py` 恰好在导入链前面 |
+
+失败方式很隐蔽：`os.getenv` 静默返回 `None`，然后以一个和根因毫无关系的面目炸掉。实测过一次——从仓库根目录跑一段裸脚本 import `redis_client`，密码读成 `None`，报出来的是：
+
+```
+redis.exceptions.AuthenticationError: Authentication required.
+```
+
+你会去查 Redis 的 ACL 配置，而真正的原因是 `.env` 没被加载。
+
+改法是收敛成一个入口：`backend/core/config.py` 用**绝对路径**加载一次，所有读 env 的模块统一调 `load_env()`。
 
 **Files:**
-- Modify: `backend/agents/agent/get_llm.py:1-20`
-- Create: `backend/tests/test_get_llm_env.py`
+- Create: `backend/core/config.py`
+- Create: `backend/tests/test_config_env.py`
+- Modify: `backend/agents/agent/get_llm.py`（原本完全不加载）
+- Modify: `backend/utils/redis_client.py`（原本完全不加载）
+- Modify: `backend/model/__init__.py`
+- Modify: `backend/agents/memory/vector_store_manager.py`
+- Modify: `backend/agents/agent/tools.py`
+- Modify: `backend/agents/agent/common_agent.py`
+- Modify: `backend/agents/agent/extract_agent.py`
+- Modify: `backend/agents/agent/question_set_agent.py`
+- Modify: `backend/agents/agent/extract_memory_agent.py`
+- Modify: `backend/tests/conftest.py`（复用 `load_env`，去掉重复的路径推导）
 
 **Interfaces:**
 - Consumes: 无
-- Produces: 模块级变量 `api_key`、`base_url`、`model`、`embedding_model` 在模块导入后必然有值（不依赖其他模块先调 `load_dotenv`）
+- Produces:
+  - `BACKEND_ROOT: Path` —— `backend/` 目录的绝对路径
+  - `ENV_PATH: Path` —— `backend/.env` 的绝对路径
+  - `load_env() -> None` —— 幂等；用绝对路径加载，不覆盖已存在的真实环境变量
 
 - [ ] **Step 1: 写失败的测试**
 
-创建 `backend/tests/test_get_llm_env.py`：
+创建 `backend/tests/test_config_env.py`：
 
 ```python
 import importlib
+import os
 
 
-def test_get_llm_loads_env_by_itself(monkeypatch):
-    """清掉环境变量后重载模块，值应当由 get_llm 自己从 .env 读回来。"""
+def test_env_path_is_absolute_and_points_at_backend():
+    from backend.core.config import BACKEND_ROOT, ENV_PATH
+
+    assert ENV_PATH.is_absolute()
+    assert ENV_PATH.name == ".env"
+    assert ENV_PATH.parent == BACKEND_ROOT
+    assert BACKEND_ROOT.name == "backend"
+
+
+def test_load_env_works_from_any_cwd(tmp_path, monkeypatch):
+    """核心保证：进程工作目录跟 backend/ 无关时，依然读得到 .env。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("API_KEY", raising=False)
+
+    import backend.core.config as cfg
+    cfg._loaded = False          # 重置幂等标记，模拟首次加载
+    cfg.load_env()
+
+    assert os.getenv("API_KEY"), "换个工作目录就读不到 .env，说明用的是相对路径"
+
+
+def test_load_env_is_idempotent():
+    import backend.core.config as cfg
+
+    cfg._loaded = False
+    cfg.load_env()
+    cfg.load_env()               # 第二次应当直接返回，不重复读盘
+    assert cfg._loaded is True
+
+
+def test_real_env_overrides_dotenv(monkeypatch):
+    """容器里注入的环境变量优先级必须高于 .env 文件。"""
+    monkeypatch.setenv("API_KEY", "sentinel-from-real-env")
+
+    import backend.core.config as cfg
+    cfg._loaded = False
+    cfg.load_env()
+
+    assert os.getenv("API_KEY") == "sentinel-from-real-env"
+
+
+def test_get_llm_reads_config_without_prior_load(tmp_path, monkeypatch):
+    """回归：get_llm 原本完全不加载 .env，靠导入顺序侥幸拿到值。"""
+    monkeypatch.chdir(tmp_path)
     for key in ("API_KEY", "API_URL", "MODEL_NAME", "EMBEDDING_MODEL"):
         monkeypatch.delenv(key, raising=False)
 
+    import backend.core.config as cfg
+    cfg._loaded = False
     import backend.agents.agent.get_llm as m
     importlib.reload(m)
 
-    assert m.api_key, "get_llm 必须自己 load_dotenv，不能依赖导入顺序"
-    assert m.base_url, "base_url 同样必须自己加载"
+    assert m.api_key, "get_llm 必须自己调 load_env，不能依赖导入顺序"
+    assert m.base_url
+
+
+def test_redis_url_carries_credentials_without_prior_load(tmp_path, monkeypatch):
+    """
+    回归：redis_client 原本完全不加载 .env，密码读成 None，
+    表现为 AuthenticationError——一个和根因毫无关系的错误。
+    """
+    monkeypatch.chdir(tmp_path)
+    for key in ("REDIS_URL", "REDIS_HOST", "REDIS_PORT",
+                "REDIS_PASSWORD", "REDIS_USERNAME"):
+        monkeypatch.delenv(key, raising=False)
+
+    import backend.core.config as cfg
+    cfg._loaded = False
+    import backend.utils.redis_client as rc
+    importlib.reload(rc)
+
+    url = rc._build_redis_url()
+    assert os.getenv("REDIS_PASSWORD"), "load_env 应当已把 .env 里的密码读进来"
+    assert "@" in url, "URL 必须带认证信息，否则会以 AuthenticationError 的面目失败"
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd backend && python -m pytest tests/test_get_llm_env.py -v`
-Expected: FAIL，`assert m.api_key` 为 None
+Run: `cd backend && python -m pytest tests/test_config_env.py -v`
+Expected: FAIL，`ModuleNotFoundError: No module named 'backend.core.config'`
 
-- [ ] **Step 3: 实现**
+- [ ] **Step 3: 实现 config 模块**
 
-在 `backend/agents/agent/get_llm.py` 顶部，`os.getenv` 调用**之前**插入：
+创建 `backend/core/config.py`：
 
 ```python
+"""
+环境变量的单一加载入口。
+
+为什么需要它：
+项目里原本有 11 处 load_dotenv，三种写法——不传参（从 cwd 逐级上找）、
+传 '.env'（相对 cwd）、以及压根不加载（get_llm.py、utils/redis_client.py）。
+前两种依赖「进程的工作目录恰好是 backend/」，第三种依赖「别的模块碰巧先导入」。
+任何一条不成立，os.getenv 就静默返回 None，然后以一个和根因毫无关系的面目
+炸掉——比如 Redis 密码读成 None，报出来的是 AuthenticationError。
+
+这里用绝对路径加载一次，所有读 env 的模块统一调 load_env()。
+"""
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# 显式指定 .env 绝对路径：不依赖当前工作目录，也不依赖其他模块先完成加载
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+# backend/core/config.py -> backend/
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+ENV_PATH = BACKEND_ROOT / ".env"
+
+_loaded = False
+
+
+def load_env() -> None:
+    """
+    幂等地加载 backend/.env。
+
+    - 用绝对路径，不依赖当前工作目录
+    - 不覆盖已存在的真实环境变量（load_dotenv 的默认行为），
+      因此容器/CI 注入的配置优先级高于 .env 文件
+    """
+    global _loaded
+    if _loaded:
+        return
+    load_dotenv(ENV_PATH)
+    _loaded = True
 ```
 
-`parents[2]` 从 `backend/agents/agent/get_llm.py` 上溯到 `backend/`。
+本模块只依赖 `pathlib` 和 `dotenv`，不 import 任何项目模块，因此谁都可以安全地导入它，不会产生循环依赖。
 
-- [ ] **Step 4: 运行测试确认通过**
+- [ ] **Step 4: 给两个「完全不加载」的模块补上**
 
-Run: `cd backend && python -m pytest tests/test_get_llm_env.py -v`
-Expected: PASS
+这两个是真正的隐患，优先改。
 
-- [ ] **Step 5: 提交**
+`backend/agents/agent/get_llm.py` —— 在 `os.getenv` 调用**之前**插入：
+
+```python
+from backend.core.config import load_env
+
+load_env()
+```
+
+`backend/utils/redis_client.py` —— 同样在文件顶部 import 之后插入：
+
+```python
+from backend.core.config import load_env
+
+load_env()
+```
+
+注意 `redis_client` 的 `os.getenv` 是在 `_build_redis_url()` **调用时**才执行的，模块级 `load_env()` 一定早于它，没有时序问题。
+
+- [ ] **Step 5: 把其余 9 处旧写法统一过来**
+
+下列文件中，删掉 `from dotenv import load_dotenv` 及其对应的 `load_dotenv()` / `load_dotenv('.env')` 调用，换成：
+
+```python
+from backend.core.config import load_env
+
+load_env()
+```
+
+- `backend/model/__init__.py`
+- `backend/agents/memory/vector_store_manager.py`
+- `backend/agents/agent/tools.py`
+- `backend/agents/agent/common_agent.py`
+- `backend/agents/agent/extract_agent.py`
+- `backend/agents/agent/question_set_agent.py`
+- `backend/agents/agent/extract_memory_agent.py`（这个用的是 `import dotenv` + `dotenv.load_dotenv('.env')`，把 `import dotenv` 也一并删掉）
+
+`backend/model/__init__.py` 是唯一需要留意导入方向的：它 import `backend.core.config`，而 `core/config.py` 不 import 任何项目模块，因此不会成环。
+
+改完确认没有漏网的：
+
+Run: `cd backend && grep -rn "load_dotenv" --include=*.py . | grep -v "\.venv" | grep -v "core/config.py"`
+Expected: 无输出
+
+顺带一提，`analyse_agent.py`、`planner_agent.py`、`image_gene_agent.py` 也各有一处 `load_dotenv()`，但这三个模块目前没有任何调用方（属于旧 planner 架构的遗留）。改不改都行；如果你打算删掉它们，就别在这里花力气。
+
+- [ ] **Step 6: 让 conftest 复用同一个入口**
+
+`backend/tests/conftest.py` 目前自己推导了一遍 `.env` 路径。换成同一个入口，避免两处路径逻辑将来走偏：
+
+```python
+from backend.core.config import load_env
+
+load_env()
+```
+
+并删掉原来的 `from pathlib import Path`、`from dotenv import load_dotenv` 和那行 `load_dotenv(Path(__file__).resolve().parents[1] / ".env")`（`Path` 若在别处仍有使用则保留）。
+
+- [ ] **Step 7: 运行测试确认通过**
+
+Run: `cd backend && python -m pytest tests/ -v`
+Expected: 全部 passed（含原有的 2 个冒烟测试）
+
+- [ ] **Step 8: 验证「换个工作目录也能起来」**
+
+这是本任务的真正目的，务必手工验证一次：
 
 ```bash
-git add backend/agents/agent/get_llm.py backend/tests/test_get_llm_env.py
-git commit -m "fix: get_llm 显式加载 .env，消除模块导入顺序依赖"
+cd D:/yonghu/Program/python_program/question_set_program
+python -c "
+from backend.utils.redis_client import get_redis_client
+import asyncio
+c = get_redis_client()
+asyncio.run(c.client.ping()) and print('PING OK')
+"
+```
+
+改造前这条命令会报 `AuthenticationError: Authentication required`（因为 cwd 是仓库根目录，`.env` 找不到）；改造后应当正常返回。
+
+- [ ] **Step 9: 提交**
+
+```bash
+git add backend/core/config.py backend/tests/test_config_env.py backend/agents/ backend/model/__init__.py backend/utils/redis_client.py backend/tests/conftest.py
+git commit -m "fix: 环境变量收敛到单一加载入口，消除工作目录与导入顺序依赖"
 ```
 
 ---
