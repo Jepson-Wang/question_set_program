@@ -71,6 +71,74 @@ Skill 是存放在文件中的程序化剧本，不是可执行工具。当用�
     return prompt
 
 
+def _normalize_action(value) -> str:
+    """
+    把 LLM 可能给出的 null / "null" / None / 空白统一成空字符串。
+    否则 `None != ''` 恒为真，should_continue 会误判成"还要调工具"，
+    一路空转到轮次上限才结束。
+    """
+    if value is None:
+        return ''
+    action = str(value).strip()
+    if action.lower() in ('null', 'none', 'nil'):
+        return ''
+    return action
+
+
+def _extract_json_object(content: str) -> str | None:
+    """截取最外层 JSON 对象，兼容模型输出的 Markdown 围栏和前后缀说明。"""
+    start = content.find('{')
+    end = content.rfind('}')
+    if start == -1 or end == -1 or end < start:
+        return None
+    return content[start:end + 1]
+
+
+def _parse_react_response(content) -> dict:
+    """
+    解析 LLM 的 ReAct 输出。任何异常都降级成"一次终止回答"，
+    而不是让 json.loads 抛异常把整张图打断。
+    返回的 dict 保证 4 个键齐全。
+    """
+    fallback = {
+        'thought': '模型输出解析失败',
+        'action': '',
+        'action_args': {},
+        'final_result': "我不能解答用户的问题",
+    }
+
+    if not isinstance(content, str) or not content.strip():
+        logger.error("LLM 未返回文本内容：%r", content)
+        return fallback
+
+    raw = _extract_json_object(content)
+    if raw is None:
+        logger.error("LLM 输出中找不到 JSON 对象：%s", content[:300])
+        return fallback
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error("LLM 输出 JSON 解析失败：%s | 原文：%s", e, content[:300])
+        return fallback
+
+    if not isinstance(parsed, dict):
+        logger.error("LLM 输出不是 JSON 对象：%s", content[:300])
+        return fallback
+
+    action_args = parsed.get('action_args') or {}
+    if not isinstance(action_args, dict):
+        logger.warning("action_args 不是对象，已忽略：%r", action_args)
+        action_args = {}
+
+    return {
+        'thought': parsed.get('thought') or '',
+        'action': _normalize_action(parsed.get('action')),
+        'action_args': action_args,
+        'final_result': parsed.get('final_result') or '',
+    }
+
+
 def react_think_node(state: GraphState) -> dict:
     """LLM思考：是否调用Tool、调用哪个"""
     hint_skills = match_triggers(state['user_input'])
@@ -83,11 +151,16 @@ def react_think_node(state: GraphState) -> dict:
         "session_id": state['session_id'],
     }
     llm = get_llm().bind_tools(TOOLS)
-    response_content = llm.invoke([
+    response_message = llm.invoke([
         SystemMessage(content=system_text),
         HumanMessage(content=json.dumps(llm_input, ensure_ascii=False, default=str)),
-    ]).content
-    response = json.loads(response_content)
+    ])
+    response = _parse_react_response(response_message.content)
+
+    # 既没选工具又没给答案时强制收尾，避免向用户返回空串
+    if not response['action'] and not response['final_result']:
+        logger.warning("模型既未选择工具也未给出最终回答，强制结束本轮")
+        response['final_result'] = "我不能解答用户的问题"
 
     round = state['round'] + 1
     logger.info("轮次: %s", round)
@@ -154,7 +227,8 @@ def should_continue(state: GraphState) -> str:
     - 没有 → 结束，回答用户
     """
     logger.debug("正在执行should_continue_node")
-    if state['action'] != '' and state['round'] < 5:
+    # 必须用真值判断：action 为 None 时 `None != ''` 恒真，会一直空转到轮次上限
+    if state['action'] and state['round'] < 5:
         return "execute_tool"
     return END
 

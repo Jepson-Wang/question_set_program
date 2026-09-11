@@ -29,8 +29,10 @@ class QueryMemoryTool(BaseTool):
 
             lines = []
             for i, mem in enumerate(memories, 1):
-                user_content = mem.get('user', '')
-                model_content = mem.get('model', '')
+                # MemoryUnit 结构为 {'memory': {'user_memory', 'model_memory'}, 'timestamp': ...}
+                unit = mem.get('memory', {})
+                user_content = unit.get('user_memory', '')
+                model_content = unit.get('model_memory', '')
                 timestamp = mem.get('timestamp', '')
                 lines.append(f"{i}. 时间: {timestamp}\n用户: {user_content}\n模型: {model_content}")
 

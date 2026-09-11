@@ -49,11 +49,11 @@ def common_tool(text: str) -> str:
     # 注意：这里必须调用 prompt-chain，而不是直接调用 llm
     # 否则会把 {'input': ...} 作为无效输入类型传给 ChatOpenAI
     response = common_chain.invoke({'input': text})
-    # 将回答返回给用户
-    return response
+    # 返回纯文本：上游 CommonTool 声明返回 str，直接返回 AIMessage 会污染 ToolMessage
+    return response.content
 
 async def async_common_tool(text: str) -> str:
     common_agent = build_common_agent(streaming=True)
     common_chain = COMMON_PROMPT | common_agent
     response = await common_chain.ainvoke({'input': text})
-    return response
+    return response.content
