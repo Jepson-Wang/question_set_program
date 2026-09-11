@@ -6,6 +6,9 @@ import os
 import redis.asyncio as redis
 from typing import Optional
 
+from backend.core.config import load_env
+
+load_env()
 
 class RedisClient:
     """Redis客户端管理类"""

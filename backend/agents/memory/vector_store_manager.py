@@ -8,14 +8,14 @@ from llama_index.core.schema import Document
 from llama_index.core.vector_stores import MetadataFilters, ExactMatchFilter
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
-from dotenv import load_dotenv
+from backend.core.config import load_env
 
 from backend.agents.agent.get_llm import get_embedding_model
 from backend.middleware.logging import get_logger
 
 logger = get_logger(__name__)
 
-load_dotenv('.env')
+load_env()
 
 COLLECTION_NAME = os.getenv('CHROMA_COLLECTION', 'vector_store_collection')
 PERSIST_DIR = os.getenv('VECTOR_MEMORY_DIR', './vector_memory')

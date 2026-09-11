@@ -3,14 +3,14 @@ import os
 from backend.agents.agent.get_llm import get_llm
 from langchain_core.prompts import ChatPromptTemplate
 
-from dotenv import load_dotenv
+from backend.core.config import load_env
 
 from backend.core.single_tool import singleton_method
 from backend.middleware.logging import get_logger
 
 logger = get_logger(__name__)
 
-load_dotenv()
+load_env()
 
 COMMON_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是专业教育解题助手，负责：

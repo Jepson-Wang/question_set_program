@@ -6,8 +6,10 @@ from langchain_openai import ChatOpenAI
 from llama_index.core.embeddings import BaseEmbedding
 from llama_index.core.bridge.pydantic import Field, PrivateAttr
 
+from backend.core.config import load_env
 from backend.core.single_tool import singleton_method
 
+load_env()
 
 model = os.getenv('MODEL_NAME','glm-5')
 api_key = os.getenv('API_KEY')

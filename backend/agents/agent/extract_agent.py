@@ -9,11 +9,11 @@ from langgraph.graph.state import CompiledStateGraph
 from backend.core.single_tool import singleton_method
 from backend.middleware.logging import get_logger
 
-from dotenv import load_dotenv
+from backend.core.config import load_env
 
 logger = get_logger(__name__)
 
-load_dotenv()
+load_env()
 
 EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是一个专业的知识点和难度提取助手，

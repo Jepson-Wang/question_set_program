@@ -1,15 +1,15 @@
 import os
-from pathlib import Path
 
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis
-from dotenv import load_dotenv
+
+from backend.core.config import load_env
 
 # conftest 不 import 任何项目模块，没人替它加载 .env，必须自己来。
 # 否则 REDIS_HOST 等一律读不到，全部回落 localhost，测试会以
 # 「Redis 没开」的面目集体 skip。
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+load_env()
 
 TEST_DB = 15
 

@@ -5,7 +5,7 @@ Prompt 从 backend/agents/skills/memory_refinement/SKILL.md 读取，实现单�
 import json
 import os
 
-import dotenv
+from backend.core.config import load_env
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from backend.agents.agent.get_llm import get_llm
@@ -15,7 +15,7 @@ from backend.middleware.logging import get_logger
 
 logger = get_logger(__name__)
 
-dotenv.load_dotenv('.env')
+load_env()
 
 
 @singleton_method

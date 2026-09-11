@@ -9,9 +9,9 @@ from backend.agents.skills import load_skill
 from backend.agents.skills.skill_runner import run_validator
 from backend.core.single_tool import singleton_method
 
-from dotenv import load_dotenv
+from backend.core.config import load_env
 
-load_dotenv()
+load_env()
 
 
 @singleton_method
