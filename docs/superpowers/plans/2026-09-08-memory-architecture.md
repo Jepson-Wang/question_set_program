@@ -437,8 +437,13 @@ load_env()
 
 改完确认没有漏网的：
 
-Run: `cd backend && grep -rn "load_dotenv" --include=*.py . | grep -v "\.venv" | grep -v "core/config.py"`
-Expected: 无输出
+Run: `cd backend && grep -rn "load_dotenv" --include=*.py --exclude-dir=.venv --exclude-dir=__pycache__ . | grep -v "core/config.py"`
+
+注意必须用 `--exclude-dir`：写成 `grep -rn ... . | grep -v "\.venv"` 的话，第二个 grep 只能过滤输出，第一个 grep 照样会把整个 `.venv` 扫一遍，会卡上好几分钟。
+
+Expected: 只剩下面两类，都在预期内：
+- `analyse_agent.py`、`image_gene_agent.py`、`planner_agent.py` 各两行（没有调用方的死模块，见下文）
+- `tests/conftest.py` 两行（由 Step 6 处理，做完 Step 6 这两行就没了）
 
 顺带一提，`analyse_agent.py`、`planner_agent.py`、`image_gene_agent.py` 也各有一处 `load_dotenv()`，但这三个模块目前没有任何调用方（属于旧 planner 架构的遗留）。改不改都行；如果你打算删掉它们，就别在这里花力气。
 
@@ -1737,8 +1742,10 @@ Expected: FAIL，`ImportError: cannot import name 'merge_json_field'`
 `backend/schemas/response/user_profile_response.py` —— 加一个字段：
 
 ```python
-    notes: list = Field(default_factory=list, description='自由观察记录', example=['做题时喜欢先看思路'])
+    notes: list = Field(default_factory=list, description='自由观察记录', examples=[['做题时喜欢先看思路']])
 ```
+
+注意是 `examples`（复数）且外面多套一层列表：`examples` 本身就是「示例的列表」，这个字段的一个示例值又是一个列表。不要写成 `example=`——Pydantic V2 已弃用、V3 会移除，同文件其他字段也已统一改为 `examples=[...]`。
 
 `backend/agents/memory/long_term_memory.py` 的 `add_or_update` 里，新建画像的分支补上：
 
