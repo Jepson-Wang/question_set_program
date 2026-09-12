@@ -3,9 +3,12 @@ Redis客户端工具类
 负责Redis连接的初始化、管理和关闭
 """
 import os
-import redis.asyncio as aioredis
+import redis.asyncio as redis
 from typing import Optional
 
+from backend.core.config import load_env
+
+load_env()
 
 class RedisClient:
     """Redis客户端管理类"""
@@ -18,7 +21,7 @@ class RedisClient:
             redis_url: Redis连接URL
         """
         self.redis_url = redis_url
-        self.redis = aioredis.from_url(
+        self.redis = redis.from_url(
                 self.redis_url,
                 encoding="utf-8",
                 decode_responses=True

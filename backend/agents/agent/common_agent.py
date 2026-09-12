@@ -3,14 +3,14 @@ import os
 from backend.agents.agent.get_llm import get_llm
 from langchain_core.prompts import ChatPromptTemplate
 
-from dotenv import load_dotenv
+from backend.core.config import load_env
 
 from backend.core.single_tool import singleton_method
 from backend.middleware.logging import get_logger
 
 logger = get_logger(__name__)
 
-load_dotenv()
+load_env()
 
 COMMON_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是专业教育解题助手，负责：
@@ -34,26 +34,8 @@ def build_common_agent(streaming: bool = False) :
         agent = get_llm(model=model, streaming=streaming)
     return agent
 
-def common_tool(text: str) -> str:
-    """
-    负责其他一般性回答
-    :param text: 用户的查询内容
-    :return:
-    """
-
-    logger.info("正在初始化common_agent")
-
-    # 进行大模型调用相关操作
-    common_agent = build_common_agent()
-    common_chain = COMMON_PROMPT | common_agent
-    # 注意：这里必须调用 prompt-chain，而不是直接调用 llm
-    # 否则会把 {'input': ...} 作为无效输入类型传给 ChatOpenAI
-    response = common_chain.invoke({'input': text})
-    # 将回答返回给用户
-    return response
-
 async def async_common_tool(text: str) -> str:
     common_agent = build_common_agent(streaming=True)
     common_chain = COMMON_PROMPT | common_agent
     response = await common_chain.ainvoke({'input': text})
-    return response
+    return response.content

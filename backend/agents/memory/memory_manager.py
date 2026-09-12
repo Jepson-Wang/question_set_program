@@ -61,12 +61,7 @@ class MemoryManager(metaclass=singleMeta):
                 """
                 import time as _time
                 delete_size = 1  # 每次淘汰最旧的 1 条为新记忆腾位
-                metadata = {
-                    'user_id': user_id,
-                    'session_id': session_id,
-                    'timestamp': int(_time.time()),
-                    'tags': []
-                }
+                archive_time = int(_time.time())
 
                 # 1. 获取全量记忆，从尾部取最旧的 delete_size 条
                 all_memories = await self.short_term_memory.get_latest_memories(user_id, session_id, memory_size)
@@ -74,12 +69,22 @@ class MemoryManager(metaclass=singleMeta):
 
                 # 2. 通过大模型提取后存入向量库
                 extracted_memory = await get_extract_memory(memories_to_archive)
+                if not extracted_memory:
+                    logger.warning("记忆精炼未产出可归档内容，本轮跳过向量库写入")
+
                 for index, memory_dict in enumerate(extracted_memory):
-                    metadata['tags'].append(memory_dict['tags'])
-                    result = await self.vector_memory.add_document(memory_dict['memory'], metadata)
+                    # metadata 必须逐条构造：共用一个 dict 会让 tags 跨条累加；
+                    # 且 Chroma 的 metadata 只接受标量，list 需要展平成字符串
+                    metadata = {
+                        'user_id': user_id,
+                        'session_id': session_id,
+                        'timestamp': archive_time,
+                        'tags': ','.join(memory_dict['tags']),
+                    }
+                    result = await self.vector_memory.add_document(memory_dict['text'], metadata)
                     if not result:
                         await asyncio.sleep(0.5)
-                        result = await self.vector_memory.add_document(memory_dict['memory'], metadata)
+                        result = await self.vector_memory.add_document(memory_dict['text'], metadata)
                         if not result:
                             logger.error("添加第%s条记忆到向量数据库失败", index)
                             continue

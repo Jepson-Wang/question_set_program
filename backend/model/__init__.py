@@ -2,10 +2,10 @@ import os
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
-from dotenv import load_dotenv
+from backend.core.config import load_env
 from sqlalchemy.orm.decl_api import declarative_base
 
-load_dotenv()
+load_env()
 
 SQLALCHEMY_DATABASE_URL = os.getenv("SQL_DATABASE_URL")
 

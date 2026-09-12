@@ -1,10 +1,10 @@
 import os
 from typing import TypedDict,Any
 
-from dotenv import load_dotenv
+from backend.core.config import load_env
 from langchain_core.messages import ToolMessage
 
-load_dotenv()
+load_env()
 
 class react_format(TypedDict):
     thought : list[str]

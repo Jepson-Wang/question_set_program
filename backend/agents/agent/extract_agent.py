@@ -9,11 +9,11 @@ from langgraph.graph.state import CompiledStateGraph
 from backend.core.single_tool import singleton_method
 from backend.middleware.logging import get_logger
 
-from dotenv import load_dotenv
+from backend.core.config import load_env
 
 logger = get_logger(__name__)
 
-load_dotenv()
+load_env()
 
 EXTRACT_PROMPT = ChatPromptTemplate.from_messages([
     ("system", """你是一个专业的知识点和难度提取助手，
@@ -45,43 +45,6 @@ def build_extract_agent() -> CompiledStateGraph[GraphState] | None:
         agent = get_llm(model=model)
 
     return agent
-
-def extract_tool(text: str) -> dict:
-    """
-    负责提取请求中知识点和难度
-    :param text:
-    :return:
-    """
-
-    logger.info("正在初始化extract_agent")
-    system_input = text
-    # 调用用户请求进行提取操作
-    extract_agent = build_extract_agent()
-    extract_chain = EXTRACT_PROMPT | extract_agent
-    response = extract_chain.invoke({'input': system_input})
-    # 将提取到的知识点和难度返回给state
-    response_text = response.content
-
-    
-    # 尝试解析 JSON 格式的响应
-    try:
-        # 尝试从文本中提取 JSON
-        if '{' in response_text and '}' in response_text:
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
-            json_str = response_text[json_start:json_end]
-            parsed = json.loads(json_str)
-            extract = {
-                'knowledge_points': parsed.get('knowledge_points', []),
-                'difficulty': parsed.get('difficulty', '未知')
-            }
-        elif isinstance(response, dict):
-            extract = response
-        else:
-            extract = {}
-    except:
-        extract = {}
-    return extract
 
 async def async_extract_tool(text : str) -> dict:
     system_input = text

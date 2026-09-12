@@ -5,35 +5,38 @@
 2. 调用LangGraph中的Node，完成任务执行
 3. 设定一个最大迭代轮次，超过之后，就只接关停
 """
-from backend.agents.agent.get_llm import get_llm
-from backend.agents.tools import TOOLS, TOOL_MAP, get_tool_prompt
-from backend.agents.skills import get_skill_list_prompt
-from backend.middleware.logging import get_logger
-
-from langgraph.graph import StateGraph, END
-
-from langchain_core.messages import ToolMessage
 import json
 
-from backend.agents.agent.tools import GraphState
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
-from langchain_core.prompts import ChatPromptTemplate
+from backend.agents.agent.get_llm import get_llm
+from backend.agents.agent.tools import GraphState
+from backend.agents.tools import TOOLS, TOOL_MAP, get_tool_prompt
+from backend.agents.skills import get_skill_list_prompt, match_triggers
+from backend.middleware.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-_REACT_SYSTEM_PROMPT = """# 角色
+def build_react_system_prompt(hint_skills: list[str] | None = None) -> str:
+    """每轮动态构建 ReAct 系统提示词。
+
+    - `get_skill_list_prompt()` 每次重新扫目录 + 走 mtime 缓存，新增/删除 SKILL.md 下一轮即生效。
+    - 若 `hint_skills` 非空，追加「命中提示」段，作为 LLM 语义漏触发的兜底。
+    """
+    prompt = f"""# 角色
 你是 ReAct 决策 Agent：基于 `user_input` 和 `messages` 上下文，循环「思考→行动」，决定调用工具或直接回答。
 
 # 可用工具 (Tools)
 只能从下列工具中选择，禁止编造不存在的工具：
 
-""" + get_tool_prompt() + """
+{get_tool_prompt()}
 
 # 可用 Skill（能力包，按需加载）
 Skill 是存放在文件中的程序化剧本，不是可执行工具。当用户诉求命中某个 Skill 的触发词时，先用 `load_skill_tool` 加载对应 Skill 的剧本，再根据剧本指引决定下一步调哪个业务工具或直接作答。
 
-""" + get_skill_list_prompt() + """
+{get_skill_list_prompt()}
 
 # 规则
 1. 业务问题必须通过工具获取数据，不得凭空编造。
@@ -46,8 +49,8 @@ Skill 是存放在文件中的程序化剧本，不是可执行工具。当用�
 # 输出格式
 只返回一段合法 JSON，禁止 Markdown 代码块或额外解释。
 
-- 需调工具：`action`=工具名，`action_args`=参数，`final_result`=`""`
-- 信息已充足：`action`=''，`action_args`=`{{}}`，`final_result`=通俗易懂的最终回答
+- 需调工具：`action`=工具名，`action_args`=参数，`final_result`=""
+- 信息已充足：`action`=''，`action_args`={{}}，`final_result`=通俗易懂的最终回答
 
 结构：
 {{
@@ -57,28 +60,111 @@ Skill 是存放在文件中的程序化剧本，不是可执行工具。当用�
     "final_result": "最终回答"
 }}
 """
+    if hint_skills:
+        names = "、".join(hint_skills)
+        prompt += (
+            f"\n# 命中提示\n"
+            f"系统检测到 `user_input` 字面命中以下 Skill 触发词：{names}。"
+            f"强烈建议本轮优先调用 `load_skill_tool` 加载对应 Skill，再决定后续动作；"
+            f"若 `messages` 中已有该 Skill 的剧本，则直接依剧本行事，无需重复加载。\n"
+        )
+    return prompt
 
-REACT_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", _REACT_SYSTEM_PROMPT),
-    ("user", "{input}")
-])
+
+def _normalize_action(value) -> str:
+    """
+    把 LLM 可能给出的 null / "null" / None / 空白统一成空字符串。
+    否则 `None != ''` 恒为真，should_continue 会误判成"还要调工具"，
+    一路空转到轮次上限才结束。
+    """
+    if value is None:
+        return ''
+    action = str(value).strip()
+    if action.lower() in ('null', 'none', 'nil'):
+        return ''
+    return action
 
 
-def react_think_node(state: GraphState) -> dict:
+def _extract_json_object(content: str) -> str | None:
+    """截取最外层 JSON 对象，兼容模型输出的 Markdown 围栏和前后缀说明。"""
+    start = content.find('{')
+    end = content.rfind('}')
+    if start == -1 or end == -1 or end < start:
+        return None
+    return content[start:end + 1]
+
+
+def _parse_react_response(content) -> dict:
+    """
+    解析 LLM 的 ReAct 输出。任何异常都降级成"一次终止回答"，
+    而不是让 json.loads 抛异常把整张图打断。
+    返回的 dict 保证 4 个键齐全。
+    """
+    fallback = {
+        'thought': '模型输出解析失败',
+        'action': '',
+        'action_args': {},
+        'final_result': "我不能解答用户的问题",
+    }
+
+    if not isinstance(content, str) or not content.strip():
+        logger.error("LLM 未返回文本内容：%r", content)
+        return fallback
+
+    raw = _extract_json_object(content)
+    if raw is None:
+        logger.error("LLM 输出中找不到 JSON 对象：%s", content[:300])
+        return fallback
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error("LLM 输出 JSON 解析失败：%s | 原文：%s", e, content[:300])
+        return fallback
+
+    if not isinstance(parsed, dict):
+        logger.error("LLM 输出不是 JSON 对象：%s", content[:300])
+        return fallback
+
+    action_args = parsed.get('action_args') or {}
+    if not isinstance(action_args, dict):
+        logger.warning("action_args 不是对象，已忽略：%r", action_args)
+        action_args = {}
+
+    return {
+        'thought': parsed.get('thought') or '',
+        'action': _normalize_action(parsed.get('action')),
+        'action_args': action_args,
+        'final_result': parsed.get('final_result') or '',
+    }
+
+
+async def react_think_node(state: GraphState) -> dict:
     """LLM思考：是否调用Tool、调用哪个"""
+    hint_skills = match_triggers(state['user_input'])
+    system_text = build_react_system_prompt(hint_skills)
+
     llm_input = {
         "user_input": state['user_input'],
         "messages": state['messages'],
         "user_id": state['user_id'],
-        "session_id": state['session_id']
+        "session_id": state['session_id'],
     }
     llm = get_llm().bind_tools(TOOLS)
-    ReAct_chain = REACT_PROMPT | llm
-    response_content = ReAct_chain.invoke({"input": llm_input}).content
-    response = json.loads(response_content)
+    response_message = await llm.ainvoke([
+        SystemMessage(content=system_text),
+        HumanMessage(content=json.dumps(llm_input, ensure_ascii=False, default=str)),
+    ])
+    response = _parse_react_response(response_message.content)
+
+    # 既没选工具又没给答案时强制收尾，避免向用户返回空串
+    if not response['action'] and not response['final_result']:
+        logger.warning("模型既未选择工具也未给出最终回答，强制结束本轮")
+        response['final_result'] = "我不能解答用户的问题"
 
     round = state['round'] + 1
     logger.info("轮次: %s", round)
+    logger.debug("命中触发词 Skill: %s", hint_skills)
     logger.debug("输入: %s", llm_input)
     logger.debug("思考结果: %s", response["thought"])
     logger.info("调用tool: %s", response["action"])
@@ -87,11 +173,11 @@ def react_think_node(state: GraphState) -> dict:
     logger.info("最终回答final_result: %s", response["final_result"])
 
     return {
-        'thought' : response["thought"],
-        'action' : response["action"],
-        'action_args' : response["action_args"],
-        'round' : round,
-        'final_result' : response["final_result"]
+        'thought': response["thought"],
+        'action': response["action"],
+        'action_args': response["action_args"],
+        'round': round,
+        'final_result': response["final_result"],
     }
 
 # ----------------------
@@ -141,7 +227,8 @@ def should_continue(state: GraphState) -> str:
     - 没有 → 结束，回答用户
     """
     logger.debug("正在执行should_continue_node")
-    if state['action'] != '' and state['round'] < 5:
+    # 必须用真值判断：action 为 None 时 `None != ''` 恒真，会一直空转到轮次上限
+    if state['action'] and state['round'] < 5:
         return "execute_tool"
     return END
 

@@ -1,4 +1,3 @@
-import asyncio
 from typing import Type, Optional
 
 from langchain_core.tools import BaseTool
@@ -25,27 +24,8 @@ class UserProfileSaveTool(BaseTool):
     )
     args_schema: Type[BaseModel] = UserProfileSaveInput
 
-    def _run(
-        self,
-        user_id: Optional[int] = None,
-        grade: Optional[str] = None,
-        subject: Optional[str] = None,
-        weak_points: Optional[dict] = None,
-        preferences: Optional[dict] = None,
-    ) -> str:
-        try:
-            loop = asyncio.get_event_loop()
-            return loop.run_until_complete(
-                self._arun(
-                    user_id=user_id,
-                    grade=grade,
-                    subject=subject,
-                    weak_points=weak_points,
-                    preferences=preferences,
-                )
-            )
-        except RuntimeError:
-            return "【用户画像】保存失败：无法在当前事件循环中执行"
+    def _run(self, *args, **kwargs):
+        raise NotImplementedError("UserProfileSaveTool 仅支持异步调用，请使用 _arun")
 
     async def _arun(
         self,

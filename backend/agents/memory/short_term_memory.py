@@ -8,7 +8,7 @@
 主要技术分析：
 1. 使用Redis哈希结构存储记忆，键格式为：user:{user_id}:session:{session_id}
 2. 每个会话的记忆使用列表存储，保持最新的记忆在列表头部
-3. 使用aioredis进行异步Redis操作
+3. 使用 redis.asyncio 进行异步Redis操作
 4. 支持设置最大记忆长度，超过后自动删除最早的记忆
 
 存储结构设计：
