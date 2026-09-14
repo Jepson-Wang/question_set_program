@@ -637,7 +637,8 @@ from backend.core import executors
 
 def test_vector_executor_is_bounded_and_named():
     ex = executors.get_vector_executor()
-    assert ex.max_workers == 4, "必须有界，避免 embedding 风暴打满线程"
+    # ThreadPoolExecutor 没有公开的 max_workers 属性，池大小存在 _max_workers 里
+    assert ex._max_workers == 4, "必须有界，避免 embedding 风暴打满线程"
     assert executors.get_vector_executor() is ex, "必须复用同一个池"
 
 
@@ -655,7 +656,7 @@ def test_shutdown_is_idempotent():
     executors.shutdown_executors()
     executors.shutdown_executors()  # 第二次不应抛异常
     # 关停后再取应当拿到一个可用的新池
-    assert executors.get_vector_executor().max_workers == 4
+    assert executors.get_vector_executor()._max_workers == 4
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -735,8 +736,10 @@ await loop.run_in_executor(get_vector_executor(), partial(...))
 
 共 4 处：`add_document`、`delete_document`、`update_document`、`query` 各 1 处。用下面的命令确认没有遗漏：
 
-Run: `cd backend && grep -n "run_in_executor" agents/memory/vector_store_manager.py`
-Expected: 输出中不再出现 `run_in_executor(None`
+Run: `cd backend && grep -n "None, partial" agents/memory/vector_store_manager.py`
+Expected: 无输出
+
+不要用 `grep "run_in_executor"` 然后看输出里有没有 `run_in_executor(None`：`query` 里那一处是跨行写的，`None` 在下一行，那样检查的话，漏改了也会显示为通过。
 
 - [ ] **Step 5: 运行测试确认通过**
 
@@ -832,8 +835,17 @@ Expected: FAIL，`common_tool`/`extract_tool`/`question_set_tool` 三个工具�
 
 删完后确认没有残留引用：
 
-Run: `cd backend && grep -rn "common_tool\|extract_tool\|question_set_tool" --include=*.py agents/ api/ | grep -v "async_\|_tool.py:\|CommonTool\|QuestionSetTool"`
-Expected: 无输出（或只剩工具类自身的 `name` 字符串）
+Run（在 `backend/` 下）：
+
+```bash
+python -c "import re,pathlib; p=re.compile(r'(?<![\w\".])(common_tool|extract_tool|question_set_tool)(?![\w\"])'); [print(f'{f}:{i}: {l.strip()}') for f in pathlib.Path('.').rglob('*.py') if '.venv' not in f.parts for i,l in enumerate(f.read_text(encoding='utf-8').splitlines(),1) if p.search(l)]"
+```
+
+Expected: 无输出
+
+这条检查匹配的是「作为标识符出现的同步函数名」，排除了 `async_` 前缀、带引号的工具名（`name = "common_tool"`）和模块路径（`tools.common_tool`）。
+
+不要用 `grep ... | grep -v "async_\|_tool.py:"` 这种写法：`-v "_tool.py:"` 会把三个 `*_tool.py` 文件整个排除掉，而残留最可能出现的恰恰是这三个文件；`-v "async_"` 又会把 `import async_extract_tool, extract_tool` 这种没删干净的导入一起过滤掉——两处漏洞叠加，漏改了也显示通过。也不要换成 `grep -P`，Windows 的 Git Bash 下它要求 UTF-8 locale，常常直接报错。
 
 - [ ] **Step 5: 运行测试确认通过**
 
