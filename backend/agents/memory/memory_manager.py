@@ -55,61 +55,69 @@ class MemoryManager(metaclass=singleMeta):
 
     def _spawn(self,coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
+        # 事件循环对任务只持有弱引用，自己不存一份的话，任务可能跑到一半被垃圾回收
         self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
         return task
 
     def _on_task_done(self,task: asyncio.Task):
-        """
-        标记任务成功,幂等性
-        """
-        # 需要做的任务：
-        # 查看这个任务是否调用完毕，调用exception，如果有结果表明执行完毕
-        # 如果任务已经取消，那么就直接返回。
-        if task not in set:
+        """任务结束（成功、失败或被取消）时调用：释放引用，并把异常记进日志"""
+        self._tasks.discard(task)
+        # 被取消的任务调用 exception() 会抛 CancelledError，要先排除
+        if task.cancelled():
             return
-        result = task.exception()
-        if result is not None:
-            logger.error("归档过程失败: %s", result,exc_info=True)
-        self._tasks.remove(task)
+        exc = task.exception()
+        if exc is not None:
+            # 回调里没有「当前异常」，exc_info=True 取不到堆栈，要把异常对象直接传进去
+            logger.error("归档任务异常退出: %s", exc, exc_info=exc)
 
-    async def _archive(self,user_id,session_id,raw_item) -> int:
-        """在archive_batch中完成批量归档操作"""
-        # 先将 raw_item 反序列化为dict，如果出错，直接跳过，并 log 日志记录
-        items: list[dict] = []
-        keep = []
-        for item in raw_item:
-            try:
-                items.append(json.loads(item))
-                keep.append(item)
-            except Exception as e:
-                logger.error("_archive_batch归档操作时反序列化失败: %s",e)
+    async def _archive(self,user_id,session_id,raw_items: list[str]) -> int:
+        """
+        逐条归档，返回成功的条数。
+        不把多条记录一起交给 LLM 再按顺序配对：模型可能把一条拆成多条，也可能把多条合成一条，
+        输出条数和输入对不上时，按顺序配对会 ack 错条目，造成内容丢失或重复写入。
+        """
+        success = 0
+        for raw in raw_items:
+            if await self._archive_one(user_id,session_id,raw):
+                success += 1
+        return success
 
-        # 序列化成功后对记忆通过LLM进行处理
-        if len(items) == 0:
-            return 0
+    async def _archive_one(self,user_id,session_id,raw: str) -> bool:
+        """归档一条：精炼出的内容全部写进向量库之后才 ack；任何一步失败，条目都留在 pending 待重试"""
+        try:
+            unit = json.loads(raw)
+        except json.JSONDecodeError as e:
+            # 坏数据重试多少次都不会好，直接从 pending 删掉，否则每次启动都会卡在它上面
+            logger.error("待归档记忆无法反序列化，已丢弃: %s | %s", e, raw[:100])
+            await self.short_term_memory.ack_archived(user_id,session_id,raw)
+            return False
 
         try:
-            refined = await get_extract_memory(items)
+            refined = await get_extract_memory([unit])
         except Exception as e:
-            logger.error("_archive_batch记忆归档失败，回退到pending中待之后重试: %s", e)
-            return 0
+            logger.error("记忆精炼失败，留在 pending 待重试: %s", e, exc_info=True)
+            return False
+        if not refined:
+            # 精炼的提示词要求每条记录都有输出，空结果说明模型输出无法解析
+            logger.warning("记忆精炼没有产出内容，留在 pending 待重试")
+            return False
 
-        archive_success = 0
         archive_time = int(time.time())
-        for row,item in zip(keep,refined):
+        for item in refined:
             metadata = {
                 "user_id": user_id,
                 "session_id": session_id,
                 "tags": ','.join(item['tags']),
                 "time_stamp": archive_time
             }
-            ok = await self.vector_memory.add_document(item['text'],metadata)
-            if ok:
-                await self.short_term_memory.ack_archived(user_id,session_id,row)
-                archive_success += 1
-            else:
-                logger.error("_archive_batch写入向量库失败，条目保留在pending中待重试")
-        return archive_success
+            if not await self.vector_memory.add_document(item['text'],metadata):
+                # 前面几条可能已经写进去了，重试时会再写一遍；向量库不按内容去重，这里接受少量重复
+                logger.error("写入向量库失败，留在 pending 待重试")
+                return False
+
+        await self.short_term_memory.ack_archived(user_id,session_id,raw)
+        return True
 
     async def drain_pending(self) -> int:
         """重启恢复之后，将已弹出但未归档的进行归档"""
@@ -138,10 +146,12 @@ class MemoryManager(metaclass=singleMeta):
         tasks = list(self._tasks)
         if not tasks:
             return
-        logger.info("shutdown等待 %s 个 doc 归档", len(tasks))
-        done,pending = await asyncio.wait(fs=tasks,timeout=timeout)
+        logger.info("shutdown 等待 %s 个归档任务", len(tasks))
+        done,pending = await asyncio.wait(tasks,timeout=timeout)
         if pending:
-            logger.info("shutdown归档过程中有 %s 个 doc 因超时未归档成功",len(pending))
+            logger.warning("shutdown 时有 %s 个归档任务超时，已取消，下次启动由 drain_pending 补做",len(pending))
             for cancel_task in pending:
                 cancel_task.cancel()
+            # cancel() 只是发出取消请求，要等任务真正退出；否则事件循环关闭时会报 Task was destroyed but it is pending
+            await asyncio.gather(*pending, return_exceptions=True)
 
