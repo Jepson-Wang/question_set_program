@@ -33,6 +33,8 @@
 
 Task 0 是测试基建，必须最先做。
 
+Task 15 是后加的优化（归档精炼的截断、限时与耗时日志），只依赖 Task 6，可以在 Task 6 之后任何时候做。
+
 ## 文件结构
 
 **新建**
@@ -55,13 +57,15 @@ Task 0 是测试基建，必须最先做。
 | `backend/tests/test_profile_merge.py` | JSON 字段合并与 notes 追加的测试 |
 | `backend/tests/test_profile_schema_skill.py` | 词表加载与词表外键分流的测试 |
 | `backend/tests/test_recall_injection.py` | 向量召回格式化与工具注入的测试 |
+| `backend/tests/test_extract_memory_agent.py` | 精炼输入截断、限时与耗时日志的测试 |
 
 **修改**
 
 | 文件 | 改动 |
 |---|---|
 | `backend/agents/memory/short_term_memory.py` | 全面重写为 Redis LIST + Lua 脚本 |
-| `backend/agents/memory/memory_manager.py` | 归档转后台任务，新增 ack / 启动恢复 / 关停 |
+| `backend/agents/memory/memory_manager.py` | 归档转后台任务，新增 ack / 启动恢复 / 关停；精炼超时不打错误堆栈（Task 15） |
+| `backend/agents/agent/extract_memory_agent.py` | 精炼输入截断、按长度限时、记录耗时（Task 15） |
 | `backend/agents/memory/vector_store_manager.py` | 新增 `retrieve()`，改用专属线程池 |
 | `backend/agents/agent/react_agent.py` | 节点改 async；system prompt 增加画像段 |
 | `backend/agents/agent/get_llm.py` | 改调 `load_env()`（原本完全不加载 .env） |
@@ -3040,6 +3044,266 @@ git commit -m "docs: 更新 CLAUDE.md 至改造后的实际架构"
 
 ---
 
+## Task 15: 归档精炼提速：截断输入、单次限时、耗时日志
+
+**前提：以当前代码为准。** 上面 Task 6 的代码块里，`_archive` 把多条记录一起精炼再按 `zip` 顺序配对。模型输出条数和输入对不上时，会 ack 错条目，这个写法已经废弃。实际实现改成了逐条归档，由 `_archive_one` 负责单条，本任务在它的基础上修改。
+
+**要解决的问题**：归档每条记录都要调用一次 LLM，而 LLM 客户端**没有设置超时**。`ChatOpenAI` 的 `request_timeout` 是 None，底层 httpx 是 `Timeout(timeout=None)`，服务端一旦不响应，请求就会一直挂着；`max_retries=2` 只在出错时重试，卡住不算出错。这类任务到关停时一定会超时，被取消后下次启动再重做一遍。另一方面，交给精炼的 `model_memory` 是 Agent 的完整回答，生成变式题时可能是整套题加解析，拖慢调用、浪费费用，而精炼并不需要这么多内容。
+
+**做法**：
+
+1. 截断精炼的输入：`user_memory` 最多 1000 字，`model_memory` 最多 500 字
+2. 单次精炼限时：20 秒起，每千字加 10 秒，最多 60 秒。截断之后，输入最长约 1500 字，限时约 35 秒。超时的条目留在 pending，等下次重试
+3. 每次精炼都记下输入字数和耗时，用数据确认慢在哪里，再决定要不要做更大的改动
+
+**不做的事：不给「超时过的任务」在关停时多留时间。** 理由有四个：
+- 耗时主要花在生成输出和服务端排队上，输入长度只影响读取输入那一步，而这一步很快。
+- 卡住的请求，给再多时间也不会返回。
+- 关停时间的上限由部署环境决定（`docker stop` 默认 10 秒，k8s 默认 30 秒），超过就被 SIGKILL。
+- 有 pending 队列兜底，关停时取消任务不会丢数据；剩下的一点时间，应该留给最可能做完的任务。
+
+关停继续用固定的时间预算，没做完的交给启动恢复。
+
+**Files:**
+- Modify: `backend/agents/agent/extract_memory_agent.py`
+- Modify: `backend/agents/memory/memory_manager.py`（`_archive_one` 单独处理超时）
+- Create: `backend/tests/test_extract_memory_agent.py`
+- Modify: `backend/tests/test_memory_manager.py`（追加一个测试）
+
+**Interfaces:**
+- Consumes: Task 6 的 `MemoryManager._archive_one`，以及测试辅助函数 `_fill_pending`
+- Produces:
+  - 常量 `USER_MEMORY_MAX_CHARS = 1000`、`MODEL_MEMORY_MAX_CHARS = 500`、`REFINE_TIMEOUT_BASE = 20.0`、`REFINE_TIMEOUT_PER_1K = 10.0`、`REFINE_TIMEOUT_MAX = 60.0`
+  - `refine_timeout(input_chars: int) -> float`
+  - `get_extract_memory(memory)`：超时抛 `TimeoutError`（先记一条 WARNING），成功时记一条 INFO（输入字数、耗时）
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `backend/tests/test_extract_memory_agent.py`：
+
+```python
+import asyncio
+import json
+import logging
+
+import pytest
+
+import backend.agents.agent.extract_memory_agent as em
+
+REFINED = '[{"text": "用户想练习一元一次方程", "tags": ["用户需求"]}]'
+
+
+class FakeLLM:
+    """记录收到的消息；delay 模拟远程调用的耗时"""
+
+    def __init__(self, delay: float = 0.0):
+        self.delay = delay
+        self.messages = None
+
+    async def ainvoke(self, messages):
+        self.messages = messages
+        await asyncio.sleep(self.delay)
+        return type("Response", (), {"content": REFINED})()
+
+
+@pytest.fixture
+def fake_llm(monkeypatch):
+    llm = FakeLLM()
+    monkeypatch.setattr(em, "build_extract_memory_agent", lambda: llm)
+    monkeypatch.setattr(em, "load_skill", lambda name: "精炼协议")
+    return llm
+
+
+def _unit(user: str, model: str) -> dict:
+    return {"memory": {"user_memory": user, "model_memory": model}, "timestamp": 0}
+
+
+def test_short_text_is_untouched():
+    assert em._flatten_memories([_unit("问", "答")]) == [{"user_memory": "问", "model_memory": "答"}]
+
+
+def test_long_text_is_truncated():
+    [flat] = em._flatten_memories([_unit("问" * 5000, "答" * 5000)])
+    assert flat["user_memory"] == "问" * em.USER_MEMORY_MAX_CHARS + "…"
+    assert flat["model_memory"] == "答" * em.MODEL_MEMORY_MAX_CHARS + "…"
+
+
+def test_timeout_grows_with_input_and_is_capped():
+    assert em.refine_timeout(0) == em.REFINE_TIMEOUT_BASE
+    assert em.refine_timeout(1000) == em.REFINE_TIMEOUT_BASE + em.REFINE_TIMEOUT_PER_1K
+    assert em.refine_timeout(10**6) == em.REFINE_TIMEOUT_MAX
+
+
+async def test_llm_receives_truncated_input(fake_llm):
+    await em.get_extract_memory([_unit("问", "答" * 5000)])
+    [sent] = json.loads(fake_llm.messages[1].content)
+    assert len(sent["model_memory"]) == em.MODEL_MEMORY_MAX_CHARS + 1
+
+
+async def test_slow_llm_times_out(fake_llm, monkeypatch, caplog):
+    """LLM 客户端本身没有超时，卡住的请求会一直挂着；精炼必须自己限时"""
+    fake_llm.delay = 1.0
+    monkeypatch.setattr(em, "refine_timeout", lambda chars: 0.05)
+    with caplog.at_level(logging.WARNING), pytest.raises(TimeoutError):
+        await em.get_extract_memory([_unit("问", "答")])
+    assert "记忆精炼超时" in caplog.text
+
+
+async def test_success_logs_input_size_and_duration(fake_llm, caplog):
+    with caplog.at_level(logging.INFO):
+        result = await em.get_extract_memory([_unit("问", "答")])
+    assert result == [{"text": "用户想练习一元一次方程", "tags": ["用户需求"]}]
+    assert "记忆精炼完成" in caplog.text and "耗时" in caplog.text
+```
+
+在 `backend/tests/test_memory_manager.py` 末尾追加：
+
+```python
+async def test_refine_timeout_keeps_item_pending_without_traceback(manager, monkeypatch, caplog):
+    """超时已经在精炼函数里记过一条 WARNING，这里只保留条目，不再重复打一遍错误堆栈"""
+    async def timeout(units):
+        raise TimeoutError
+    monkeypatch.setattr(mm, "get_extract_memory", timeout)
+
+    await _fill_pending(manager, 1)
+    with caplog.at_level(logging.INFO):
+        assert await manager.drain_pending() == 0
+    assert len(await manager.short_term_memory.get_pending(USER, SESSION)) == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd backend && python -m pytest tests/test_extract_memory_agent.py tests/test_memory_manager.py -v`
+Expected: 6 failed。新文件 5 个，报 `AttributeError`（找不到 `USER_MEMORY_MAX_CHARS` 等）或断言失败；追加的那 1 个会失败，因为现有代码对超时也打了一条 ERROR。`test_short_text_is_untouched` 本来就能通过。
+
+- [ ] **Step 3: 实现截断、限时与耗时日志**
+
+修改 `backend/agents/agent/extract_memory_agent.py`：
+
+1. 在 `import json` 前后补上 `import asyncio` 与 `import time`
+2. 在 `load_env()` 之后加上常量：
+
+```python
+# 精炼只需要知道「用户问了什么、得到了什么帮助」，Agent 的完整回答（例如整套变式题加解析）截断即可。
+# 输入越短，精炼越快、越省钱
+USER_MEMORY_MAX_CHARS = 1000
+MODEL_MEMORY_MAX_CHARS = 500
+
+# 单次精炼的限时：基础 20 秒，每千字加 10 秒，最多 60 秒。
+# LLM 客户端本身没有超时（httpx Timeout(None)），不设的话卡住的请求会一直挂着
+REFINE_TIMEOUT_BASE = 20.0
+REFINE_TIMEOUT_PER_1K = 10.0
+REFINE_TIMEOUT_MAX = 60.0
+```
+
+3. 用下面的代码替换原来的 `_flatten_memories`（新增 `_truncate` 和 `refine_timeout`）：
+
+```python
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + '…'
+
+
+def _flatten_memories(memories: list[dict]) -> list[dict[str, str]]:
+    """
+    把 MemoryUnit（{'memory': {...}, 'timestamp': ...}）压平成
+    SKILL.md 示例里的 {'user_memory', 'model_memory'} 形式，避免多余层级干扰模型；
+    过长的文本在这里截断。
+    """
+    flat: list[dict[str, str]] = []
+    for item in memories:
+        unit = item.get('memory', {}) if isinstance(item, dict) else {}
+        flat.append({
+            'user_memory': _truncate(unit.get('user_memory', ''), USER_MEMORY_MAX_CHARS),
+            'model_memory': _truncate(unit.get('model_memory', ''), MODEL_MEMORY_MAX_CHARS),
+        })
+    return flat
+
+
+def refine_timeout(input_chars: int) -> float:
+    """按输入长度给单次精炼限时"""
+    return min(REFINE_TIMEOUT_BASE + input_chars / 1000 * REFINE_TIMEOUT_PER_1K, REFINE_TIMEOUT_MAX)
+```
+
+4. `get_extract_memory` 里，从 `system_body = load_skill(...)` 到 `return` 的部分替换为：
+
+```python
+    system_body = load_skill("memory_refinement")
+    llm = build_extract_memory_agent()
+    payload = json.dumps(_flatten_memories(memory), ensure_ascii=False)
+    timeout = refine_timeout(len(payload))
+
+    started = time.perf_counter()
+    try:
+        response = await asyncio.wait_for(
+            llm.ainvoke([SystemMessage(content=system_body), HumanMessage(content=payload)]),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        logger.warning("记忆精炼超时：输入 %s 字，限时 %.0f 秒", len(payload), timeout)
+        raise
+    logger.info("记忆精炼完成：输入 %s 字，耗时 %.1f 秒", len(payload), time.perf_counter() - started)
+    return _parse_refined_memories(response.content)
+```
+
+用 `asyncio.wait_for` 包住整个 `ainvoke`，客户端自己的重试也算在这次限时里。超时后，`wait_for` 会取消底层的 httpx 请求。
+
+- [ ] **Step 4: `_archive_one` 单独处理超时**
+
+在 `backend/agents/memory/memory_manager.py` 的 `_archive_one` 里，捕获精炼异常的地方加一个分支，放在 `except Exception` 之前：
+
+```python
+        try:
+            refined = await get_extract_memory([unit])
+        except TimeoutError:
+            # 精炼函数已经记过一条带输入长度的 WARNING，这里不再重复打错误堆栈
+            return False
+        except Exception as e:
+            logger.error("记忆精炼失败，留在 pending 待重试: %s", e, exc_info=True)
+            return False
+```
+
+- [ ] **Step 5: 运行测试确认通过**
+
+Run: `cd backend && python -m pytest tests/test_extract_memory_agent.py tests/test_memory_manager.py -v`
+Expected: 18 passed
+
+Run: `cd backend && python -m pytest tests/ -v`
+Expected: 全部 passed
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add backend/agents/agent/extract_memory_agent.py backend/agents/memory/memory_manager.py backend/tests/test_extract_memory_agent.py backend/tests/test_memory_manager.py
+git commit -m "feat: 记忆精炼截断输入并按长度限时，记录耗时"
+```
+
+- [ ] **Step 7: 上线后看数据，再决定下一步**
+
+服务跑一段时间后统计日志：
+
+```bash
+grep -c "记忆精炼完成" logs/*.log
+grep "记忆精炼超时" logs/*.log
+```
+
+按结果决定：
+
+| 观察到的情况 | 说明 | 下一步 |
+|---|---|---|
+| 几乎没有超时，耗时稳定 | 截断加限时已经够用 | 不做别的 |
+| 超时集中在输入长的条目 | 长度确实是主因 | 调小 `MODEL_MEMORY_MAX_CHARS` |
+| 超时与长度无关、零星出现 | 服务端偶发卡顿 | 保持现状，靠 pending 重试即可 |
+| 耗时普遍偏长，pending 积压 | 串行调用太多 | 考虑后续可选的改动（见下） |
+
+**后续可选的改动**（先不做，数据支持时再做）：
+- **按会话合并调度**：同一个会话同一时刻只跑一个归档协程；启动恢复只做登记、立即返回，不再阻塞启动（Task 7 目前是 `await drain_pending()`）。它还能消除启动恢复与新产生的溢出同时处理同一条记录的问题
+- **批量精炼、按来源编号对齐**：每条输出注明来自哪几条输入（`"sources": [0, 2]`），把 N 次调用降为 1 次；对齐失败就退回逐条处理
+- **全局并发上限**：多个会话同时溢出时，限制同时进行的 LLM 调用数
+- **失败次数上限**：同一条记录失败 3 次后移到 dead 列表，不再每次启动都重试
+
+---
+
 ## 验收对照表
 
 实施完成后，逐条核对设计文档的验收标准：
@@ -3057,6 +3321,7 @@ git commit -m "docs: 更新 CLAUDE.md 至改造后的实际架构"
 | 7c | 词表外的键转存 notes，不静默失效 | `test_profile_schema_skill.py::test_unknown_key_is_routed_to_notes` |
 | 7d | notes 不进 system prompt | `test_react_agent_async.py::test_format_profile_excludes_notes` |
 | 8 | 事件循环无同步 LLM 调用 | `test_react_agent_async.py::test_react_think_node_is_coroutine_function` |
+| 9 | 精炼调用不会无限挂起，超时的条目留在 pending | `test_extract_memory_agent.py::test_slow_llm_times_out`、`test_memory_manager.py::test_refine_timeout_keeps_item_pending_without_traceback` |
 
 全量跑一遍：
 
