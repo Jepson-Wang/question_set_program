@@ -5,7 +5,7 @@ aiosqlite==0.22.1
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.12.1
-asyncmy==0.2.11
+asyncmy==0.2.14
 attrs==26.1.0
 banks==2.4.1
 bcrypt==5.0.0
