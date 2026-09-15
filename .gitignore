@@ -3,3 +3,4 @@ backend/.env
 *.env
 __pycache__/
 backend/logs/
+.venv/
