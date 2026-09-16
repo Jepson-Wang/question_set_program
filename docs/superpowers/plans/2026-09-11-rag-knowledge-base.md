@@ -4,18 +4,81 @@
 
 **Goal:** 为生成变式题建立题库与教材知识库：PDF / Word 与 LLM 生成的资料经第三方模型复核后入库；生题前经多路召回、RRF 融合、重排得到参考材料交给模型决策；用离线评测量化每项检索技术的收益。
 
-**Architecture:** Chroma 存两个 collection（题目一题一文档，教材按段切块）；进程内的词法索引同时承担 BM25、知识点倒排与题目目录，重建时整体替换快照。入库流水线由命令行与后台接口共用，去重在复核之前、复核失败即拒。检索三路并行、逐级降级，任何环节失败都不影响生题。
+**Architecture:** 向量操作统一经 LlamaIndex：向量化用 LlamaIndex 的 `BaseEmbedding`，向量库经 LlamaIndex 的 Chroma 集成读写两个 collection（题目一题一文档，教材按段切块）；进程内的词法索引同时承担 BM25、知识点倒排与题目目录，重建时整体替换快照。入库流水线由命令行与后台接口共用，去重在复核之前、复核失败即拒。检索三路并行、逐级降级，任何环节失败都不影响生题。
 
-**Tech Stack:** Python 3.14 / FastAPI / LangChain（ChatOpenAI 对接 DashScope）/ chromadb 1.5.5 / jieba 0.42.1 / rank_bm25 0.2.2 / pypdf 6.18.0 / python-docx 1.2.0 / httpx / SQLAlchemy async / pytest + pytest-asyncio
+**Tech Stack:** Python 3.14 / FastAPI / LangChain（ChatOpenAI 对接 DashScope）/ LlamaIndex 0.14.18（llama-index-core + llama-index-vector-stores-chroma 0.5.5）/ chromadb 1.5.5 / jieba 0.42.1 / rank_bm25 0.2.2 / pypdf 6.18.0 / python-docx 1.2.0 / httpx / SQLAlchemy async / pytest + pytest-asyncio
 
 **Spec:** `docs/superpowers/specs/2026-09-11-rag-knowledge-base-design.md`
+
+## 依赖清单
+
+开工前先过一遍这张清单。版本号是编写本计划时在 Python 3.14.3 上实测通过的版本，「状态」是当时 `backend/.venv` 里的实际情况。
+
+**需要新装**（Task 0 Step 2）
+
+| 包（pip 名） | import 名 | 版本 | 用途 | 首次用到 |
+|---|---|---|---|---|
+| jieba | `jieba` | 0.42.1 | 中文分词，BM25 用它的搜索引擎模式 `cut_for_search` | Task 3 |
+| rank_bm25 | `rank_bm25` | 0.2.2 | BM25 打分 | Task 3 |
+| pypdf | `pypdf` | 6.18.0 | 抽取 PDF 文本 | Task 5 |
+| python-docx | `docx` | 1.2.0 | 读取 Word（.docx） | Task 5 |
+| lxml | `lxml` | 6.1.3 | python-docx 的依赖，随它自动安装；也要写进 requirements.txt | Task 5 |
+
+**已安装，但缺二进制文件，必须修复**（Task 0 Step 1）
+
+安装记录（`RECORD`）里登记了、磁盘上却不存在的编译扩展，导致 `import chromadb` 失败。这不是版本不兼容：PyPI 上这三个版本都有 Python 3.14 的 Windows 二进制包，补回文件后全部 RAG 测试通过。
+
+| 包 | 版本 | 缺失的文件 | 作用 |
+|---|---|---|---|
+| grpcio | 1.78.0 | `grpc/_cython/cygrpc.cp314-win_amd64.pyd` | chromadb 导入时要用 |
+| chromadb | 1.5.5 | `chromadb_rust_bindings/chromadb_rust_bindings.pyd` | 向量库本体（本地持久化） |
+| onnxruntime | 1.24.4 | `onnxruntime/capi/onnxruntime_pybind11_state.pyd` | chromadb 默认 embedding 函数的依赖。本计划自己算向量、用不到它，但一起修好，免得以后踩到 |
+
+**已安装，直接可用**
+
+| 包 | 版本 | 用途 | 首次用到 |
+|---|---|---|---|
+| llama-index-core | 0.14.18 | `TextNode`、`VectorStoreQuery`、`BaseEmbedding`：向量操作的统一接口 | Task 2 |
+| llama-index-vector-stores-chroma | 0.5.5 | LlamaIndex 的 Chroma 集成 | Task 2 |
+| openai | 2.26.0 | `get_llm.py` 里的 `DashScopeEmbedding` 通过它调用向量化接口 | Task 2 |
+| pydantic | 2.12.5 | 领域模型 | Task 1 |
+| SQLAlchemy / aiosqlite | 2.0.48 / 0.22.1 | 入库任务表、隔离区表；测试里用 SQLite 代替 MySQL | Task 4 |
+| langchain-openai / langchain-core | 1.1.10 / 1.2.17 | `ChatOpenAI`：结构化、种子题生成、裁判 | Task 6 |
+| httpx | 0.28.1 | 调用重排接口；测试里用 `MockTransport` 做替身 | Task 0 |
+| fastapi / python-multipart | 0.135.1 / 0.0.20 | 管理接口；`UploadFile` 需要 python-multipart | Task 17 |
+| numpy | 2.4.3 | rank_bm25 的依赖 | Task 3 |
+| pytest / pytest-asyncio | 9.0.2 / 1.3.0 | 测试 | Task 0 |
+
+**用不到，不要装**
+
+| 包 | 为什么不用 |
+|---|---|
+| llama-index-retrievers-bm25 | 基于 bm25s，默认按英文分词、取词干；中文要另接分词器。本计划的词法索引还兼做知识点倒排和题目目录，所以保持 jieba + rank_bm25 |
+| llama-index-postprocessor-dashscope-rerank | 会引入 dashscope SDK。重排直接用 httpx 调接口，失败降级与响应解析都有测试覆盖 |
+| llama-index-embeddings-dashscope | `get_llm.py` 已有自定义的 `DashScopeEmbedding`（绕过了模型名的枚举校验），直接复用 |
+| llama-index-readers-file | 依赖很多；PDF、Word 直接用 pypdf、python-docx |
+| torch、sentence-transformers、FlagEmbedding | 向量化和重排都走 DashScope 接口，不在本地跑模型 |
+| ragas | 评测指标（召回率、MRR、成对胜率）自己算，代码量很小 |
+| reportlab | 测试用的 PDF 是手写字节生成的 |
+
+LlamaIndex 的 `VectorStoreIndex`、`IngestionPipeline`、`QueryFusionRetriever` 都在 llama-index-core 里，不用另装；但本计划不用它们，理由见 Task 2 开头。
+
+一次装齐（逐步操作与核对见 Task 0 Step 1-2）：
+
+```bash
+cd backend
+pip install --force-reinstall --no-deps --no-cache-dir grpcio==1.78.0 chromadb==1.5.5 onnxruntime==1.24.4
+pip install jieba==0.42.1 rank_bm25==0.2.2 pypdf==6.18.0 python-docx==1.2.0
+python -c "import chromadb, llama_index.vector_stores.chroma, jieba, rank_bm25, pypdf, docx; print('OK')"
+```
 
 ## 这份计划里的代码是跑通过的
 
 写这份计划之前，所有代码都在仓库的一个临时副本里完整实现并运行过，文档里的代码块直接从那份副本导出，没有手抄：
 
-- 当前环境（chromadb 因 grpc 编译扩展与 Python 3.14 不兼容而无法导入）：**185 passed，6 skipped**。跳过的全部依赖 chromadb（3 个接口测试文件整体跳过，另有 3 条单独跳过），并给出明确原因
-- 用替身顶替 chromadb 之后：除两个必须连真实 Chroma 的测试外全部通过——这两个只能在你修好 grpc 后验证，所以 Task 0 安排了探针
+- 补回缺失的二进制文件、用真实的 LlamaIndex + Chroma 运行：**218 passed**
+- 当前环境（chromadb 缺二进制文件，无法导入）：**191 passed，10 skipped**。跳过的全部依赖 chromadb（3 个接口测试文件整体跳过，另有 7 条单独跳过），并给出明确原因
+- 向量存储改为 LlamaIndex 版本时，LlamaIndex 与 Chroma 的每一处特殊行为都先在真实 Chroma 上实测，再写进适配层；适配层的每一道防护都做过变异验证——去掉任何一道，都恰好有一条测试失败
 
 验证过程中发现、并已在本计划中修正的问题（spec 已同步）：
 
@@ -25,13 +88,19 @@
 4. **RAG 的 skill 需要 `visibility: internal`**。否则会出现在 ReAct 主提示词的 Skill 清单里，诱导 Agent 在处理用户请求时去加载
 5. **上传文件要单独传原始文件名**。落盘名是任务 id，不传的话题目来源里记的是一串 id，无法追溯
 6. **后台接口的测试依赖 chromadb 可导入**。`backend/api/__init__.py` 会连带导入 agent_api，这是项目原有结构，相关测试已用 `importorskip` 守住
+7. **chromadb 导入失败的原因是二进制文件缺失，不是版本不兼容**。重装三个包即可，不用换 Python 版本（见依赖清单）
+8. **LlamaIndex 返回的分数不是余弦相似度**。它的 Chroma 集成返回 exp(-距离)：余弦 0.6 会变成 0.67，余弦 0 会变成 0.37；去重、防泄漏、教材阈值都按余弦定义，适配层要换算回来
+9. **LlamaIndex 的 add 不是 upsert**。对已有 id 再写一次会被 Chroma 静默忽略，改了内容也不生效；同一批里 id 重复直接报错；`delete_nodes([])` 也报错
+10. **LlamaIndex 的异步方法会阻塞事件循环**。`async_add`、`aquery` 只是直接调用同步方法，仍然要投递到线程池
+11. **LlamaIndex 的批量向量化没有并发上限**。`aget_text_embedding_batch` 会把所有批次一起发出去，一份 200 段的教材就是 200 个并发请求；`LlamaIndexEmbedder` 改为逐批等待
 
 ## Global Constraints
 
 - 单机单进程；互斥与后台任务一律用进程内机制。
-- 所有 I/O 保持 async；同步阻塞或 CPU 密集的调用（PDF 解析、BM25 检索与重建、Chroma 操作、写上传文件）投递到 `backend.core.executors.get_vector_executor()`，不要用 `run_in_executor(None, ...)`。
+- 所有 I/O 保持 async；同步阻塞或 CPU 密集的调用（PDF 解析、BM25 检索与重建、LlamaIndex 向量库操作、写上传文件）投递到 `backend.core.executors.get_vector_executor()`，不要用 `run_in_executor(None, ...)`。
 - 所有目录相对 `backend/` 解析，不依赖当前工作目录：`RAG_DB_DIR` 默认 `rag_db`，`RAG_UPLOAD_DIR` 默认 `rag_uploads`，`RAG_EVAL_DIR` 默认 `rag_eval`。
-- 向量一律归一化为单位长度；Chroma collection 使用 cosine 空间，相似度 = 1 - 距离。
+- 向量操作统一经 LlamaIndex：向量化用 `BaseEmbedding`，读写向量库用 `TextNode` 与 `VectorStoreQuery`。只有 `from_chroma` 创建 client 与 collection 时直接用 chromadb（要指定 cosine 空间）。
+- 向量一律归一化为单位长度；Chroma collection 使用 cosine 空间。LlamaIndex 返回的分数是 exp(-距离)，由适配层换算回余弦相似度，**RAG 这一层**的业务代码拿到的一律是余弦。（记忆层是另一套：`VectorStoreManager` 建 collection 时没指定距离函数，用的是 chromadb 默认的 l2，`min_score` 卡的是 `exp(-平方欧氏距离)`，详见记忆计划 Task 11。两层的阈值不能直接互相套用。）
 - 题目 id = `q_` + 规范化题干 sha1 的前 16 位；教材段 id = `k_` + 规范化文本 sha1 的前 16 位。
 - 检索参数：每路召回 20，融合后 30，最终 3，教材 2；RRF k = 60；重排分数阈值 0.3；教材相似度阈值 0.5。
 - 近似去重与防泄漏阈值：余弦相似度 0.95。
@@ -83,8 +152,9 @@
 | `backend/agents/rag/config.py` | RAG 配置 | 0 |
 | `backend/scripts/__init__.py`、`backend/scripts/rag_probe.py` | 外部接口探针 | 0 |
 | `backend/agents/rag/models.py` | 领域模型、文本规范化、id、年级排序 | 1 |
-| `backend/agents/rag/store/embedder.py` | 向量化协议、归一化、DashScope 实现 | 2 |
-| `backend/agents/rag/store/vector_store.py` | 向量存储协议、内存实现、Chroma 实现 | 2 |
+| `backend/agents/rag/store/embedder.py` | 向量化协议、归一化、LlamaIndex 实现 | 2 |
+| `backend/agents/rag/store/vector_store.py` | 向量存储协议、内存实现 | 2 |
+| `backend/agents/rag/store/llama_store.py` | LlamaIndex 适配层（生产实现，后端 Chroma） | 2 |
 | `backend/agents/rag/store/lexical_index.py` | BM25 + 知识点倒排 + 题目目录 | 3 |
 | `backend/model/rag.py` | 入库任务表、隔离区表 | 4 |
 | `backend/dao/rag_mapper.py` | 任务与隔离区的数据访问 | 4 |
@@ -136,7 +206,11 @@
 
 ## Task 0: 环境、依赖与配置
 
-要先解决的是 **chromadb 现在无法导入**：`import chromadb` 在当前 venv 里报 `ImportError: cannot import name 'cygrpc'`，原因是 grpcio 的编译扩展与 Python 3.14 不兼容。服务的启动链路会导入它，所以这个问题不解决，服务就起不来。RAG 的大部分测试跑在内存实现上，不受影响。
+> **这个任务做什么**：给 RAG 打地基，还不写任何检索或入库逻辑。一共四件事：① 确保 chromadb 和 LlamaIndex 的 Chroma 集成能正常导入——导入失败通常是 grpcio、chromadb、onnxruntime 的编译文件（`.pyd`）在磁盘上缺失，按步骤只重装这几个包即可；② 装齐 RAG 的新依赖（jieba 中文分词、rank_bm25 关键词检索、pypdf 读 PDF、python-docx 读 Word），把实际版本写进 `requirements.txt`，并在 `.gitignore` 里忽略 RAG 运行时生成的三个数据目录（知识库、上传文件、评测报告）；③ 新建 `backend/agents/rag/config.py`，用一个只读的 `RagSettings` 把所有 RAG 配置项（开关、目录、重排接口、裁判模型等）集中从 `.env` 读进来，后面所有任务都从这里取配置；④ 写一个一次性探针脚本 `rag_probe.py`，用真实请求确认四件项目外部的事：DashScope 重排接口的返回结构、embedding 能否拿到向量、LlamaIndex 读写 Chroma 时查询分数怎么换算成余弦相似度、裁判模型能不能调通。
+>
+> **做完之后**：`backend/tests/rag/` 测试目录和 `rag_settings` fixture 建好了，后续任务的测试都用它；探针的输出决定 Task 2 和 Task 14 里有没有要按实际情况调整的地方。chromadb 暂时修不好也不耽误往下做，依赖它的测试会被明确跳过。
+
+要先解决的是 **chromadb 现在无法导入**：`import chromadb` 在当前 venv 里报 `ImportError: cannot import name 'cygrpc'`。原因不是版本不兼容，而是有三个包的编译扩展（`.pyd`）在安装记录里登记了、磁盘上却不存在（见依赖清单）。LlamaIndex 的 Chroma 集成和服务的启动链路都会导入 chromadb，所以这个问题不解决，服务就起不来。RAG 的大部分测试跑在内存实现上，不受影响。
 
 **Files:**
 - Modify: `backend/requirements.txt`、`.gitignore`
@@ -154,29 +228,40 @@
 
 - [ ] **Step 1: 修复 chromadb 的导入**
 
+> **这一步已经做完了**（2026-09-15）：三个缺失的 `.pyd` 已经通过 `pip install --force-reinstall --no-deps --no-cache-dir grpcio==1.78.0 chromadb==1.5.5 onnxruntime==1.24.4` 补回，`import chromadb` 正常。下面保留排查过程，供以后再遇到时参考。**因此本计划里所有「chromadb 不可用时 X skipped」的分支都不会出现，实际看到的是「可用」那一档的数字。**
+
 ```bash
 cd backend
-python -c "import chromadb; print('chromadb OK')"
+python -c "import chromadb, llama_index.vector_stores.chroma; print('OK')"
 ```
 
-报 `cannot import name 'cygrpc'` 时，先尝试重装 grpcio：
+报 `cannot import name 'cygrpc'` 或 `No module named 'chromadb_rust_bindings.chromadb_rust_bindings'` 时，先列出 venv 里缺失的二进制文件：
 
 ```bash
-pip install --force-reinstall --no-cache-dir grpcio
-python -c "import chromadb; print('chromadb OK')"
+python -c "
+import csv, pathlib, sysconfig
+sp = pathlib.Path(sysconfig.get_paths()['purelib'])
+for rec in sp.glob('*.dist-info/RECORD'):
+    for row in csv.reader(rec.read_text(encoding='utf-8').splitlines()):
+        if row and row[0].endswith(('.pyd', '.dll')) and not (sp / row[0]).exists():
+            print(rec.parent.name, row[0])
+"
 ```
 
-仍然失败的话，看 PyPI 上有没有适配 Python 3.14 的 grpcio 二进制包：
+编写本计划时输出的是 grpcio、chromadb、onnxruntime 各一个文件。只重装这几个包本身（`--no-deps` 表示不动它们的依赖）：
 
 ```bash
-pip download grpcio --only-binary=:all: --no-deps -d ./_grpc_probe
+pip install --force-reinstall --no-deps --no-cache-dir grpcio==1.78.0 chromadb==1.5.5 onnxruntime==1.24.4
+python -c "import chromadb, llama_index.vector_stores.chroma; print('OK')"
 ```
 
-下载到的文件名里有 `cp314` 说明有，重装应该能解决；没有的话说明 grpcio 尚未支持 3.14，需要为这个项目换成 Python 3.12 或 3.13 的虚拟环境。完事后删掉 `_grpc_probe` 目录。
+再跑一次上面的检查脚本，应当没有输出。如果重装后文件又不见了，多半是杀毒软件把它们隔离了：到隔离区恢复，并把 `backend/.venv` 加入排除目录。
 
-**这一步没解决之前**：依赖 chromadb 的 5 个测试会被明确跳过，其余 RAG 任务都可以照常推进。
+**这一步没解决之前**：依赖 chromadb 的测试会被明确跳过（全部任务做完时共 10 个），其余 RAG 任务都可以照常推进。
 
 - [ ] **Step 2: 安装依赖并回填版本**
+
+> **这一步也已经做完了**（2026-09-15）：jieba 0.42.1、rank-bm25 0.2.2、pypdf 6.18.0、python-docx 1.2.0、lxml 6.1.3 都已安装并写进 `requirements.txt`（提交 `f9d1cff`）。那次提交同时把 `asyncmy` 升到 0.2.12，并清掉了 25 个没用到的包，其中包括 `llama-index` 元包和它的几个子包——RAG 用到的 `llama-index-core` 与 `llama-index-vector-stores-chroma` 都保留着。
 
 ```bash
 pip install jieba rank_bm25 pypdf python-docx
@@ -185,6 +270,8 @@ pip show jieba rank_bm25 pypdf python-docx lxml | grep -iE "^(name|version)"
 ```
 
 把实际版本写进 `backend/requirements.txt`（lxml 是 python-docx 的依赖，一并写入）。编写本计划时在 Python 3.14 上验证过的版本是：jieba 0.42.1、rank_bm25 0.2.2、pypdf 6.18.0、python-docx 1.2.0、lxml 6.1.3。
+
+LlamaIndex 相关的包已经在 requirements.txt 里（llama-index-core 0.14.18、llama-index-vector-stores-chroma 0.5.5），不用另装，也不要单独升级：Task 2 适配层依赖的几处行为是在这两个版本上实测的，升级后要先重跑 Step 9 的探针。
 
 - [ ] **Step 3: 忽略数据目录**
 
@@ -381,16 +468,18 @@ Expected: 5 passed
 
 ```python
 """
-一次性探针：在写检索与入库代码之前，用真实请求确认三件事。会产生极少量 API 费用。
+一次性探针：在写检索与入库代码之前，用真实请求确认四件事。会产生极少量 API 费用。
 
     python -m backend.scripts.rag_probe      （在仓库根目录运行）
 
 1. 重排接口：地址、模型名是否可用，响应结构长什么样（Task 14 的解析函数以此为准）
-2. Chroma 的 cosine 空间：相同向量距离约 0、正交向量约 1（Task 2 的相似度换算以此为准）
-3. 裁判模型：配置是否可用
+2. 向量化：LlamaIndex 的 embedding 封装能否拿到向量、维度多少
+3. LlamaIndex + Chroma：查询分数与 cosine 距离的关系、重复 id 的写入行为（Task 2 的适配层以此为准）
+4. 裁判模型：配置是否可用
 """
 import asyncio
 import json
+import math
 import tempfile
 
 import httpx
@@ -413,15 +502,35 @@ async def probe_rerank(settings: RagSettings) -> None:
     print("[rerank] 预期：结果在 output.results 里，每项含 index 与 relevance_score，且方程那条分数更高")
 
 
-def probe_chroma() -> None:
+async def probe_embedding(settings: RagSettings) -> None:
+    from backend.agents.agent.get_llm import get_embedding_model
+
+    vectors = await get_embedding_model().aget_text_embedding_batch(["解方程 2x+3=7", "计算三角形的面积"])
+    print(f"[embedding] 返回 {len(vectors)} 条，维度 {len(vectors[0])}")
+    print("[embedding] 预期：2 条，维度与 EMBEDDING_MODEL 的说明一致")
+
+
+def probe_llamaindex_chroma() -> None:
     import chromadb
+    from llama_index.core.schema import TextNode
+    from llama_index.core.vector_stores.types import VectorStoreQuery
+    from llama_index.vector_stores.chroma import ChromaVectorStore
 
     client = chromadb.PersistentClient(path=tempfile.mkdtemp())
     collection = client.get_or_create_collection("probe", metadata={"hnsw:space": "cosine"})
-    collection.upsert(ids=["same", "orth"], embeddings=[[1.0, 0.0], [0.0, 1.0]], documents=["a", "b"])
-    result = collection.query(query_embeddings=[[1.0, 0.0]], n_results=2, include=["distances"])
-    print(f"[chroma] ids={result['ids'][0]} distances={result['distances'][0]}")
-    print("[chroma] 预期：same 约 0.0，orth 约 1.0（cosine 距离 = 1 - 余弦相似度）")
+    store = ChromaVectorStore(chroma_collection=collection)
+    store.add([
+        TextNode(id_="same", text="a", embedding=[1.0, 0.0]),
+        TextNode(id_="mid", text="b", embedding=[0.6, 0.8]),
+    ])
+    result = store.query(VectorStoreQuery(query_embedding=[1.0, 0.0], similarity_top_k=2))
+    cosines = [round(1 + math.log(score), 4) for score in result.similarities]
+    print(f"[chroma] ids={result.ids} 分数={[round(s, 4) for s in result.similarities]} 按 1+ln(分数) 换算={cosines}")
+    print("[chroma] 预期：换算后 same 约 1.0、mid 约 0.6（LlamaIndex 返回的分数 = exp(-cosine 距离)）")
+
+    store.add([TextNode(id_="same", text="changed", embedding=[1.0, 0.0])])
+    print(f"[chroma] 对已有 id 再 add 一次后，原文={collection.get(ids=['same'])['documents']}")
+    print("[chroma] 预期：仍是 ['a']（add 不覆盖已有记录，所以适配层的 upsert 要先删后加）")
 
 
 async def probe_judge(settings: RagSettings) -> None:
@@ -439,13 +548,13 @@ async def probe_judge(settings: RagSettings) -> None:
 
 async def main() -> None:
     settings = RagSettings.from_env()
-    for name, probe in (("rerank", probe_rerank), ("judge", probe_judge)):
+    for name, probe in (("rerank", probe_rerank), ("embedding", probe_embedding), ("judge", probe_judge)):
         try:
             await probe(settings)
         except Exception as e:
             print(f"[{name}] 失败：{type(e).__name__}: {e}")
     try:
-        probe_chroma()
+        probe_llamaindex_chroma()
     except Exception as e:
         print(f"[chroma] 失败：{type(e).__name__}: {e}")
 
@@ -463,8 +572,9 @@ python -m backend.scripts.rag_probe
 逐项核对输出：
 
 1. **rerank**：记下结果列表在响应中的路径和字段名。如果不是 `output.results[].index / relevance_score`，Task 14 的 `parse_rerank_response` 要按实际结构改；模型名不可用时改 `.env` 里的 `RERANK_MODEL`。
-2. **chroma**：`same` 约 0、`orth` 约 1 才对。如果不是，说明 cosine 空间的配置方式在当前 chromadb 版本里变了，Task 2 的 `ChromaVectorStore` 要相应调整。
-3. **judge**：能返回「2」即可。
+2. **embedding**：返回 2 条向量即可。失败时检查 `.env` 里的 `EMBEDDING_MODEL`。
+3. **chroma**：换算后 `same` 约 1.0、`mid` 约 0.6，且重复 add 之后原文仍是 `['a']`。换算结果不对，说明 LlamaIndex 的 Chroma 集成改了分数公式（当前是 exp(-距离)），Task 2 的 `chroma_score_to_cosine` 要跟着改；原文变成了 `'changed'`，说明 add 已经会覆盖，这时先删后加仍然正确，不用改。
+4. **judge**：能返回「2」即可。
 
 - [ ] **Step 10: 提交**
 
@@ -476,6 +586,10 @@ git commit -m "feat: RAG 配置与外部接口探针"
 ---
 
 ## Task 1: 领域模型
+
+> **这个任务做什么**：定义整个 RAG 模块共用的「数据长什么样」，全是纯 Python 数据类，不连数据库，也不调模型。包括：一道题 `QuestionItem`（题干、答案、解析、题型、难度、知识点、年级、来源）、一段教材讲解 `KnowledgeChunk`、裁判复核结果 `JudgeResult`、一次检索的输入 `RagQuery` 和输出 `RagContext`。另外定三条小规则：文本规范化（全角转半角、去空白、转小写）；用规范化文本的哈希当 id，同一道题无论从哪来，id 永远相同；年级排序，用来避免给低年级学生推高年级的题。
+>
+> **做完之后**：后续所有任务都用这些类型传数据。这是最适合入门的任务：没有外部依赖，读懂它就知道 RAG 里流转的都是些什么。
 
 题目与教材段的数据结构、文本规范化与 id 规则、年级排序。之后所有任务都建立在这里定义的类型上。
 
@@ -838,24 +952,34 @@ git commit -m "feat: RAG 领域模型与内容哈希 id"
 
 ## Task 2: 向量化与向量存储
 
-入库与检索只依赖 `VectorStore` 协议：测试与评测用内存实现，生产用 Chroma。chromadb 在构造时才导入，它坏掉时只影响真正用到它的地方。
+> **这个任务做什么**：解决「文本怎么变成向量、向量存到哪、怎么按相似度查」。定义两个协议（可以理解成接口约定）：`Embedder` 把文本变成向量，生产环境用 `LlamaIndexEmbedder` 包装项目里已有的 LlamaIndex embedding 模型；`VectorStore` 负责存向量、按相似度查询，有两个实现——`LlamaIndexVectorStore`（生产用，经 LlamaIndex 读写落盘的 Chroma，单独写在适配层 `llama_store.py` 里）和 `InMemoryVectorStore`（测试用，只存在内存里）。适配层要抹平 LlamaIndex + Chroma 的几处特殊行为，比如查询返回的分数要换算回余弦相似度、写入已存在的 id 时不会覆盖。所有向量都归一化成单位长度，这样余弦相似度就等于点积，两种实现算出来的相似度可以直接比较。测试里用 `HashingEmbedder` 代替真实模型，不花钱、结果固定。
+>
+> **做完之后**：能把题目的向量存进库，并查出最相似的几条。它是三路召回里「向量召回」那一路的底座，Task 9 的近似去重也要用它。
+
+入库与检索只依赖 `VectorStore` 协议：测试与评测用内存实现，生产用 LlamaIndex 读写 Chroma。LlamaIndex 适配层放在单独的 `llama_store.py`，chromadb 到 `from_chroma` 里才导入，它坏掉时只影响真正用到它的地方。
+
+**为什么直接操作 LlamaIndex 的向量库，而不用 `VectorStoreIndex`**：向量要事先算好。去重在入库前就要拿到向量；一次检索的查询向量要在题库、教材库两个库之间复用；向量化失败时检索要能降级。`VectorStoreIndex` 会自己再向量化一次，没配 embed_model 时还会去用 LlamaIndex 全局 Settings 里默认的 OpenAI。`QueryFusionRetriever` 同理：三路召回、降级和计时都要自己控制，所以融合也自己写（Task 13）。
+
+**适配层要处理的四处特殊行为**（都在真实 Chroma 上测过，详见 `llama_store.py` 的模块说明）：分数是 exp(-距离)，要换算回余弦；add 不覆盖已有 id，upsert 要先删后加，同批 id 要去重；`delete_nodes([])` 会报错；异步方法其实是同步的。
 
 **Files:**
 - Create: `backend/agents/rag/store/__init__.py`（空文件）
 - Create: `backend/agents/rag/store/embedder.py`
 - Create: `backend/agents/rag/store/vector_store.py`
+- Create: `backend/agents/rag/store/llama_store.py`
 - Create: `backend/tests/rag/helpers.py`
 - Test: `backend/tests/rag/test_vector_store.py`
 
 **Interfaces:**
-- Consumes: `get_vector_executor()`（记忆计划 Task 3）、`get_embedding_model()`（已有的 `get_llm.py`）
+- Consumes: `get_vector_executor()`（记忆计划 Task 3）、`get_embedding_model()`（已有的 `get_llm.py`，返回 LlamaIndex 的 `BaseEmbedding`）、llama-index-core、llama-index-vector-stores-chroma
 - Produces:
   - `Embedder` 协议：`async embed(texts) -> list[list[float]]`
   - `l2_normalize(vec)`、`dot(a, b)`
-  - `DashScopeEmbedder(model=None)`
+  - `LlamaIndexEmbedder(model=None, batch_size=10)`：包装任意 LlamaIndex `BaseEmbedding`，默认用 `get_embedding_model()`
   - `VectorHit(id, document, metadata, similarity)`
   - `VectorStore` 协议：`upsert(ids, embeddings, documents, metadatas)`、`query(embedding, top_k) -> list[VectorHit]`、`get_all() -> list[(id, document, metadata)]`、`count()`、`delete(ids)`，全部为 async
-  - `InMemoryVectorStore()`、`ChromaVectorStore(persist_dir, collection_name)`
+  - `InMemoryVectorStore()`
+  - `LlamaIndexVectorStore(backend, score_to_similarity)`、`LlamaIndexVectorStore.from_chroma(persist_dir, collection_name)`、`chroma_score_to_cosine(score)`
   - 测试替身 `HashingEmbedder(dim=256)`
 
 - [ ] **Step 1: 写测试替身**
@@ -900,11 +1024,15 @@ class HashingEmbedder:
 创建 `backend/tests/rag/test_vector_store.py`：
 
 ```python
+import asyncio
 import math
 
 import pytest
+from llama_index.core.embeddings import MockEmbedding
+from llama_index.core.vector_stores import SimpleVectorStore
 
-from backend.agents.rag.store.embedder import DashScopeEmbedder, dot, l2_normalize
+from backend.agents.rag.store.embedder import LlamaIndexEmbedder, dot, l2_normalize
+from backend.agents.rag.store.llama_store import LlamaIndexVectorStore, chroma_score_to_cosine
 from backend.agents.rag.store.vector_store import InMemoryVectorStore
 from backend.tests.rag.helpers import HashingEmbedder
 
@@ -919,21 +1047,50 @@ def test_l2_normalize_zero_vector_is_safe():
     assert l2_normalize([0.0, 0.0]) == [0.0, 0.0]
 
 
-async def test_dashscope_embedder_normalizes_model_output():
+# ---------- 向量化 ----------
+
+async def test_embedder_normalizes_model_output():
     class FakeModel:
         async def aget_text_embedding_batch(self, texts):
             return [[3.0, 4.0] for _ in texts]
 
-    vectors = await DashScopeEmbedder(model=FakeModel()).embed(["a", "b"])
+    vectors = await LlamaIndexEmbedder(model=FakeModel()).embed(["a", "b"])
     assert vectors == [pytest.approx([0.6, 0.8]), pytest.approx([0.6, 0.8])]
 
 
-async def test_dashscope_embedder_empty_input_makes_no_call():
+async def test_embedder_empty_input_makes_no_call():
     class ExplodingModel:
         async def aget_text_embedding_batch(self, texts):
             raise AssertionError("空输入不应调用接口")
 
-    assert await DashScopeEmbedder(model=ExplodingModel()).embed([]) == []
+    assert await LlamaIndexEmbedder(model=ExplodingModel()).embed([]) == []
+
+
+async def test_embedder_sends_one_bounded_batch_at_a_time():
+    """25 条文本分成 10、10、5 三批，且同一时刻只有一批在请求：并发量不随文本数增长。"""
+    class RecordingModel:
+        def __init__(self):
+            self.batches, self.in_flight, self.max_in_flight = [], 0, 0
+
+        async def aget_text_embedding_batch(self, texts):
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+            await asyncio.sleep(0)
+            self.in_flight -= 1
+            self.batches.append(len(texts))
+            return [[1.0, 0.0] for _ in texts]
+
+    model = RecordingModel()
+    vectors = await LlamaIndexEmbedder(model=model, batch_size=10).embed([f"t{i}" for i in range(25)])
+    assert len(vectors) == 25
+    assert model.batches == [10, 10, 5]
+    assert model.max_in_flight == 1
+
+
+async def test_embedder_accepts_a_real_llamaindex_embedding():
+    """真正的 LlamaIndex BaseEmbedding 子类可以直接接入（MockEmbedding 固定返回 [0.5] * 维度）。"""
+    [vector] = await LlamaIndexEmbedder(model=MockEmbedding(embed_dim=4)).embed(["任意文本"])
+    assert vector == pytest.approx([0.5, 0.5, 0.5, 0.5])
 
 
 async def test_hashing_embedder_is_a_trustworthy_double():
@@ -947,43 +1104,80 @@ async def test_hashing_embedder_is_a_trustworthy_double():
     assert dot(a, c) < 0.5
 
 
-async def test_in_memory_store_orders_by_similarity():
-    store = InMemoryVectorStore()
-    await store.upsert(["x", "y"], [[1.0, 0.0], [0.6, 0.8]], ["doc-x", "doc-y"], [{"k": "x"}, {"k": "y"}])
-    hits = await store.query([1.0, 0.0], top_k=2)
-    assert [h.id for h in hits] == ["x", "y"]
-    assert hits[0].similarity == pytest.approx(1.0)
-    assert hits[1].similarity == pytest.approx(0.6)
-    assert hits[0].document == "doc-x" and hits[0].metadata == {"k": "x"}
+# ---------- 向量存储：两种实现跑同一套契约测试 ----------
+# 其余测试都用内存实现，生产用 LlamaIndex + Chroma；这组测试保证两者行为一致，可以互换。
+
+@pytest.fixture(params=["memory", "llamaindex_chroma"])
+def store(request, tmp_path):
+    if request.param == "memory":
+        return InMemoryVectorStore()
+    # 必须显式传 exc_type=ImportError：chromadb「找得到但导入报错」（如编译扩展缺失）时，
+    # pytest 9.1 起默认会把跳过改成报错
+    pytest.importorskip("chromadb", exc_type=ImportError)
+    return LlamaIndexVectorStore.from_chroma(tmp_path / "chroma", "contract")
 
 
-async def test_in_memory_store_upsert_overwrites_and_delete_removes():
-    store = InMemoryVectorStore()
+async def test_query_returns_cosine_similarity_in_order(store):
+    """mid 与查询向量的余弦是 0.6：不换算的话，LlamaIndex + Chroma 会给出 exp(-0.4) ≈ 0.67。"""
+    await store.upsert(
+        ["same", "mid", "orth"],
+        [[1.0, 0.0], [0.6, 0.8], [0.0, 1.0]],
+        ["doc-same", "doc-mid", "doc-orth"],
+        [{"k": "same", "n": 1}, {"k": "mid"}, {"k": "orth"}],
+    )
+    hits = await store.query([1.0, 0.0], top_k=3)
+    assert [h.id for h in hits] == ["same", "mid", "orth"]
+    assert [h.similarity for h in hits] == pytest.approx([1.0, 0.6, 0.0], abs=1e-3)
+    assert hits[0].document == "doc-same" and hits[0].metadata == {"k": "same", "n": 1}
+    assert [h.id for h in await store.query([1.0, 0.0], top_k=2)] == ["same", "mid"]
+    assert len(await store.query([1.0, 0.0], top_k=10)) == 3
+
+
+async def test_upsert_overwrites_and_delete_removes(store):
     await store.upsert(["x"], [[1.0, 0.0]], ["old"], [{"v": 1}])
-    await store.upsert(["x"], [[1.0, 0.0]], ["new"], [{"v": 2}])
+    await store.upsert(["x"], [[0.0, 1.0]], ["new"], [{"v": 2}])
     assert await store.count() == 1
     assert await store.get_all() == [("x", "new", {"v": 2})]
-    await store.delete(["x"])
+    [hit] = await store.query([0.0, 1.0], top_k=1)
+    assert hit.similarity == pytest.approx(1.0, abs=1e-3)  # 向量也跟着更新了
+    await store.delete(["x", "never-existed"])
     assert await store.count() == 0
     assert await store.query([1.0, 0.0], top_k=5) == []
 
 
-async def test_chroma_store_similarity_semantics(tmp_path):
-    """
-    与 InMemoryVectorStore 语义一致：相同向量相似度约 1，正交约 0。chromadb 不可用时跳过。
-    必须显式传 exc_type=ImportError：chromadb「找得到但导入报错」（如 grpc 扩展不兼容）时，
-    pytest 9.1 起默认会把跳过改成报错。
-    """
-    pytest.importorskip("chromadb", exc_type=ImportError)
-    from backend.agents.rag.store.vector_store import ChromaVectorStore
+async def test_duplicate_ids_in_one_batch_keep_the_last(store):
+    await store.upsert(["x", "x"], [[1.0, 0.0], [1.0, 0.0]], ["first", "second"], [{}, {}])
+    assert await store.get_all() == [("x", "second", {})]
 
-    store = ChromaVectorStore(tmp_path / "chroma", "probe")
-    await store.upsert(["same", "orth"], [[1.0, 0.0], [0.0, 1.0]], ["a", "b"], [{"k": "a"}, {"k": "b"}])
-    hits = {h.id: h.similarity for h in await store.query([1.0, 0.0], top_k=2)}
-    assert hits["same"] == pytest.approx(1.0, abs=1e-3)
-    assert hits["orth"] == pytest.approx(0.0, abs=1e-3)
-    assert await store.count() == 2
-    assert {row[0] for row in await store.get_all()} == {"same", "orth"}
+
+async def test_empty_operations_are_noops(store):
+    await store.upsert([], [], [], [])
+    await store.delete([])
+    assert await store.query([1.0, 0.0], top_k=3) == []
+    assert await store.get_all() == []
+    assert await store.count() == 0
+
+
+# ---------- LlamaIndex 适配层 ----------
+
+def test_chroma_score_conversion():
+    for cosine in (1.0, 0.6, 0.0, -0.5):
+        assert chroma_score_to_cosine(math.exp(-(1.0 - cosine))) == pytest.approx(cosine)
+
+
+def test_rejects_backend_that_does_not_store_text():
+    """SimpleVectorStore 只存向量、不存原文，查询结果里拿不到题干，必须在构造时就拒绝。"""
+    with pytest.raises(ValueError, match="不保存原文"):
+        LlamaIndexVectorStore(SimpleVectorStore(), lambda score: score)
+
+
+async def test_llamaindex_chroma_persists_across_instances(tmp_path):
+    pytest.importorskip("chromadb", exc_type=ImportError)
+    first = LlamaIndexVectorStore.from_chroma(tmp_path / "chroma", "persist")
+    await first.upsert(["x"], [[1.0, 0.0]], ["doc"], [{"k": "v"}])
+    reopened = LlamaIndexVectorStore.from_chroma(tmp_path / "chroma", "persist")
+    assert await reopened.get_all() == [("x", "doc", {"k": "v"})]
+    assert (tmp_path / "chroma" / "chroma.sqlite3").exists()
 ```
 
 - [ ] **Step 3: 运行测试确认失败**
@@ -1002,7 +1196,7 @@ Expected: 收集阶段报 `ModuleNotFoundError: No module named 'backend.agents.
 向量化。
 
 所有向量都归一化为单位长度：余弦相似度因此等于点积，
-InMemoryVectorStore 与 Chroma（cosine 空间）给出的相似度可以直接比较，
+InMemoryVectorStore 与 LlamaIndex + Chroma（cosine 空间）给出的相似度可以直接比较，
 去重与防泄漏的阈值在两种实现下含义一致。
 """
 import math
@@ -1025,20 +1219,28 @@ def dot(a: Sequence[float], b: Sequence[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
 
-class DashScopeEmbedder:
-    """复用 get_llm.py 里已有的 DashScope embedding 封装，输出归一化后的向量。"""
+class LlamaIndexEmbedder:
+    """
+    包装任意 LlamaIndex BaseEmbedding，输出归一化后的向量。默认用 get_llm.py 里已有的 DashScope 封装。
 
-    def __init__(self, model=None):
+    按 batch_size 分段、一段一段地等，而不是把全部文本一次交给 aget_text_embedding_batch：
+    后者会把所有批次一起 gather，而 get_llm.py 的封装没有实现批量接口、每条文本单独发一个请求——
+    不分段的话，入库一份 200 段的教材会同时打出 200 个请求，很容易被限流。
+    """
+
+    def __init__(self, model=None, batch_size: int = 10):
         if model is None:
             from backend.agents.agent.get_llm import get_embedding_model
             model = get_embedding_model()
         self._model = model
+        self._batch_size = batch_size
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         texts = list(texts)
-        if not texts:
-            return []
-        vectors = await self._model.aget_text_embedding_batch(texts)
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self._batch_size):
+            batch = texts[start:start + self._batch_size]
+            vectors.extend(await self._model.aget_text_embedding_batch(batch))
         return [l2_normalize(v) for v in vectors]
 ```
 
@@ -1049,18 +1251,13 @@ class DashScopeEmbedder:
 向量存储。入库与检索代码只依赖 VectorStore 协议：
 
 - InMemoryVectorStore：纯 Python 实现，测试与离线评测用
-- ChromaVectorStore：生产实现。chromadb 在构造时才导入——它导入失败
-  （例如 grpc 编译扩展与当前 Python 不兼容）时，只有真正要用它的地方报错，
-  不会拖垮 import 了本模块的其他代码
+- LlamaIndexVectorStore（llama_store.py）：生产实现，经 LlamaIndex 读写 Chroma。
+  放在单独的模块里，只用内存实现的代码就不必导入 LlamaIndex 和 chromadb
 """
-import asyncio
 from dataclasses import dataclass
-from functools import partial
-from pathlib import Path
 from typing import Protocol, Sequence
 
 from backend.agents.rag.store.embedder import dot
-from backend.core.executors import get_vector_executor
 
 
 @dataclass
@@ -1109,83 +1306,124 @@ class InMemoryVectorStore:
     async def delete(self, ids) -> None:
         for row_id in ids:
             self._rows.pop(row_id, None)
+```
+
+创建 `backend/agents/rag/store/llama_store.py`：
+
+```python
+"""
+向量存储的生产实现：把 LlamaIndex 的向量库接口（BasePydanticVectorStore）适配成 VectorStore 协议，
+后端用 Chroma。以后换成 LlamaIndex 支持的其他向量库，只需照着 from_chroma 另写一个工厂。
+
+LlamaIndex 与 Chroma 有几处行为和直觉不一样，都已用真实的 Chroma 验证过（Task 0 的探针会再确认一次）：
+
+1. 查询分数不是余弦相似度。LlamaIndex 的 Chroma 集成返回 exp(-距离)，cosine 空间里距离 = 1 - 余弦，
+   所以余弦 = 1 + ln(分数)。去重、防泄漏、教材阈值都按余弦定义，必须换算回来
+2. add 不是 upsert。id 已存在时 Chroma 静默忽略这次写入、保留旧内容，所以 upsert = 先删后加；
+   同一批里 id 重复会报 DuplicateIDError，先在批内去重（后出现的覆盖先出现的，与内存实现一致）
+3. delete_nodes([]) 会报错，空列表要提前返回
+4. async_add、aquery 等异步方法只是直接调用同步方法，照样阻塞事件循环；
+   所以一律调用同步方法，投递到向量库专属线程池
+5. 不经过 VectorStoreIndex，直接操作向量库：向量由 Embedder 事先算好（去重要先拿到向量，
+   一次查询的向量要在题库和教材库之间复用），这样不会重复向量化，也不会用到 LlamaIndex 的全局 Settings
+   （它默认的 embedding 是 OpenAI）
+"""
+import asyncio
+import math
+from functools import partial
+from pathlib import Path
+from typing import Callable
+
+from llama_index.core.schema import TextNode
+from llama_index.core.vector_stores.types import BasePydanticVectorStore, VectorStoreQuery
+
+from backend.agents.rag.store.vector_store import VectorHit
+from backend.core.executors import get_vector_executor
 
 
-class ChromaVectorStore:
-    """cosine 空间：Chroma 返回的距离 = 1 - 余弦相似度（Task 0 探针已验证）。"""
+def chroma_score_to_cosine(score: float) -> float:
+    """LlamaIndex 的 Chroma 集成返回 exp(-cosine 距离)，换算回余弦相似度。"""
+    return 1.0 + math.log(score)
 
-    def __init__(self, persist_dir: Path, collection_name: str):
-        import chromadb  # 延迟导入，理由见模块说明
+
+class LlamaIndexVectorStore:
+    def __init__(self, backend: BasePydanticVectorStore, score_to_similarity: Callable[[float], float]):
+        if not backend.stores_text:
+            # 例如 LlamaIndex 自带的 SimpleVectorStore：原文要另存在 docstore 里，查询结果拿不到文本
+            raise ValueError(f"{type(backend).__name__} 不保存原文，不能作为 RAG 的向量库")
+        self._backend = backend
+        self._to_similarity = score_to_similarity
+
+    @classmethod
+    def from_chroma(cls, persist_dir: Path, collection_name: str) -> "LlamaIndexVectorStore":
+        # 延迟导入：chromadb 导入失败时，只有真正要用它的地方报错
+        import chromadb
+        from llama_index.vector_stores.chroma import ChromaVectorStore
 
         persist_dir.mkdir(parents=True, exist_ok=True)
-        self._client = chromadb.PersistentClient(path=str(persist_dir))
-        self._col = self._client.get_or_create_collection(
-            collection_name, metadata={"hnsw:space": "cosine"}
-        )
+        client = chromadb.PersistentClient(path=str(persist_dir))
+        collection = client.get_or_create_collection(collection_name, metadata={"hnsw:space": "cosine"})
+        return cls(ChromaVectorStore(chroma_collection=collection), chroma_score_to_cosine)
 
-    async def _run(self, fn, /, **kwargs):
-        # chromadb 是同步库，投递到向量库专属线程池，不阻塞事件循环
+    async def _run(self, fn, /, *args, **kwargs):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(get_vector_executor(), partial(fn, **kwargs))
+        return await loop.run_in_executor(get_vector_executor(), partial(fn, *args, **kwargs))
 
     async def upsert(self, ids, embeddings, documents, metadatas) -> None:
-        if not ids:
-            return
-        await self._run(
-            self._col.upsert,
-            ids=list(ids),
-            embeddings=[list(v) for v in embeddings],
-            documents=list(documents),
-            metadatas=list(metadatas),
-        )
+        latest: dict[str, TextNode] = {}
+        for row_id, vec, doc, meta in zip(ids, embeddings, documents, metadatas, strict=True):
+            latest[row_id] = TextNode(id_=row_id, text=doc, embedding=list(vec), metadata=dict(meta))
+        if latest:
+            await self._run(self._replace, list(latest.values()))
+
+    def _replace(self, nodes: list[TextNode]) -> None:
+        # 查询恰好落在两步之间时，会暂时查不到这几条；入库是低频操作，可以接受
+        self._backend.delete_nodes([node.node_id for node in nodes])
+        self._backend.add(nodes)
 
     async def query(self, embedding, top_k) -> list[VectorHit]:
-        total = await self.count()
-        if total == 0:
-            return []
-        res = await self._run(
-            self._col.query,
-            query_embeddings=[list(embedding)],
-            n_results=min(top_k, total),
-            include=["documents", "metadatas", "distances"],
+        result = await self._run(
+            self._backend.query,
+            VectorStoreQuery(query_embedding=list(embedding), similarity_top_k=top_k),
         )
         return [
-            VectorHit(row_id, doc, meta or {}, 1.0 - distance)
-            for row_id, doc, meta, distance in zip(
-                res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0]
-            )
+            VectorHit(node.node_id, node.get_content(), dict(node.metadata), self._to_similarity(score))
+            for node, score in zip(result.nodes or [], result.similarities or [])
         ]
 
     async def get_all(self) -> list[tuple[str, str, dict]]:
-        res = await self._run(self._col.get, include=["documents", "metadatas"])
-        return [
-            (row_id, doc, meta or {})
-            for row_id, doc, meta in zip(res["ids"], res["documents"], res["metadatas"])
-        ]
+        nodes = await self._run(self._backend.get_nodes, node_ids=None)
+        return [(node.node_id, node.get_content(), dict(node.metadata)) for node in nodes]
 
     async def count(self) -> int:
-        return await self._run(self._col.count)
+        # LlamaIndex 没有通用的计数接口；这个方法只在测试与统计里用，全量读取可以接受
+        return len(await self.get_all())
 
     async def delete(self, ids) -> None:
+        ids = list(ids)
         if ids:
-            await self._run(self._col.delete, ids=list(ids))
+            await self._run(self._backend.delete_nodes, ids)
 ```
 
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd backend && python -m pytest tests/rag/test_vector_store.py -v -rs`
-Expected: chromadb 可用时 8 passed；不可用时 7 passed、1 skipped，跳过原因写明 chromadb 导入失败
+Expected: chromadb 可用时 18 passed；不可用时 13 passed、5 skipped（4 条契约测试的 `llamaindex_chroma` 版本，加上持久化测试），跳过原因写明 chromadb 导入失败
 
 - [ ] **Step 6: 提交**
 
 ```bash
 git add backend/agents/rag/store/ backend/tests/rag/helpers.py backend/tests/rag/test_vector_store.py
-git commit -m "feat: RAG 向量化与向量存储（内存实现与 Chroma 实现）"
+git commit -m "feat: RAG 向量化与向量存储（内存实现与 LlamaIndex + Chroma 实现）"
 ```
 
 ---
 
 ## Task 3: 词法索引
+
+> **这个任务做什么**：做一个常驻内存的索引，补上向量检索的短板——向量擅长找「意思相近」的内容，对具体术语和关键词却不够敏感。这个索引同时干三件事：① BM25 关键词召回：用 jieba 分词后按关键词匹配程度给题目打分（BM25 是搜索引擎里经典的关键词打分算法）；② 知识点倒排表：记录「某个知识点 → 有哪些题」，用来按知识点找题；③ 题目目录：按 id 直接取出完整题目，检索完不用再回查向量库。
+>
+> **做完之后**：给一段文本或一组知识点，能返回相关题目的 id 和分数。它是三路召回里「关键词」和「知识点」两路的底座。
 
 同时承担三件事：BM25 关键词召回、知识点倒排表、题目目录。rank_bm25 不支持增量添加，所以每次整体重建，重建完成后用一次赋值替换快照。
 
@@ -1500,6 +1738,10 @@ git commit -m "feat: RAG 词法索引（BM25 + 知识点倒排 + 快照替换）
 ---
 
 ## Task 4: 入库任务表与隔离区表
+
+> **这个任务做什么**：在 MySQL 里建两张表，并写好对应的数据访问层（DAO）。`rag_ingest_job` 记录每次入库任务：什么类型、来源是什么、状态（排队 / 运行中 / 成功 / 失败）、入库报告。`rag_quarantine` 是「隔离区」，存放裁判复核没通过的题，等管理员人工决定通过还是丢弃。测试用 SQLite 代替 MySQL，本地不装数据库也能跑。
+>
+> **做完之后**：能创建、更新、查询入库任务，能把题放进隔离区并修改处理状态。Task 17～19 的后台接口都建在这上面。
 
 隔离区放 MySQL 而不是向量库：它是工作流状态，不是检索数据。测试用 SQLite 文件库代替 MySQL——DAO 只依赖会话工厂，与具体数据库无关。
 
@@ -1831,6 +2073,10 @@ git commit -m "feat: RAG 入库任务表与隔离区表"
 
 ## Task 5: 文档加载
 
+> **这个任务做什么**：入库流水线的第一步——把 PDF 或 Word 文件读成「一页一页的纯文本」。PDF 用 pypdf 按页取文字；Word 没有页的概念，用 python-docx 按顺序读段落和表格，每约 1500 字算一页。扫描件 PDF（全是图片，几乎读不出字）直接报错拒收，因为这次不做 OCR。这一步只管把字读出来，不管里面哪些是题目。
+>
+> **做完之后**：`load_document(path)` 返回 `PageText` 列表，交给 Task 6 做结构化。
+
 只负责把文件变成「逐页文本」，不做任何理解。Word 没有「页」的概念，按约 1500 字切成一页，供后面的滑动窗口使用。没有文字层的 PDF 直接拒收。
 
 测试需要真实的 PDF 与 Word 文件，但不想引入 reportlab 之类的依赖：Word 用 python-docx 现写；PDF 手写一个最小的合法文件（单页、Helvetica 字体、一行 ASCII 文字），pypdf 能正常读出来。
@@ -2073,6 +2319,10 @@ git commit -m "feat: RAG 文档加载（PDF / Word，拒收扫描件）"
 ---
 
 ## Task 6: LLM 结构化
+
+> **这个任务做什么**：入库流水线的第二步——让大模型把 Task 5 读出的原始页面文字，整理成一道道结构化的题目（`QuestionItem`）和教材讲解段（`KnowledgeChunk`）。每次喂给模型 2 页，下一次往后挪 1 页，相邻两次重叠一页，这样跨页的题至少在某一次里是完整的；重叠带来的重复交给 Task 9 去重。顺带做两件配套的事：① 写 `llm_json.py`，从模型回复里抠出 JSON（模型常在 JSON 前后加说明文字）；② 修改 skill 加载器，支持 `visibility: internal`，让 RAG 专用的 prompt 不出现在 ReAct Agent 的能力清单里。
+>
+> **做完之后**：给一份资料的页面列表，能得到其中的题目和讲解段。测试用 `ScriptedLLM` 预设模型回复，不调真实模型。
 
 把页面文本整理成题目与知识讲解。按滑动窗口处理，每次 2 页、相邻重叠 1 页，保证跨页的题目至少在一个窗口里完整出现。
 
@@ -2493,6 +2743,10 @@ git commit -m "feat: RAG 结构化入库，skill 支持 internal 可见性"
 
 ## Task 7: 种子题生成
 
+> **这个任务做什么**：除了从资料里抽题，语料的另一个来源是让大模型直接出题。按「知识点 + 年级 + 难度 + 数量」批量生成，每次调用最多 10 道，要更多就分几次调用。prompt 放在 `rag_seed_generation/SKILL.md`。这个任务只负责生成，不判断题目对错。
+>
+> **做完之后**：`SeedGenerator.generate()` 返回一批 `QuestionItem`，在 Task 10 里送去复核。题库还是空的时候，可以靠它快速灌进一批数据。
+
 按「知识点 + 年级 + 难度 + 数量」批量生成题目，每次调用最多 10 道。生成结果一律视为不可信，必须经过 Task 8 的复核才能入库。
 
 **Files:**
@@ -2680,6 +2934,10 @@ git commit -m "feat: RAG 种子题批量生成"
 ---
 
 ## Task 8: 第三方复核（入库闸门）
+
+> **这个任务做什么**：入库前的质量把关。用另一家的大模型当「裁判」逐道检查：裁判先自己独立把题做一遍，再和题目给的答案比对，同时检查题干是否完整、是否超出年级范围、知识点标注是否准确。四项全过、且总分不低于 0.8 才算通过；出现任何意外（调用失败、输出解析不了）一律判不通过，送进隔离区。另外要校验裁判和出题的模型不是同一家（比如都是 qwen），否则裁判会偏袒同家族模型的输出。
+>
+> **做完之后**：`QuestionJudge.judge(item)` 返回 `JudgeResult`；裁判没配置或配成同家族模型时，在构建阶段就报错并说明原因。
 
 三个关键设计：
 1. **先让裁判独立解题，再与给定答案比对**，而不是问它「这个答案对不对」——后一种问法会诱导模型附和。
@@ -2968,6 +3226,10 @@ git commit -m "feat: RAG 第三方复核闸门（独立解题比对，失败即�
 
 ## Task 9: 去重
 
+> **这个任务做什么**：在花钱调用裁判之前，先把重复的题筛掉。分两级：① 精确去重：规范化后文本相同的题 id 也相同，直接比 id；② 近似去重：比较向量相似度，和库里已有的题、同一批里已经接受的题都比一遍，相似度不低于 0.95 就算重复。近似去重主要兜住两种情况：同一道题在两个重叠窗口里被转写得略有差别，以及模型批量出题时换汤不换药。
+>
+> **做完之后**：两个函数分别返回去重后的题目和被去掉的数量，供 Task 10 的流水线调用。
+
 两级去重都放在复核之前——重复的题不值得再花一次裁判调用。近似去重用来兜住「同一道题在两个重叠窗口里被转写得略有不同」和「LLM 批量生成时换汤不换药」。
 
 **Files:**
@@ -3099,6 +3361,10 @@ git commit -m "feat: RAG 精确与近似两级去重"
 ---
 
 ## Task 10: 入库服务编排
+
+> **这个任务做什么**：把 Task 2～9 做好的零件串成完整的入库流水线，封装成 `IngestService`。对外提供几个入口：导入一个文件、按知识点生成并入库、直接入库一批题、入库教材讲解段、把隔离区里人工通过的题直接入库。内部流程是：精确去重 → 向量化 → 近似去重 → 裁判复核 → 通过的写入向量库并重建词法索引，没通过的送进隔离区。每次调用返回一份 `IngestReport`，统计抽出多少、去重多少、通过和拒绝各多少。
+>
+> **做完之后**：入库的全部逻辑都集中在这一个类里，命令行（Task 11）和后台接口（Task 18）都只调用它，不重复写逻辑。这是阶段二的核心任务。
 
 命令行与后台接口共用的唯一入口，把前面的零件串成流水线：
 
@@ -3541,6 +3807,10 @@ git commit -m "feat: RAG 入库服务编排"
 
 ## Task 11: 运行时组装与入库命令行
 
+> **这个任务做什么**：两件事。① `RagRuntime`：把真实组件组装起来（`LlamaIndexEmbedder` 向量化、经 LlamaIndex 读写 Chroma 的两个 collection、词法索引、出题模型和裁判），整个进程里只建一份，其他地方通过 `get_rag_runtime()` 拿到；测试时可以换成内存版。② 入库命令行 `python -m backend.agents.rag.ingest`：在终端里指定文件或知识点，调用 Task 10 的服务入库，并打印入库报告。
+>
+> **做完之后**：阶段二完成，可以真正把 PDF / Word 资料和生成的种子题灌进本地知识库了。
+
 `RagRuntime` 负责按需组装各组件（进程内单例）；命令行是阶段二的交付物——做完这个任务，就可以把资料灌进库里了。
 
 **Chroma 的本地库不支持多进程同时写入**：服务运行期间请改用后台接口入库（Task 18）；命令行入库完成后要重启服务，服务里的词法索引才会包含新题。
@@ -3556,7 +3826,7 @@ git commit -m "feat: RAG 入库服务编排"
 - Produces:
   - `RagRuntime(settings, *, embedder, question_store, knowledge_store, lexical_index, llm_factory, judge_factory, reranker=None)`
     - 属性 `settings, embedder, question_store, knowledge_store, lexical_index`
-    - `RagRuntime.from_settings(settings)`：生产组装（DashScope + Chroma）
+    - `RagRuntime.from_settings(settings)`：生产组装（`LlamaIndexEmbedder` + 两个 `LlamaIndexVectorStore.from_chroma`）
     - `async warm_up() -> int`、`ensure_judge()`（缓存；配置不对时抛 `JudgeConfigError`）
     - `ingest_service(quarantine, require_judge=True) -> IngestService`
   - `get_rag_runtime()`、`set_rag_runtime(runtime | None)`
@@ -3656,12 +3926,15 @@ def test_runtime_singleton_can_be_injected(rag_settings):
         set_rag_runtime(None)
 
 
-def test_production_wiring_uses_chroma(rag_settings):
+def test_production_wiring_uses_llamaindex_chroma(rag_settings):
     pytest.importorskip("chromadb", exc_type=ImportError)
-    from backend.agents.rag.store.vector_store import ChromaVectorStore
+    from backend.agents.rag.store.embedder import LlamaIndexEmbedder
+    from backend.agents.rag.store.llama_store import LlamaIndexVectorStore
 
     runtime = RagRuntime.from_settings(rag_settings)
-    assert isinstance(runtime.question_store, ChromaVectorStore)
+    assert isinstance(runtime.embedder, LlamaIndexEmbedder)
+    assert isinstance(runtime.question_store, LlamaIndexVectorStore)
+    assert isinstance(runtime.knowledge_store, LlamaIndexVectorStore)
     assert (rag_settings.db_dir / "chroma.sqlite3").exists()
 
 
@@ -3763,19 +4036,19 @@ class RagRuntime:
 
     @classmethod
     def from_settings(cls, settings: RagSettings) -> "RagRuntime":
-        """生产组装：DashScope 向量化 + Chroma 持久化 + 独立配置的裁判。"""
+        """生产组装：LlamaIndex 向量化（DashScope）+ LlamaIndex 读写 Chroma + 独立配置的裁判。"""
         from backend.agents.agent.get_llm import get_llm
-        from backend.agents.rag.store.embedder import DashScopeEmbedder
-        from backend.agents.rag.store.vector_store import ChromaVectorStore
+        from backend.agents.rag.store.embedder import LlamaIndexEmbedder
+        from backend.agents.rag.store.llama_store import LlamaIndexVectorStore
 
         def judge_factory():
             return QuestionJudge(build_judge_llm(settings), settings.judge_model, settings.judge_pass_score)
 
         return cls(
             settings,
-            embedder=DashScopeEmbedder(),
-            question_store=ChromaVectorStore(settings.db_dir, QUESTION_COLLECTION),
-            knowledge_store=ChromaVectorStore(settings.db_dir, KNOWLEDGE_COLLECTION),
+            embedder=LlamaIndexEmbedder(),
+            question_store=LlamaIndexVectorStore.from_chroma(settings.db_dir, QUESTION_COLLECTION),
+            knowledge_store=LlamaIndexVectorStore.from_chroma(settings.db_dir, KNOWLEDGE_COLLECTION),
             lexical_index=LexicalIndex(),
             llm_factory=get_llm,
             judge_factory=judge_factory,
@@ -3968,6 +4241,10 @@ git commit -m "feat: RAG 运行时组装与入库命令行"
 
 ## Task 12: 三路召回
 
+> **这个任务做什么**：检索链路的第一步——从题库里各自粗筛出一批候选题。三路互相独立：① 向量召回：按语义相似度找（用 Task 2）；② BM25 召回：按关键词匹配找（用 Task 3）；③ 知识点召回：按知识点重合数找，难度一致的加分，过滤掉高于用户年级的题（用 Task 3）。每一路都只返回「题目 id + 本路分数」的列表。
+>
+> **做完之后**：得到三个召回函数。拆成三个独立函数，是为了某一路失败时能单独跳过，评测时也能单独跑某一路做对比。
+
 每一路都是独立的函数，只返回 `[(id, score)]`，彼此没有依赖：单独失败时由编排层跳过；离线评测可以逐路单独运行，做消融对比。各路分数量纲不同，不直接比较，由 Task 13 按名次融合。
 
 **Files:**
@@ -4087,6 +4364,10 @@ git commit -m "feat: RAG 三路召回（向量 / BM25 / 知识点）"
 
 ## Task 13: RRF 融合
 
+> **这个任务做什么**：把三路召回的结果合并成一个排名。三路的分数单位完全不同（BM25 分、余弦相似度、知识点重合数），不能直接相加，所以 RRF（倒数排名融合）只看每道题在各路里排第几：`score = Σ 1 / (60 + 名次)`。一道题在越多路里排得越靠前，总分就越高。
+>
+> **做完之后**：`rrf_fuse()` 输出融合后的前 30 名候选，每个候选都记录它来自哪几路。这是个几十行的纯函数、没有外部依赖，也很适合入门。
+
 `score(d) = Σ 1 / (k + rank)`。只看名次、不看原始分数：BM25 分、余弦相似度、知识点重合数三者量纲完全不同，没法直接相加。
 
 **Files:**
@@ -4179,6 +4460,10 @@ git commit -m "feat: RAG 多路召回的 RRF 融合"
 ---
 
 ## Task 14: 重排
+
+> **这个任务做什么**：对融合后的候选再精排一次。召回和融合都比较粗糙，重排模型会把「查询」和「每个候选」成对地看一遍，给出更准确的相关度分数。这里调用 DashScope 的文本排序服务（默认 `gte-rerank-v2`），并定义 `Reranker` 协议，将来想换成本地模型只要另写一个实现。另外提供 `NoopReranker`（不重排，保持原顺序），没配重排 key 时用它。
+>
+> **做完之后**：给一个查询和一组文档，返回按相关度排好序的结果。动手前要先对照 Task 0 探针打印出的真实响应结构。
 
 检索编排只依赖 `Reranker` 协议，将来换本地 cross-encoder 只需另写一个实现。
 
@@ -4364,6 +4649,10 @@ git commit -m "feat: RAG 重排（DashScope 实现与不重排的兜底）"
 ---
 
 ## Task 15: 检索编排
+
+> **这个任务做什么**：把 Task 12～14 串成完整的检索器 `RagRetriever`：查询向量化 → 三路并行召回（同时去教材库找相关讲解）→ RRF 融合 → 防泄漏过滤（排除用户问的这道原题本身）→ 重排 → 取前 3 道。重点是「逐级降级」：任何环节出错都只是少一些结果，不抛异常，并在结果里记下哪里降级了。同时给 `RagRuntime` 加上 `retriever` 属性。
+>
+> **做完之后**：阶段三完成，给一道题就能拿到参考题和相关知识点。此时检索还没接进生题链路，只能在测试或评测里调用。
 
 把前面的组件串起来：
 
@@ -4785,6 +5074,12 @@ git commit -m "feat: RAG 检索编排（并行召回、防泄漏、逐级降级�
 ---
 
 ## Task 16: 接入生题
+
+> **这个任务做什么**：让线上的「生成变式题」真正用上 RAG。`question_set_tool` 在抽取知识点之后调用检索，把结果整理成「参考真题」「相关知识点」两段文字（总长不超过 1200 字），拼进生题模型的 system prompt，并附上使用规则（参考题型和难度，不许照抄）。生成之后做防照抄检查：和参考题太像（相似度不低于 0.9）就带上提示重试一次。服务启动时加载词法索引。RAG 任何环节失败，生题都照常进行。
+>
+> **前置**：依赖记忆计划的 Task 7 和 Task 12，开工前先确认它们已经完成。
+>
+> **做完之后**：用户调用生题接口时，背后会自动检索参考材料。这是 RAG 第一次对线上用户产生效果。
 
 生题前先检索，把结果整理成「参考真题」与「相关知识点」两段拼进 system prompt，交给模型自己决定怎么用。
 
@@ -5357,6 +5652,12 @@ git commit -m "feat: 生题接入 RAG 参考材料，附防照抄重试"
 
 ## Task 17: 管理员鉴权、后台任务执行器与生命周期
 
+> **这个任务做什么**：为后台管理接口（Task 18）准备三样基础设施。① `require_admin`：FastAPI 依赖，非管理员（`user_privilege < 1`）直接返回 403；② `RagJobRunner`：进程内的后台任务执行器，入库任务提交后在后台运行，同一时间只跑一个，并把状态写进 Task 4 的任务表；③ 生命周期：服务启动时把上次没跑完的任务标记为失败，关停时最多等 10 秒让在途任务结束，再关数据库连接和线程池。
+>
+> **前置**：依赖记忆计划 Task 7 改造后的 `core/hooks.py`，开工前先确认它已经完成。
+>
+> **做完之后**：接口层只需要提交任务、查询状态，不用自己处理并发和关停收尾。
+
 入库任务在进程内后台运行，**同一时间只跑一个**：入库会密集调用 LLM，词法索引的重建也需要串行。服务重启时，没跑完的任务一律标记为失败，不做断点续传——id 是哈希、入库是幂等的，重新提交即可，已入库的部分会被自动跳过。
 
 **关于测试**：`backend/api/__init__.py` 在包初始化时会导入全部路由，`agent_api` 导入时就要实例化向量库，所以**导入 `backend.api` 下的任何模块都会连带导入 chromadb**。这是项目原有的结构，本次不改。鉴权的测试因此单独放一个文件、开头用 `importorskip` 守住；执行器的测试不碰 `backend.api`，照常运行。
@@ -5485,7 +5786,7 @@ from types import SimpleNamespace
 import pytest
 
 # backend/api/__init__.py 在包初始化时会导入全部路由，agent_api 导入时就要连 chromadb。
-# chromadb 不可用（grpc 扩展与当前 Python 不兼容）时明确跳过，而不是在收集阶段报错。
+# chromadb 不可用（例如编译扩展缺失）时明确跳过，而不是在收集阶段报错。
 pytest.importorskip("chromadb", exc_type=ImportError)
 
 from fastapi import HTTPException  # noqa: E402
@@ -5727,6 +6028,10 @@ git commit -m "feat: RAG 后台任务执行器、管理员鉴权与生命周期�
 ---
 
 ## Task 18: 上传、生成与任务查询接口
+
+> **这个任务做什么**：提供管理后台调用的 HTTP 接口，路径都在 `/manage/rag/` 下：上传 PDF / Word 入库（`/upload`）、按知识点生成种子题（`/generate`）、查询任务进度和入库报告（`/jobs/{job_id}`）。上传和生成都是异步的：立即返回任务 id，实际入库交给 Task 17 的执行器。安全方面：落盘文件只用「任务 id + 后缀」命名以防路径穿越，大小限制 20MB，裁判没配好时直接返回 503。同时把一直没接进来的 `manage_api` 挂到 `main.py` 上。
+>
+> **做完之后**：不用命令行、也不用停服务就能入库，并能在 `/api` 接口文档里看到这几个接口。
 
 路由挂在项目里已有的 `manage_api`（前缀 `/manage`）之下，自身前缀 `/rag`，最终路径 `/manage/rag/...`。`manage_api` 之前定义了但没接进 `main.py`，这次一并接入。
 
@@ -6112,6 +6417,10 @@ git commit -m "feat: RAG 管理接口（上传、生成、任务查询）"
 
 ## Task 19: 隔离区复核接口
 
+> **这个任务做什么**：给管理员处理隔离区的接口：列出隔离区里的题（可按待处理 / 已通过 / 已丢弃筛选，支持分页）、人工通过（跳过裁判直接入库）、人工丢弃。对已经处理过的题再操作返回 409，条目不存在返回 404；并发操作时，同一道题也只能被处理一次。
+>
+> **做完之后**：被裁判误拒的好题可以捞回来，入库流程形成闭环。阶段五完成。
+
 人工通过的题**跳过裁判直接入库**。实现上先入库再改状态：入库是幂等的，即使并发下被别人抢先处理，重复入库也不会产生脏数据；而状态更新是条件更新（Task 4），保证每个条目只能被处理一次。
 
 **Files:**
@@ -6265,6 +6574,10 @@ git commit -m "feat: RAG 隔离区人工复核接口"
 ---
 
 ## Task 20: 评测指标与评测集
+
+> **这个任务做什么**：为回答「RAG 到底有没有用」准备量尺和考题。① 指标：Recall@K（前 K 个结果里有没有找到正确答案）、MRR（正确答案平均排第几）、nDCG（整体排序质量），以及耗时的分位数。② 评测集：从题库抽题，让大模型改写成「考法相同、措辞和数字不同」的新题当查询，原题就是这条查询的标准答案（known-item 方法），不需要人工标注。改写失败、或改写后和原题太像的样本会被剔除。
+>
+> **做完之后**：能自动生成评测集并保存成 JSONL 文件，供 Task 21、22 使用。
 
 **known-item 方法**：从库里抽样题目，让 LLM 改写成「考法相同、措辞和数字都不同」的新题作为查询，原题就是这条查询的标准答案。
 
@@ -6538,6 +6851,10 @@ git commit -m "feat: RAG 评测指标与 known-item 评测集构建"
 
 ## Task 21: 检索消融评测
 
+> **这个任务做什么**：用 Task 20 的评测集，让同一批查询在五种配置下各跑一遍检索：只用向量、只用 BM25、只用知识点、三路融合、融合加重排；算出每种配置的 Recall@3/5/10、MRR、nDCG@5、p95 耗时和降级率，输出对比表。「消融」就是逐项去掉某种技术，看效果下降多少。
+>
+> **做完之后**：得到一张对比表，用数字说明多路召回和重排各自带来多少提升。
+
 同一批查询分别用五种配置跑一遍：只用向量、只用 BM25、只用知识点、三路融合、融合加重排。**「多路召回和重排到底有没有用」直接用数字回答。**
 
 评测时关闭重排分数阈值并取前 10 个结果：衡量的是排序质量本身，阈值会把后面的结果截掉，让 Recall@10 失去意义。
@@ -6756,6 +7073,10 @@ git commit -m "feat: RAG 检索消融评测"
 ---
 
 ## Task 22: 生题 A/B 评测与评测命令行
+
+> **这个任务做什么**：检索指标好，不代表题出得更好，这个任务直接比较最终产出：同一道题，开 RAG 和不开 RAG 各生成一次，让裁判模型判断哪个更好。每对结果比较两次、交换前后位置，两次结论一致才算一方胜出，否则记为平局，以抵消大模型当裁判时偏爱某个位置的毛病。另外提供评测命令行 `python -m backend.agents.rag.eval`，包含 `build`（建评测集）、`retrieval`（Task 21 的消融评测）、`generation`（本任务的 A/B 评测）三个子命令，报告以 Markdown 和 JSON 两种格式写进 `rag_eval` 目录。
+>
+> **做完之后**：阶段六完成，能得到有 RAG 与无 RAG 的胜 / 平 / 负比例。真实运行会产生 API 费用。
 
 同一道题，有 RAG 与无 RAG 各生成一次，由裁判成对比较。**每对比较两次、交换先后位置**：两次结论一致才算一方胜出，否则记为平局。位置一换结论就变，说明裁判只是偏向某个位置——这是大模型当裁判时常见的位置偏差，不做交换就会被它系统性地带偏。
 
@@ -7197,6 +7518,10 @@ git commit -m "feat: RAG 生题 A/B 评测与评测命令行"
 
 ## Task 23: 更新 CLAUDE.md
 
+> **这个任务做什么**：全部功能完成后，在 `CLAUDE.md` 里补一节 RAG 说明：目录结构和各文件的职责、命令行用法、管理接口的位置，以及必须遵守的约定（RAG 失败只能降级、入库必须经过复核、词法索引要整体重建、分词模式不能改回普通模式等）。这是写给之后的开发者和 AI 助手看的，不涉及代码。
+>
+> **做完之后**：之后接手的人读一遍 `CLAUDE.md`，就知道 RAG 模块的结构和规矩。
+
 **Files:**
 - Modify: `CLAUDE.md`
 
@@ -7211,7 +7536,7 @@ git commit -m "feat: RAG 生题 A/B 评测与评测命令行"
 
 | 目录 / 文件 | 职责 |
 |---|---|
-| `store/` | 向量化、向量存储（Chroma / 内存）、词法索引（BM25 + 知识点倒排 + 题目目录） |
+| `store/` | 向量化与向量存储（经 LlamaIndex 读写 Chroma / 内存实现）、词法索引（BM25 + 知识点倒排 + 题目目录） |
 | `ingest/` | 加载 → 结构化 → 去重 → 第三方复核 → 入库；命令行 `python -m backend.agents.rag.ingest` |
 | `retrieval/` | 三路召回 → RRF → 防泄漏 → 重排；参考材料格式化与防照抄 |
 | `eval/` | 离线评测：`python -m backend.agents.rag.eval build / retrieval / generation` |
@@ -7226,6 +7551,8 @@ git commit -m "feat: RAG 生题 A/B 评测与评测命令行"
 - 入库必须经过第三方复核，裁判与生成模型不同家族，失败即拒；只有隔离区的人工通过可以跳过复核
 - 题目 id 是规范化题干的哈希：入库幂等，精确去重只比较 id
 - 词法索引整体重建、替换快照；不要原地修改快照
+- RAG 的向量操作统一经 `store/llama_store.py`，这一层的业务代码拿到的相似度一律是余弦；LlamaIndex 的 Chroma 集成返回 exp(-距离)，换算只在适配层做。不要改用 `VectorStoreIndex`（向量由 `Embedder` 事先算好）
+- **记忆层（`agents/memory/vector_store_manager.py`）是另一套封装**：它用 `VectorStoreIndex` + 切分器 + 同步 embedding，collection 用 chromadb 默认的 l2 空间，`min_score` 的口径是 `exp(-平方欧氏距离)`。两层的需求不同（RAG 要先拿到向量做去重、查询向量还要在两个库之间复用），所以没有合并；写新代码时先确认自己在哪一层，阈值不要互相套用
 - BM25 分词用 jieba 的 `cut_for_search`，不要改回普通 `cut`（同一知识点的不同说法会互相召回不到）
 - RAG 的 prompt 放在 `agents/skills/` 下，frontmatter 必须带 `visibility: internal`
 - 命令行入库前要停服务（Chroma 本地库不支持多进程写入）；入库后重启服务才会加载新题
@@ -7263,4 +7590,4 @@ git commit -m "docs: CLAUDE.md 补充 RAG 知识库的结构与约定"
 cd backend && python -m pytest tests/ -v -rs
 ```
 
-chromadb 可用时，RAG 部分应为 208 passed；不可用时应为 185 passed、6 skipped——3 个接口测试文件整体跳过，另有 3 条单独跳过，原因都写明 chromadb 导入失败。
+chromadb 可用时，RAG 部分应为 218 passed；不可用时应为 191 passed、10 skipped——3 个接口测试文件整体跳过，另有 7 条单独跳过，原因都写明 chromadb 导入失败。

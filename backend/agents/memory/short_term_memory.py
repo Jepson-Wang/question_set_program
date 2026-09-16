@@ -25,11 +25,35 @@
 5. 备份和恢复机制
 """
 import json
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from datetime import datetime
 
+from backend.middleware.logging import get_logger
 from backend.utils.redis_client import get_redis_client
-from redis.exceptions import AuthenticationError
+from redis.exceptions import AuthenticationError, RedisError
+
+logger = get_logger(__name__)
+
+DEFAULT_TTL = 86400
+DEFAULT_PENDING_TTL = 604800
+
+_PUSH_AND_EVICT_LUA = """
+redis.call('LPUSH', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+local evicted = {}
+while redis.call('LLEN', KEYS[1]) > tonumber(ARGV[2]) do
+  local item = redis.call('RPOPLPUSH', KEYS[1], KEYS[2])
+  if not item then break end
+  table.insert(evicted, item)
+end
+if #evicted > 0 then
+  redis.call('EXPIRE', KEYS[2], tonumber(ARGV[4]))
+end
+return evicted
+"""
+
+_short_term_memory: Optional[ShortTermMemory] = None
+
 
 class MemoryUnit(dict):
     def __init__(self, user_memory: str = "", model_memory: str = ""):
@@ -44,7 +68,12 @@ class MemoryUnit(dict):
 
 
 class ShortTermMemory:
-    def __init__(self, max_memory_size: int = 10):
+    def __init__(
+            self,
+            max_memory_size: int = 10,
+            ttl: int = DEFAULT_TTL,
+            pending_tll = DEFAULT_PENDING_TTL
+    ):
         """
         初始化短期记忆模块
         
@@ -53,145 +82,124 @@ class ShortTermMemory:
             redis_client: Redis客户端实例，可选，若不传则自动获取全局实例
         """
         self.max_memory_size = max_memory_size
-        self._redis_client = get_redis_client()
+        self._client = get_redis_client().client
+        self.ttl = ttl
+        self.pending_ttl = pending_tll
+        self._push_script = None
 
-    async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit):
-        """添加新记忆（自动删除超出长度的最早记忆）"""
-        # 构建Redis键
-        redis_key = f"user:{user_id}:session:{session_id}"
+    @staticmethod
+    def key(user_id: int,session_id: int) -> str:
+        return f"stm:{user_id}:{session_id}"
+
+    @staticmethod
+    def pending_key(user_id: int,session_id: int) -> str:
+        return f"stm:pending:{user_id}:{session_id}"
+
+    @staticmethod
+    def parse_pending_key(key: str) -> tuple[int,int]:
+        parts = key.split(":")
+        return int(parts[2]),int(parts[3])
+
+    def _script(self):
+        if self._push_script is None:
+            self._push_script = self._client.register_script(_PUSH_AND_EVICT_LUA)
+        return self._push_script
+
+    async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit) -> List[str]:
+        """
+        原子写入一条记忆，并把超过窗口容量的最旧记忆搬进pending队列
+
+        :return: 本次被挤出窗口的原始JSON字符串列表，调用方将他们归档
+        """
+        try:
+            evicted = await self._script()(
+                keys = [
+                    self.key(user_id,session_id),
+                    self.pending_key(user_id,session_id)
+                ],
+                args = [
+                    json.dumps(memory,ensure_ascii=False),
+                    self.max_memory_size,
+                    self.ttl,
+                    self.pending_ttl
+                ],
+            )
+            return list(evicted or [])
+        except RedisError as e:
+            logger.error("写入短期记忆失败: %s",e,exc_info=True)
+            return []
         
-        # 获取现有记忆
-        memory_list_str = await self._redis_client.client.hget(redis_key, "memory_list")
-        if memory_list_str:
-            memory_list = json.loads(memory_list_str)
-        else:
-            memory_list = []
-        
-        # 添加新记忆到列表头部
-        memory_list.insert(0, memory)
-        
-        # 限制记忆长度
-        if len(memory_list) > self.max_memory_size:
-            memory_list = memory_list[:self.max_memory_size]
-        
-        # 保存到Redis
-        await self._redis_client.client.hset(
-            redis_key,
-            mapping={
-                "memory_list": json.dumps(memory_list),
-                "last_updated": datetime.now().isoformat()
-            }
+
+    async def ack_archived(self,user_id: int,session_id: int,raw_item: str) -> int:
+        """
+        归档成功后，把该条目从pending队列中删除
+        :return: 实际移除的条数
+        """
+        try:
+            return await self._client.lrem(
+                self.pending_key(user_id,session_id),1,raw_item
+            )
+        except RedisError as e:
+            logger.error("移除pending条目失败: %s",e,exc_info=True)
+            return 0
+
+
+    async def clear_all(self,user_id: int,session_id: int) -> None:
+        """清空会话窗口和pending队列"""
+        await self._client.delete(
+            self.key(user_id,session_id),
+            self.pending_key(user_id,session_id),
         )
-        
-        # 设置过期时间（24小时）
-        await self._redis_client.client.expire(redis_key, 86400) #存入redis一天
 
     async def get_latest_memories(self, user_id: int, session_id: int, limit: int = 5) -> List[Dict[str, Any]]:
         """获取最新N条记忆"""
-        
-        # 构建Redis键
-        redis_key = f"user:{user_id}:session:{session_id}"
-        
-        # 获取记忆列表
         try:
-            memory_list_str = await self._redis_client.client.hget(redis_key, "memory_list")
-        except AuthenticationError:
-            # Redis 未配置密码/密码错误时，不让整个接口失败（直接返回空记忆）
+            raw = await self._client.lrange(
+                self.key(user_id,session_id),0,limit-1
+            )
+        except RedisError as e:
+            logger.error("读取短期记忆失败: %s",e)
             return []
-        if not memory_list_str:
-            return []
-        
-        memory_list = json.loads(memory_list_str)
-        # 返回最新的limit条
-        return memory_list[:limit]
 
-    async def remove_oldest_memory(self, user_id: int, session_id: int) -> Dict[str, Any] | None:
-        """删除最早的1条记忆"""
-        
-        # 构建Redis键
-        redis_key = f"user:{user_id}:session:{session_id}"
-        
-        # 获取记忆列表
-        memory_list_str = await self._redis_client.client.hget(redis_key, "memory_list")
-        if not memory_list_str:
-            return None
-        
-        memory_list = json.loads(memory_list_str)
-        if not memory_list:
-            return None
-        
-        # 移除最早的记忆（列表末尾）
-        oldest_memory = memory_list.pop()
-        
-        # 更新Redis
-        await self._redis_client.client.hset(
-            redis_key,
-            mapping={
-                "memory_list": json.dumps(memory_list),
-                "last_updated": datetime.now().isoformat()
-            }
-        )
-        
-        return oldest_memory
-
-    async def clear_all(self, user_id: int, session_id: int):
-        """清空所有记忆"""
-        
-        # 构建Redis键
-        redis_key = f"user:{user_id}:session:{session_id}"
-        # 删除Redis键
-        await self._redis_client.client.delete(redis_key)
+        result: List[Dict[str,Any]] = []
+        for item in raw:
+            try:
+                result.append(json.loads(item))
+            except json.JSONDecodeError:
+                logger.error("短期记忆反序列化失败，已跳过: %s",item[:100])
+        return result
 
     async def get_memory_size(self, user_id: int, session_id: int) -> int:
-        """获取当前记忆条数"""
-        
-        # 构建Redis键
-        redis_key = f"user:{user_id}:session:{session_id}"
-        
-        # 获取记忆列表
-        memory_list_str = await self._redis_client.client.hget(redis_key, "memory_list")
-        if not memory_list_str:
+        try:
+            return await self._client.llen(self.key(user_id,session_id))
+        except RedisError:
             return 0
-        
-        memory_list = json.loads(memory_list_str)
-        return len(memory_list)
 
-    async def get_max_memory_size(self) -> int:
-        return self.max_memory_size
+    async def get_pending(self,user_id: int,session_id: int) -> List[str]:
+        try:
+            return await self._client.lrange(
+                self.pending_key(user_id,session_id),0,-1
+            )
+        except RedisError:
+            return []
 
-    async def delete_max_memory(self, user_id: int, session_id: int,size:int):
-        """删除超出最大记忆条数的最早记忆"""
-        # 构建Redis键
-        redis_key = f"user:{user_id}:session:{session_id}"
-        # 获取记忆列表
-        memory_list_str = await self._redis_client.client.hget(redis_key, "memory_list")
-        if not memory_list_str:
-            return None
+    async def scan_pending_keys(self) -> List[str]:
+        keys:List[str] = []
+        try:
+            async for key in self._client.scan_iter(match="stm:pending:*",count = 100):
+                keys.append(key)
+        except RedisError as e:
+            logger.error("扫描 pending 队列失败: %s", e)
+        return keys
 
-        memory_list = json.loads(memory_list_str)
-        if len(memory_list) <= size:
-            return None
-
-        # 移除最早的记忆（列表末尾）
-        for _ in range(size):
-            memory_list.pop()
-
-        # 更新Redis
-        await self._redis_client.client.hset(
-            redis_key,
-            mapping={
-                "memory_list": json.dumps(memory_list),
-                "last_updated": datetime.now().isoformat()
-            }
-        )
-
-        return memory_list
 
 async def get_short_term_memory() -> ShortTermMemory:
     """
     获取短期记忆实例
     
-    Returns:
-        ShortTermMemory实例
+    Returns: ShortTermMemory实例
     """
-    return ShortTermMemory()
+    global _short_term_memory
+    if _short_term_memory is None:
+        _short_term_memory = ShortTermMemory()
+    return _short_term_memory #type: ignore
