@@ -1,6 +1,5 @@
 import asyncio
 import json
-from typing import List, Any
 
 import pytest
 
@@ -38,7 +37,7 @@ async def test_eviction_moves_oldest_to_pending(stm):
     pending = await stm.get_pending(USER,SESSION)
     assert pending == evicted
 
-async def tset_evicted_item_is_invisible_to_readers(stm):
+async def test_evicted_item_is_invisible_to_readers(stm):
     for i in range(4):
         await stm.add_memory(USER,SESSION,MemoryUnit(f"问题{i}",f"回答{i}"))
 
