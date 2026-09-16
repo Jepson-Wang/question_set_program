@@ -192,3 +192,30 @@ async def test_shutdown_timeout_cancels_and_waits(manager, monkeypatch):
     assert task.done() and task.cancelled()
     assert manager._tasks == set()
     assert len(await manager.short_term_memory.get_pending(USER, SESSION)) == 1
+
+async def test_shutdown_waits_for_archive_before_closing(monkeypatch):
+    """关停顺序：先归档，再关线程池于连接"""
+    from backend.core import hooks
+
+    calls = []
+
+    class FakeManager:
+        async def shutdown(self,timeout):
+            calls.append("archive")
+
+    class FakeEngine:
+        async def dispose(self):
+            calls.append("engine")
+
+    async def fake_close_redis():
+        calls.append("redis")
+
+    monkeypatch.setattr(hooks,"_get_memory_manager",lambda: FakeManager())
+    monkeypatch.setattr(hooks,"shutdown_executors",lambda wait = True:calls.append("executors"))
+    monkeypatch.setattr(hooks,"engine",FakeEngine())
+    monkeypatch.setattr(hooks,"close_redis",fake_close_redis)
+
+    await hooks.shutdown_event()
+
+    assert calls[0] == "archive", f"必须最先等归档，实际顺序：{calls}"
+    assert set(calls) == {"archive", "executors", "engine", "redis"}
