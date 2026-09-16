@@ -100,7 +100,7 @@ python -c "import chromadb, llama_index.vector_stores.chroma, jieba, rank_bm25, 
 - 所有 I/O 保持 async；同步阻塞或 CPU 密集的调用（PDF 解析、BM25 检索与重建、LlamaIndex 向量库操作、写上传文件）投递到 `backend.core.executors.get_vector_executor()`，不要用 `run_in_executor(None, ...)`。
 - 所有目录相对 `backend/` 解析，不依赖当前工作目录：`RAG_DB_DIR` 默认 `rag_db`，`RAG_UPLOAD_DIR` 默认 `rag_uploads`，`RAG_EVAL_DIR` 默认 `rag_eval`。
 - 向量操作统一经 LlamaIndex：向量化用 `BaseEmbedding`，读写向量库用 `TextNode` 与 `VectorStoreQuery`。只有 `from_chroma` 创建 client 与 collection 时直接用 chromadb（要指定 cosine 空间）。
-- 向量一律归一化为单位长度；Chroma collection 使用 cosine 空间。LlamaIndex 返回的分数是 exp(-距离)，由适配层换算回余弦相似度，业务代码拿到的一律是余弦。
+- 向量一律归一化为单位长度；Chroma collection 使用 cosine 空间。LlamaIndex 返回的分数是 exp(-距离)，由适配层换算回余弦相似度，**RAG 这一层**的业务代码拿到的一律是余弦。（记忆层是另一套：`VectorStoreManager` 建 collection 时没指定距离函数，用的是 chromadb 默认的 l2，`min_score` 卡的是 `exp(-平方欧氏距离)`，详见记忆计划 Task 11。两层的阈值不能直接互相套用。）
 - 题目 id = `q_` + 规范化题干 sha1 的前 16 位；教材段 id = `k_` + 规范化文本 sha1 的前 16 位。
 - 检索参数：每路召回 20，融合后 30，最终 3，教材 2；RRF k = 60；重排分数阈值 0.3；教材相似度阈值 0.5。
 - 近似去重与防泄漏阈值：余弦相似度 0.95。
@@ -228,6 +228,8 @@ python -c "import chromadb, llama_index.vector_stores.chroma, jieba, rank_bm25, 
 
 - [ ] **Step 1: 修复 chromadb 的导入**
 
+> **这一步已经做完了**（2026-09-15）：三个缺失的 `.pyd` 已经通过 `pip install --force-reinstall --no-deps --no-cache-dir grpcio==1.78.0 chromadb==1.5.5 onnxruntime==1.24.4` 补回，`import chromadb` 正常。下面保留排查过程，供以后再遇到时参考。**因此本计划里所有「chromadb 不可用时 X skipped」的分支都不会出现，实际看到的是「可用」那一档的数字。**
+
 ```bash
 cd backend
 python -c "import chromadb, llama_index.vector_stores.chroma; print('OK')"
@@ -258,6 +260,8 @@ python -c "import chromadb, llama_index.vector_stores.chroma; print('OK')"
 **这一步没解决之前**：依赖 chromadb 的测试会被明确跳过（全部任务做完时共 10 个），其余 RAG 任务都可以照常推进。
 
 - [ ] **Step 2: 安装依赖并回填版本**
+
+> **这一步也已经做完了**（2026-09-15）：jieba 0.42.1、rank-bm25 0.2.2、pypdf 6.18.0、python-docx 1.2.0、lxml 6.1.3 都已安装并写进 `requirements.txt`（提交 `f9d1cff`）。那次提交同时把 `asyncmy` 升到 0.2.12，并清掉了 25 个没用到的包，其中包括 `llama-index` 元包和它的几个子包——RAG 用到的 `llama-index-core` 与 `llama-index-vector-stores-chroma` 都保留着。
 
 ```bash
 pip install jieba rank_bm25 pypdf python-docx
@@ -7547,7 +7551,8 @@ git commit -m "feat: RAG 生题 A/B 评测与评测命令行"
 - 入库必须经过第三方复核，裁判与生成模型不同家族，失败即拒；只有隔离区的人工通过可以跳过复核
 - 题目 id 是规范化题干的哈希：入库幂等，精确去重只比较 id
 - 词法索引整体重建、替换快照；不要原地修改快照
-- 向量操作统一经 LlamaIndex（`store/llama_store.py`），业务代码拿到的相似度一律是余弦；LlamaIndex 的 Chroma 集成返回 exp(-距离)，换算只在适配层做。不要改用 `VectorStoreIndex`（向量由 `Embedder` 事先算好）
+- RAG 的向量操作统一经 `store/llama_store.py`，这一层的业务代码拿到的相似度一律是余弦；LlamaIndex 的 Chroma 集成返回 exp(-距离)，换算只在适配层做。不要改用 `VectorStoreIndex`（向量由 `Embedder` 事先算好）
+- **记忆层（`agents/memory/vector_store_manager.py`）是另一套封装**：它用 `VectorStoreIndex` + 切分器 + 同步 embedding，collection 用 chromadb 默认的 l2 空间，`min_score` 的口径是 `exp(-平方欧氏距离)`。两层的需求不同（RAG 要先拿到向量做去重、查询向量还要在两个库之间复用），所以没有合并；写新代码时先确认自己在哪一层，阈值不要互相套用
 - BM25 分词用 jieba 的 `cut_for_search`，不要改回普通 `cut`（同一知识点的不同说法会互相召回不到）
 - RAG 的 prompt 放在 `agents/skills/` 下，frontmatter 必须带 `visibility: internal`
 - 命令行入库前要停服务（Chroma 本地库不支持多进程写入）；入库后重启服务才会加载新题

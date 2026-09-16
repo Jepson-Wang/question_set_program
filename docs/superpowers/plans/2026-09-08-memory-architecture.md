@@ -1223,6 +1223,27 @@ git commit -m "feat: 短期记忆改用 Redis LIST + Lua 原子淘汰，消除�
 
 ## Task 6: 归档转为后台任务
 
+**这个任务解决什么问题**：短期记忆溢出时，被挤出窗口的记录要先经 LLM 精炼，再写进向量库。现在这一步是在请求路径上同步做的——用户发一条消息恰好触发溢出，就得等一次 LLM 摘要（几秒）才能拿到回复。
+
+**怎么做**：`add_memory` 拿到被挤出的记录后，交给后台任务去归档，自己立即返回。归档成功才把条目从 pending 队列里 ack 掉；失败就留在队列里，等下次重试。
+
+**为什么不需要锁**：被归档的条目在 Task 5 的 Lua 脚本里已经用 `RPOPLPUSH` 物理移出了窗口，读路径根本看不到它。所以后台归档和窗口的读写不会互相干扰，也就不需要加锁。
+
+**为什么逐条归档，而不是多条一起精炼**：一次把 N 条交给 LLM、再按顺序和返回结果配对（`zip`），看起来省调用，实际会错位——模型可能把两条合并成一条，也可能把一条拆成两条。输出条数和输入对不上时，`zip` 会把 A 的精炼结果配到 B 头上，于是 B 被错误地 ack 掉、内容永久丢失。逐条归档虽然多花几次调用，但每条记录的成败互不影响。Task 15 会给这些调用加上限时和输入截断。
+
+**做完之后**：触发溢出的那个请求不再等待摘要；归档失败的条目留在 pending，由 Task 7 在下次启动时补做。
+
+**前后依赖**：用到 Task 5 的 `add_memory -> list[str]`、`ack_archived`、`get_pending`、`scan_pending_keys`、`parse_pending_key`。产出 `drain_pending()` 与 `shutdown()`，Task 7 接线使用；`_archive_one` 是 Task 15 的修改对象。
+
+**实现时注意**：
+
+1. **`asyncio.create_task` 必须自己持有强引用**。事件循环对任务只持弱引用，不存一份的话，任务可能跑到一半被垃圾回收。所以 `_spawn` 把任务放进 `self._tasks`，并注册 done 回调负责移除。
+2. **回调里先判断 `task.cancelled()`，再调用 `task.exception()`**。对已取消的任务调用 `exception()` 会抛 `CancelledError`。
+3. **回调里没有「当前异常」**，`logger.error(..., exc_info=True)` 取不到堆栈，要把异常对象本身传给 `exc_info`。
+4. **`shutdown` 取消任务后要等它们真正退出**（`await asyncio.gather(*pending, return_exceptions=True)`）。`cancel()` 只是发出取消请求，不等的话，事件循环关闭时会报 "Task was destroyed but it is pending"。
+5. **失败的处理分两类**：精炼失败、向量库写失败都留在 pending 等重试；无法反序列化的条目直接丢弃——它重试多少次都不会好，留着只会每次启动都卡在它上面。
+6. 本任务在仓库里已经完成（提交 `40f833f`，修复见 `b329d85`），下面的代码块就是最终版本，可以直接对照。
+
 **Files:**
 - Modify: `backend/agents/memory/memory_manager.py`（重写 `add_memory`，新增归档相关方法）
 - Create: `backend/tests/test_memory_manager.py`
@@ -1233,6 +1254,7 @@ git commit -m "feat: 短期记忆改用 Redis LIST + Lua 原子淘汰，消除�
   - `async MemoryManager.add_memory(user_id, session_id, memory) -> None` —— 不再等待摘要
   - `async MemoryManager.drain_pending() -> int` —— 启动恢复，返回补做的条目数
   - `async MemoryManager.shutdown(timeout: float = 10.0) -> None` —— 等待在途归档
+  - `async MemoryManager._archive_one(user_id, session_id, raw) -> bool` —— 归档单条（Task 15 在它上面加限时）
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1241,11 +1263,13 @@ git commit -m "feat: 短期记忆改用 Redis LIST + Lua 原子淘汰，消除�
 ```python
 import asyncio
 import json
+import logging
 
 import pytest
 
+import backend.agents.memory.memory_manager as mm
 from backend.agents.memory.memory_manager import MemoryManager
-from backend.agents.memory.short_term_memory import MemoryUnit, ShortTermMemory
+from backend.agents.memory.short_term_memory import ShortTermMemory, MemoryUnit
 
 USER, SESSION = 7, 7
 
@@ -1261,25 +1285,22 @@ class FakeVectorStore:
         self.docs.append((text, metadata))
         return True
 
-
 @pytest.fixture
-def manager(redis_test_client, monkeypatch):
-    """构造一个只依赖测试 Redis 的 MemoryManager，长期记忆与精炼都打桩。"""
+def manager(redis_test_client,monkeypatch):
+    """创建一个manager对象"""
     stm = ShortTermMemory(max_memory_size=2)
-    monkeypatch.setattr(stm, "_client", redis_test_client)
+    monkeypatch.setattr(target=stm,name="_client",value=redis_test_client)
 
     vector = FakeVectorStore()
 
-    async def fake_extract(units):
-        return [
-            {"text": f"精炼:{u['memory']['user_memory']}", "tags": ["事实"]}
-            for u in units
-        ]
+    async def extract_memory(units):
+        return [{
+            "text": f"精炼:{u['memory']['user_memory']}",
+            "tags": ['事实']
+        } for u in units]
 
-    import backend.agents.memory.memory_manager as mm
-    monkeypatch.setattr(mm, "get_extract_memory", fake_extract)
+    monkeypatch.setattr(mm,'get_extract_memory',extract_memory)
 
-    # MemoryManager 用了 singleMeta 单例，测试里绕开它直接构造
     mgr = MemoryManager.__new__(MemoryManager)
     mgr.long_term_memory = None
     mgr.short_term_memory = stm
@@ -1287,87 +1308,159 @@ def manager(redis_test_client, monkeypatch):
     mgr._tasks = set()
     return mgr
 
-
-async def test_add_below_limit_spawns_no_archive(manager):
-    await manager.add_memory(USER, SESSION, MemoryUnit("问题0", "回答0"))
+async def test_below_limit_spawns_nothing(manager):
+    await manager.add_memory(USER,SESSION,MemoryUnit("问题","回答"))
     assert manager._tasks == set()
     assert manager.vector_memory.docs == []
 
-
-async def test_overflow_archives_in_background(manager):
+async def test_overflow_archive_in_background(manager):
     for i in range(3):
-        await manager.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
-
-    await manager.shutdown(timeout=5)
-
+        await manager.add_memory(USER,SESSION,MemoryUnit(f"问题{i}",f"回答{i}"))
+    await manager.shutdown(timeout = 5)
     assert len(manager.vector_memory.docs) == 1
     text, metadata = manager.vector_memory.docs[0]
     assert text == "精炼:问题0"
     assert metadata["user_id"] == USER
-    assert isinstance(metadata["tags"], str), "Chroma 的 metadata 只接受标量"
-    assert await manager.short_term_memory.get_pending(USER, SESSION) == []
+    assert isinstance(metadata['tags'],str),"Chroma 的 metadata 只接受标量"
+    assert await manager.short_term_memory.get_pending(USER,SESSION) == []
 
-
-async def test_request_path_does_not_wait_for_archive(manager, monkeypatch):
-    """验收标准 2：触发溢出的请求不得被 LLM 摘要拖慢。"""
-    import backend.agents.memory.memory_manager as mm
-
+async def test_request_path_docs_not_wait_for_archive(manager,monkeypatch):
     async def slow_extract(units):
-        await asyncio.sleep(1.0)
-        return [{"text": "慢精炼", "tags": ["事实"]}]
+        await asyncio.sleep(1)
+        return [{"text": "慢精炼","tags": ["事实"]}]
 
-    monkeypatch.setattr(mm, "get_extract_memory", slow_extract)
+    monkeypatch.setattr(mm,"get_extract_memory",slow_extract)
 
     for i in range(2):
-        await manager.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+        await manager.add_memory(USER,SESSION,MemoryUnit(f'问题{i}',f'回答{i}'))
 
     start = asyncio.get_running_loop().time()
-    await manager.add_memory(USER, SESSION, MemoryUnit("问题2", "回答2"))
-    elapsed = asyncio.get_running_loop().time() - start
+    await manager.add_memory(USER,SESSION,MemoryUnit(f'问题2',f'回答2'))
+    expire = asyncio.get_running_loop().time() - start
 
-    assert elapsed < 0.2, f"请求路径被归档阻塞了 {elapsed:.2f}s"
+    assert expire < 0.5,"归档操作应当是后台运行的，不阻塞用户请求路径"
     await manager.shutdown(timeout=5)
 
-
-async def test_failed_archive_keeps_item_in_pending(manager):
-    """验收标准 4 的一半：写向量库失败时，条目必须留在 pending 等待补做。"""
+async def test_failed_archive_write_keeps_item_pending(manager):
+    """失败的归档操作不会将pending队列中的相应doc给删除"""
+    # 也就是说那个pending应该还存在于pending队列中，通过get_pending()可以查询到
     manager.vector_memory.should_fail = True
 
     for i in range(3):
-        await manager.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
-    await manager.shutdown(timeout=5)
+        await manager.add_memory(USER,SESSION,MemoryUnit(f'问题{i}',f'回答{i}'))
 
-    pending = await manager.short_term_memory.get_pending(USER, SESSION)
-    assert len(pending) == 1
-    assert json.loads(pending[0])["memory"]["user_memory"] == "问题0"
+    await manager.shutdown(5)
+    # 然后判断 pending 中是否有相应的消息
+    result = await manager.short_term_memory.get_pending(USER,SESSION)
+    assert len(result) == 1
+    assert json.loads(result[0])['memory']['user_memory'] == '问题0'
 
-
-async def test_drain_pending_recovers_orphans(manager):
-    """验收标准 4 的另一半：模拟「已弹出、未入库」后重启，补做成功且不重复。"""
+async def test_drain_recovers_is_idempotent(manager):
+    """保证drain_pending只执行一次"""
     manager.vector_memory.should_fail = True
-    for i in range(3):
-        await manager.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
-    await manager.shutdown(timeout=5)
-    assert len(await manager.short_term_memory.get_pending(USER, SESSION)) == 1
 
-    # 「重启」：向量库恢复正常，跑一次启动恢复
+    for i in range(3):
+        await manager.add_memory(USER, SESSION, MemoryUnit(f'问题{i}', f'回答{i}'))
+
+    await manager.shutdown(5)
+    assert len(await manager.short_term_memory.get_pending(USER,SESSION)) == 1
+
     manager.vector_memory.should_fail = False
-    manager._tasks = set()
     recovered = await manager.drain_pending()
 
     assert recovered == 1
     assert len(manager.vector_memory.docs) == 1
-    assert await manager.short_term_memory.get_pending(USER, SESSION) == []
+    assert await manager.short_term_memory.get_pending(USER,SESSION) == []
 
-    # 再跑一次不应重复归档
     assert await manager.drain_pending() == 0
     assert len(manager.vector_memory.docs) == 1
+
+
+async def _fill_pending(manager, n):
+    """直接写短期记忆，让 pending 里积压 n 条（max=2，第 3 条起每条挤出一条），不触发后台归档"""
+    for i in range(n + 2):
+        await manager.short_term_memory.add_memory(USER, SESSION, MemoryUnit(f'问题{i}', f'回答{i}'))
+
+
+async def test_finished_tasks_are_released(manager):
+    """任务结束后要从 _tasks 里移除，否则每溢出一次就多攒一个"""
+    for i in range(4):
+        await manager.add_memory(USER, SESSION, MemoryUnit(f'问题{i}', f'回答{i}'))
+    await manager.shutdown(5)
+    assert manager._tasks == set()
+    assert len(manager.vector_memory.docs) == 2
+
+
+async def test_background_exception_is_logged(manager, monkeypatch, caplog):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("意料之外的错误")
+    monkeypatch.setattr(manager, "_archive", boom)
+
+    with caplog.at_level(logging.ERROR):
+        for i in range(3):
+            await manager.add_memory(USER, SESSION, MemoryUnit(f'问题{i}', f'回答{i}'))
+        await manager.shutdown(5)
+    assert "意料之外的错误" in caplog.text
+    assert manager._tasks == set()
+
+
+async def test_one_record_refined_into_several_is_not_lost(manager, monkeypatch):
+    """
+    模型把每条记录拆成两条事实。按顺序 zip 配对的旧实现里，第 2 条记录会配上第 1 条的第二条事实被 ack，
+    它自己的内容永久丢失；逐条归档则每条的产出都完整写入。
+    """
+    async def split(units):
+        q = units[0]['memory']['user_memory']
+        return [{"text": f"{q}-事实A", "tags": ["事实"]}, {"text": f"{q}-事实B", "tags": ["事实"]}]
+    monkeypatch.setattr(mm, "get_extract_memory", split)
+
+    await _fill_pending(manager, 2)
+    assert await manager.drain_pending() == 2
+    assert sorted(t for t, _ in manager.vector_memory.docs) == ["问题0-事实A", "问题0-事实B", "问题1-事实A", "问题1-事实B"]
+    assert await manager.short_term_memory.get_pending(USER, SESSION) == []
+
+
+async def test_items_are_archived_independently(manager, monkeypatch):
+    """一条精炼失败不影响另一条：成功的照常 ack，失败的留在 pending"""
+    async def flaky(units):
+        if units[0]['memory']['user_memory'] == '问题0':
+            raise RuntimeError("LLM 超时")
+        return [{"text": "精炼", "tags": ["事实"]}]
+    monkeypatch.setattr(mm, "get_extract_memory", flaky)
+
+    await _fill_pending(manager, 2)
+    assert await manager.drain_pending() == 1
+    [left] = await manager.short_term_memory.get_pending(USER, SESSION)
+    assert json.loads(left)['memory']['user_memory'] == '问题0'
+
+
+async def test_unparseable_item_is_dropped(manager, redis_test_client):
+    """坏数据重试也不会好，要从 pending 删掉，不能每次启动都卡在它上面"""
+    await redis_test_client.rpush(ShortTermMemory.pending_key(USER, SESSION), "{不是json")
+    assert await manager.drain_pending() == 0
+    assert await manager.short_term_memory.get_pending(USER, SESSION) == []
+
+
+async def test_shutdown_timeout_cancels_and_waits(manager, monkeypatch):
+    """超时的任务被取消，并且 shutdown 返回前已经真正退出；条目留在 pending 等下次启动补做"""
+    async def forever(units):
+        await asyncio.sleep(30)
+    monkeypatch.setattr(mm, "get_extract_memory", forever)
+
+    for i in range(3):
+        await manager.add_memory(USER, SESSION, MemoryUnit(f'问题{i}', f'回答{i}'))
+    [task] = manager._tasks
+    await manager.shutdown(timeout=0.1)
+
+    assert task.done() and task.cancelled()
+    assert manager._tasks == set()
+    assert len(await manager.short_term_memory.get_pending(USER, SESSION)) == 1
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `cd backend && python -m pytest tests/test_memory_manager.py -v`
-Expected: FAIL / ERROR，`MemoryManager` 没有 `_tasks`、`shutdown`、`drain_pending`
+Expected: 11 个测试全部失败或报错——`MemoryManager` 还没有 `_tasks`、`_spawn`、`shutdown`、`drain_pending`
 
 - [ ] **Step 3: 重写 memory_manager.py**
 
@@ -1375,23 +1468,19 @@ Expected: FAIL / ERROR，`MemoryManager` 没有 `_tasks`、`shutdown`、`drain_p
 
 ```python
 """
-三层记忆的统一入口。
-
-归档流程为什么不需要锁：
-被淘汰的记忆在 ShortTermMemory.add_memory 的那一次 Lua EVAL 里就已经
-原子地移出了窗口、进入 pending 队列。此后它对读路径不可见，也不可能
-被新消息插入干扰，因此归档（LLM 精炼 + 写向量库）可以放心地在后台跑，
-请求路径不必等待。
+后续还可添加功能
+将长期记忆存入RAG知识库中：根据用户输入的问题，整合RAG检索和长短期记忆，返回规划器需要的记忆
 """
 import asyncio
 import json
 import time
-from typing import Any
+from typing import Any,TYPE_CHECKING
 
 from backend.agents.agent.extract_memory_agent import get_extract_memory
 from backend.agents.memory.long_term_memory import LongTermMemory
 from backend.agents.memory.short_term_memory import ShortTermMemory, MemoryUnit
-from backend.agents.memory.vector_store_manager import VectorStoreManager
+if TYPE_CHECKING:
+    from backend.agents.memory.vector_store_manager import VectorStoreManager
 from backend.core.single_tool import singleMeta
 from backend.middleware.logging import get_logger
 
@@ -1400,16 +1489,13 @@ logger = get_logger(__name__)
 
 class MemoryManager(metaclass=singleMeta):
     def __init__(self,
-                 long_term_memory: LongTermMemory,
-                 short_term_memory: ShortTermMemory,
-                 vector_memory: VectorStoreManager):
+                 long_term_memory:LongTermMemory,
+                 short_term_memory:ShortTermMemory,
+                 vector_memory:"VectorStoreManager"):
         self.long_term_memory = long_term_memory
         self.short_term_memory = short_term_memory
         self.vector_memory = vector_memory
-        # 必须持有强引用：asyncio 只弱引用运行中的 task，否则可能在完成前被 GC
         self._tasks: set[asyncio.Task] = set()
-
-    # ---------- 读 ----------
 
     async def get_memory_for_planner(self, user_id: int, session_id: int) -> dict[str, Any]:
         """获取规划器需要的记忆（短期列表 + 单个长期画像）"""
@@ -1420,115 +1506,129 @@ class MemoryManager(metaclass=singleMeta):
             "long_memory": long_memory,    # UserProfileResponse | None
         }
 
-    # ---------- 写 ----------
-
-    async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit) -> None:
+    async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit):
         """
-        写入一条短期记忆。超出窗口的旧记忆会被原子地移入 pending 队列，
-        并交给后台任务归档——请求路径不等待 LLM 摘要。
+        对短期记忆进行修改操作，并检查记忆是否已满
+        如果已满，则进行记忆的删除，同时将修改后的记忆添加到长期记忆中
+        :param user_id:
+        :param session_id:
+        :param memory:
+        :return:
         """
-        evicted = await self.short_term_memory.add_memory(user_id, session_id, memory)
-        if evicted:
-            self._spawn(self._archive(user_id, session_id, evicted))
 
-    def _spawn(self, coro) -> asyncio.Task:
+        evicted = await self.short_term_memory.add_memory(user_id,session_id,memory)
+        if not evicted:
+            return
+        # 有 evicted说明记忆溢出了，需要归档，交给 spawn 后台做归档，不阻塞
+        self._spawn(self._archive(user_id,session_id,evicted))
+
+    def _spawn(self,coro) -> asyncio.Task:
         task = asyncio.create_task(coro)
+        # 事件循环对任务只持有弱引用，自己不存一份的话，任务可能跑到一半被垃圾回收
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._on_task_done)
         return task
 
-    async def _archive(self, user_id: int, session_id: int, raw_items: list[str]) -> int:
-        """
-        把被淘汰的记忆精炼后写入向量库；每条成功后才从 pending 移除。
-        :return: 成功归档的条数
-        """
-        units: list[dict] = []
-        keep: list[str] = []
-        for raw in raw_items:
-            try:
-                units.append(json.loads(raw))
-                keep.append(raw)
-            except json.JSONDecodeError:
-                logger.error("待归档记忆反序列化失败，直接丢弃：%s", raw[:100])
-                await self.short_term_memory.ack_archived(user_id, session_id, raw)
+    def _on_task_done(self,task: asyncio.Task):
+        """任务结束（成功、失败或被取消）时调用：释放引用，并把异常记进日志"""
+        self._tasks.discard(task)
+        # 被取消的任务调用 exception() 会抛 CancelledError，要先排除
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            # 回调里没有「当前异常」，exc_info=True 取不到堆栈，要把异常对象直接传进去
+            logger.error("归档任务异常退出: %s", exc, exc_info=exc)
 
-        if not units:
-            return 0
+    async def _archive(self,user_id,session_id,raw_items: list[str]) -> int:
+        """
+        逐条归档，返回成功的条数。
+        不把多条记录一起交给 LLM 再按顺序配对：模型可能把一条拆成多条，也可能把多条合成一条，
+        输出条数和输入对不上时，按顺序配对会 ack 错条目，造成内容丢失或重复写入。
+        """
+        success = 0
+        for raw in raw_items:
+            if await self._archive_one(user_id,session_id,raw):
+                success += 1
+        return success
+
+    async def _archive_one(self,user_id,session_id,raw: str) -> bool:
+        """归档一条：精炼出的内容全部写进向量库之后才 ack；任何一步失败，条目都留在 pending 待重试"""
+        try:
+            unit = json.loads(raw)
+        except json.JSONDecodeError as e:
+            # 坏数据重试多少次都不会好，直接从 pending 删掉，否则每次启动都会卡在它上面
+            logger.error("待归档记忆无法反序列化，已丢弃: %s | %s", e, raw[:100])
+            await self.short_term_memory.ack_archived(user_id,session_id,raw)
+            return False
 
         try:
-            refined = await get_extract_memory(units)
+            refined = await get_extract_memory([unit])
         except Exception as e:
-            logger.error("记忆精炼调用失败，条目留在 pending 待重试：%s", e, exc_info=True)
-            return 0
-
+            logger.error("记忆精炼失败，留在 pending 待重试: %s", e, exc_info=True)
+            return False
         if not refined:
-            logger.warning("记忆精炼未产出内容，条目留在 pending 待重试")
-            return 0
+            # 精炼的提示词要求每条记录都有输出，空结果说明模型输出无法解析
+            logger.warning("记忆精炼没有产出内容，留在 pending 待重试")
+            return False
 
         archive_time = int(time.time())
-        done = 0
-        # refined 与 keep 按顺序一一对应；数量不等时按较短的来，多余的留在 pending
-        for raw, item in zip(keep, refined):
+        for item in refined:
             metadata = {
-                'user_id': user_id,
-                'session_id': session_id,
-                'timestamp': archive_time,
-                # Chroma 的 metadata 只接受标量，list 需展平
-                'tags': ','.join(item['tags']),
+                "user_id": user_id,
+                "session_id": session_id,
+                "tags": ','.join(item['tags']),
+                "time_stamp": archive_time
             }
-            ok = await self.vector_memory.add_document(item['text'], metadata)
-            if not ok:
-                await asyncio.sleep(0.5)
-                ok = await self.vector_memory.add_document(item['text'], metadata)
-            if ok:
-                await self.short_term_memory.ack_archived(user_id, session_id, raw)
-                done += 1
-            else:
-                logger.error("写入向量库失败，条目留在 pending 待重试")
-        return done
+            if not await self.vector_memory.add_document(item['text'],metadata):
+                # 前面几条可能已经写进去了，重试时会再写一遍；向量库不按内容去重，这里接受少量重复
+                logger.error("写入向量库失败，留在 pending 待重试")
+                return False
 
-    # ---------- 生命周期 ----------
+        await self.short_term_memory.ack_archived(user_id,session_id,raw)
+        return True
 
     async def drain_pending(self) -> int:
-        """
-        启动恢复：扫出所有 pending 队列，补做进程崩溃时「已弹出、未入库」的归档。
-        :return: 成功补做的条目数
-        """
+        """重启恢复之后，将已弹出但未归档的进行归档"""
         keys = await self.short_term_memory.scan_pending_keys()
         total = 0
         for key in keys:
             try:
-                user_id, session_id = ShortTermMemory.parse_pending_key(key)
-            except (IndexError, ValueError):
-                logger.error("无法解析 pending key，已跳过：%s", key)
+                user_id,session_id = self.short_term_memory.parse_pending_key(key)
+            except (IndexError,ValueError):
+                logger.error("无法解析pending key，已跳过: %s",key)
                 continue
 
-            items = await self.short_term_memory.get_pending(user_id, session_id)
-            if not items:
+            # 然后就是归档，通过_archive来执行
+            texts = await self.short_term_memory.get_pending(user_id,session_id)
+            logger.info("启动恢复：session %s:%s 有 %s 条待归档", user_id, session_id, len(texts))
+            # 如果 texts 没有读取出来，那么就在这一层失败，不要抛给上层去处理，不合适
+            if not texts:
                 continue
-            logger.info("启动恢复：session %s:%s 有 %s 条待归档", user_id, session_id, len(items))
-            total += await self._archive(user_id, session_id, items)
+            total += await self._archive(user_id,session_id,texts)
+
         if total:
-            logger.info("启动恢复完成，共补做 %s 条", total)
+            logger.info("drain_pending 成功归档: %s 条消息",total)
         return total
 
-    async def shutdown(self, timeout: float = 10.0) -> None:
-        """等待在途归档完成；超时未完成的留在 pending，下次启动补做。"""
-        if not self._tasks:
+    async def shutdown(self, timeout: float = 10.0):
+        tasks = list(self._tasks)
+        if not tasks:
             return
-        pending = list(self._tasks)
-        logger.info("等待 %s 个归档任务完成……", len(pending))
-        done, not_done = await asyncio.wait(pending, timeout=timeout)
-        if not_done:
-            logger.warning("%s 个归档任务超时未完成，将在下次启动时补做", len(not_done))
-            for task in not_done:
-                task.cancel()
+        logger.info("shutdown 等待 %s 个归档任务", len(tasks))
+        done,pending = await asyncio.wait(tasks,timeout=timeout)
+        if pending:
+            logger.warning("shutdown 时有 %s 个归档任务超时，已取消，下次启动由 drain_pending 补做",len(pending))
+            for cancel_task in pending:
+                cancel_task.cancel()
+            # cancel() 只是发出取消请求，要等任务真正退出；否则事件循环关闭时会报 Task was destroyed but it is pending
+            await asyncio.gather(*pending, return_exceptions=True)
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cd backend && python -m pytest tests/test_memory_manager.py -v`
-Expected: 5 passed
+Expected: 11 passed。这些测试都要连本机 Redis（db 15）；Redis 没开时会整体跳过，那样等于没测，记得先把 Redis 起起来
 
 - [ ] **Step 5: 提交**
 
@@ -1540,6 +1640,26 @@ git commit -m "feat: 记忆归档转为后台任务，请求路径不再等待 L
 ---
 
 ## Task 7: 启动恢复与优雅关停接线
+
+**这个任务解决什么问题**：Task 6 写好的 `drain_pending()` 和 `shutdown()` 目前没有任何调用方。也就是说，上次没做完的归档没人补做，进程退出时在途的归档任务会被直接掐断。这个任务把它们接到应用的启动与关停钩子上。
+
+**现状**：`backend/core/hooks.py` 只做两件事——启动时建表，关停时释放数据库连接和 Redis 连接。
+
+**怎么做**：`startup_event` 里调用 `drain_pending()` 补做积压；`shutdown_event` 里先 `await memory_manager.shutdown(timeout=10)` 等在途任务结束，再依次关线程池、数据库、Redis。
+
+**为什么顺序不能反**：归档任务自己还要用 Redis（ack 掉已归档的条目）和向量库（写入时要走 Task 3 的线程池）。先关 Redis 或线程池，在途任务就会失败，条目留在 pending，下次启动重做一遍——重做意味着同一条记忆被写进向量库两次。
+
+**做完之后**：进程重启不再丢归档；崩溃后遗留在 pending 里的条目，下次启动自动补做。
+
+**前后依赖**：用到 Task 6 的 `drain_pending` / `shutdown`、Task 3 的 `shutdown_executors`。不产出新接口，但 Task 15 会调整这里 `drain_pending()` 的调用方式。
+
+**实现时注意**：
+
+1. **Step 1 的测试测的是真实执行顺序，不是源码文本**。它用替身换掉 `hooks` 里的四个依赖，每个替身被调用时往一个列表里记一笔，然后真跑一遍 `shutdown_event()`，最后断言归档排在第一位。这样既不需要真实的数据库和 Redis，也能覆盖线程池。（早先的写法是用 `inspect.getsource` 比较两个字符串在源码里的先后，把 `close_redis()` 挪进一个辅助函数它就失效了，而且漏掉了线程池。）
+2. **`drain_pending()` 返回的是补做的条数（int），不是列表**。写成 `len(recovered)` 会抛 `TypeError`，而它恰好在 `try` 里，于是被吞成一条「记忆归档恢复失败」的错误日志——恢复其实是成功的，日志却在报错。直接 `logger.info("...补做 %s 条", recovered)` 即可。
+3. **`startup_event` 里 `await drain_pending()` 会阻塞启动**。pending 里积压 N 条，就要串行调用 N 次 LLM，服务要等它做完才开始接请求。做完 Task 15（单次限时约 35 秒）后最坏情况可控，但积压多时仍然慢。如果在意启动速度，可以改成后台任务，代价是要处理「启动补做」与「新溢出的归档」同时处理同一个会话的问题，见 Task 15 末尾的「后续可选」。
+4. **`memory_manager` 必须延迟导入**。它是在 `agent_api` 模块里实例化的，写在 `hooks.py` 顶部会造成循环导入，所以计划里用了一个 `_get_memory_manager()` 函数在调用时才导入。
+5. `main.py` 现在用的是 `app.on_event("startup")`，FastAPI 已经把它标记为弃用（运行测试时能看到 DeprecationWarning）。迁移到 lifespan 是以后的事，本任务不动它。
 
 **Files:**
 - Modify: `backend/core/hooks.py`
@@ -1554,22 +1674,38 @@ git commit -m "feat: 记忆归档转为后台任务，请求路径不再等待 L
 追加到 `backend/tests/test_memory_manager.py` 末尾：
 
 ```python
-async def test_shutdown_order_is_documented():
-    """关停顺序：先等归档（还要用 Redis 和向量库），再关线程池与连接。"""
-    import inspect
-
+async def test_shutdown_waits_for_archive_before_closing(monkeypatch):
+    """关停顺序：先等归档（它还要用 Redis 和向量库的线程池），再关线程池与连接"""
     from backend.core import hooks
 
-    source = inspect.getsource(hooks.shutdown_event)
-    archive_pos = source.index("shutdown(")
-    redis_pos = source.index("close_redis")
-    assert archive_pos < redis_pos, "必须先等归档完成，再关 Redis 连接"
+    calls = []
+
+    class FakeManager:
+        async def shutdown(self, timeout):
+            calls.append("archive")
+
+    class FakeEngine:
+        async def dispose(self):
+            calls.append("engine")
+
+    async def fake_close_redis():
+        calls.append("redis")
+
+    monkeypatch.setattr(hooks, "_get_memory_manager", lambda: FakeManager())
+    monkeypatch.setattr(hooks, "shutdown_executors", lambda wait=True: calls.append("executors"))
+    monkeypatch.setattr(hooks, "engine", FakeEngine())
+    monkeypatch.setattr(hooks, "close_redis", fake_close_redis)
+
+    await hooks.shutdown_event()
+
+    assert calls[0] == "archive", f"必须最先等归档，实际顺序：{calls}"
+    assert set(calls) == {"archive", "executors", "engine", "redis"}
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd backend && python -m pytest tests/test_memory_manager.py::test_shutdown_order_is_documented -v`
-Expected: FAIL，`hooks.shutdown_event` 里没有 `shutdown(`
+Run: `cd backend && python -m pytest tests/test_memory_manager.py::test_shutdown_waits_for_archive_before_closing -v`
+Expected: FAIL，`AttributeError: module 'backend.core.hooks' has no attribute '_get_memory_manager'`
 
 - [ ] **Step 3: 实现 hooks**
 
@@ -1647,10 +1783,22 @@ git commit -m "feat: 启动时补做未完成归档，关停时等待在途任�
 
 ## Task 8: 画像写入策略：JSON 合并 + notes 逃生口
 
-两件事一起做，因为它们都是「画像的 JSON 字段该怎么写」这一个关注点：
+**这个任务解决什么问题**：两件事一起做，因为它们都属于「画像的 JSON 字段该怎么写」这一个关注点。
 
-1. `weak_points` / `preferences` 现在是整体替换：Agent 传入 `{"函数": "薄弱"}` 会把之前存的所有其他知识点冲掉。这与「画像只增不改」的既定策略直接矛盾。
-2. 新增 `notes` 列作为**逃生口**。画像的键名受词表约束（见 Task 10），但总有观察放不进任何已知键。`notes` 是一个纯自由文本数组，追加式写入，不参与频次确认，也**不注入 system prompt**（只在 `user_profile_query_tool` 被主动调用时返回），避免它把每轮的画像段撑大。
+1. **`weak_points` / `preferences` 现在是整体替换**。`user_profile_mapper.update_user_profile` 对 DTO 里的每个字段直接 `setattr`，所以 Agent 传一个 `{"函数": "薄弱"}` 进来，会把之前存的所有其他知识点冲掉。这与「画像只增不改」的既定策略直接矛盾，而且丢数据时不报任何错。
+2. **新增 `notes` 列作为逃生口**。画像的键名受词表约束（Task 10），但总有观察放不进任何已知键。`notes` 是纯自由文本数组，追加式写入，不参与频次确认，也**不注入 system prompt**（只在 `user_profile_query_tool` 被主动调用时返回），避免它把每轮的画像段越撑越大。
+
+**怎么做**：把合并逻辑抽成两个纯函数 `merge_json_field`（浅合并，新键追加、同键取新值、老键一律保留）和 `append_notes`（追加、跳过完全重复、超过 50 条丢最旧的），在 mapper 里按字段名分派：`_MERGE_FIELDS` 走合并，`_APPEND_FIELDS` 走追加，其余照旧覆盖。
+
+**做完之后**：写入一个新知识点不再冲掉已有的；模型遇到放不进词表的观察时，有地方可放，不用自造键名。
+
+**前后依赖**：不依赖前面的任务。产出的 `notes` 列与 `merge_json_field` / `append_notes`，Task 9、10、13 都会用到。
+
+**实现时注意**：
+
+1. **`notes` 有两条写入路径，容易只改一条**。新建画像走 `UserProfile(...)`，更新画像走 `UserProfileUpdateRequest`。只给新建分支补 `notes`（这是最容易犯的错）的话，画像已经存在时——也就是绝大多数情况——传进来的 `notes` 会被静默丢掉，mapper 里的 `_APPEND_FIELDS` 分支永远不会被触发，而且不报任何错。Step 3 里两条路径都改了，实现时不要漏。
+2. **`create_all` 只建表、不加列**。`user_profile` 表已经存在时，必须手动执行 Step 3 里的 `ALTER TABLE`。MySQL 的 JSON 列不能有字面默认值，已有的行要用 `JSON_ARRAY()` 回填。
+3. **`notes` 的去重是按整条字符串完全相同来判断的**。「喜欢先看思路」和「做题时喜欢先看思路」会各占一条，上限 50 条只能靠丢最旧的兜底。这是有意选的简单策略：语义去重要么靠模型、要么靠向量，成本都不划算。
 
 **Files:**
 - Modify: `backend/model/user_profile.py`（新增 `notes` 列）
@@ -1658,6 +1806,7 @@ git commit -m "feat: 启动时补做未完成归档，关停时等待在途任�
 - Modify: `backend/schemas/response/user_profile_response.py`（新增 `notes`）
 - Modify: `backend/agents/memory/long_term_memory.py`（新建画像时填 `notes`）
 - Modify: `backend/dao/user_profile_mapper.py`（`update_user_profile` 与 `create_memory`）
+- Modify: `backend/schemas/request/user_profile_update_request.py`（新增 `notes`，更新路径要用）
 - Create: `backend/tests/test_profile_merge.py`
 
 **Interfaces:**
@@ -1666,7 +1815,7 @@ git commit -m "feat: 启动时补做未完成归档，关停时等待在途任�
   - `merge_json_field(old: dict | None, new: dict | None) -> dict` —— 浅合并，供 `weak_points` / `preferences` 使用
   - `append_notes(old: list | None, new: list | None, max_size: int = 50) -> list` —— 追加去重并限长，供 `notes` 使用
   - `UserProfile.notes` JSON 列，默认 `[]`
-  - `LTMRequest.notes: Optional[list]`、`UserProfileResponse.notes: list`
+  - `LTMRequest.notes: Optional[list]`、`UserProfileUpdateRequest.notes: Optional[list]`、`UserProfileResponse.notes: list`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1755,6 +1904,12 @@ Expected: FAIL，`ImportError: cannot import name 'merge_json_field'`
     notes: Optional[list] = Field(None, description='本次新增的自由观察记录（追加，不覆盖）')
 ```
 
+`backend/schemas/request/user_profile_update_request.py` —— 加一个字段。**这一步不能省**：更新已有画像走的是这个 schema，少了它，`notes` 在更新时会被静默丢掉：
+
+```python
+    notes: Optional[list] = Field(None, description='本次新增的自由观察记录（追加，不覆盖）')
+```
+
 `backend/schemas/response/user_profile_response.py` —— 加一个字段：
 
 ```python
@@ -1763,10 +1918,16 @@ Expected: FAIL，`ImportError: cannot import name 'merge_json_field'`
 
 注意是 `examples`（复数）且外面多套一层列表：`examples` 本身就是「示例的列表」，这个字段的一个示例值又是一个列表。不要写成 `example=`——Pydantic V2 已弃用、V3 会移除，同文件其他字段也已统一改为 `examples=[...]`。
 
-`backend/agents/memory/long_term_memory.py` 的 `add_or_update` 里，新建画像的分支补上：
+`backend/agents/memory/long_term_memory.py` 的 `add_or_update` 里，**两个分支都要补**。新建画像的分支：
 
 ```python
                 notes=request.notes or [],
+```
+
+更新画像的分支，构造 `UserProfileUpdateRequest` 时加上：
+
+```python
+            notes=request.notes,
 ```
 
 `backend/dao/user_profile_mapper.py` 的 `create_memory` 里，构造 `UserProfile` 时补上：
@@ -1868,7 +2029,22 @@ git commit -m "feat: 画像 JSON 字段改为合并写入，新增 notes 自由�
 
 ## Task 9: 画像候选池（频次确认）
 
-事实类字段（`grade`、`subject`）直写；偏好类字段（`weak_points`、`preferences`）先进候选池，同一字段路径第二次命中才晋升为长期画像。
+**这个任务解决什么问题**：Agent 分不清「这题再简单点」和「以后题目都简单点」。前者是一次性诉求，写进长期画像会污染后续所有请求；后者才是稳定偏好。靠提示词约束模型自己判断，准确率不够。
+
+**怎么做**：改用统计。事实类字段（`grade`、`subject`）和 `notes` 直写；偏好类字段（`weak_points`、`preferences`）先进候选池，同一个字段路径**第二次**出现才晋升为长期画像。代价是偏好生效滞后一轮，换来的是判定不再依赖模型的主观发挥。
+
+**这里绕开了一个难题**：「两次说的是不是同一个偏好」本来需要语义相似度计算。但 LLM 在提取时已经把偏好结构化成了字段名，所以同键即同偏好，比较字符串就够了——**前提是键名受控**，这由 Task 10 保证。
+
+**做完之后**：用户随口一说的要求不会立刻进画像；反复出现的偏好会自动沉淀下来。
+
+**前后依赖**：用到 `get_redis_client()`。产出 `ProfileCandidateStore`（`offer` / `get_all` / `clear`）和改写后的 `UserProfileSaveTool`；Task 10 会在这个工具里再插入一层词表分流。
+
+**实现时注意**：
+
+1. **`offer` 是读-改-写，不是原子操作**：先 `hget` 读出计数，改完再 `hset` 写回。同一个用户的两个请求并发进来时，可能各自读到 `count=0`，最后都写成 1，少计一次。单个用户同时发两个请求的情况很少，漏记一次的后果也只是偏好晚一轮生效，所以可以接受。这一点和 Task 5 的短期记忆正好相反：那里丢的是用户消息，所以必须用 Lua 保证原子。要严格的话，这里也可以改成 `HINCRBY` 或一小段 Lua。
+2. **晋升后先删候选、再写库**。`offer` 达到阈值时会立刻 `hdel` 掉候选项，如果紧接着写库失败，这次晋升就丢了，用户得再说一遍。想更稳妥，可以改成写库成功后再删。
+3. **Redis 不可用时不能阻断主流程**：`offer` 捕获 `RedisError` 后返回 `(0, False)` 并记日志，画像写不进去，但用户的请求照常完成。
+4. **工具返回的文本要如实汇报**。写入了什么、哪些还在候选池里（`题目风格（1/2）`），都要说清楚。否则 Agent 会以为偏好已经生效，转头就告诉用户「已经记住了」。
 
 **Files:**
 - Create: `backend/agents/memory/profile_candidates.py`
@@ -2174,13 +2350,24 @@ git commit -m "feat: 画像写入引入候选池频次确认，区分一次性�
 
 ## Task 10: 画像维度词表（profile_schema Skill）
 
-Task 9 的工具描述里承诺了「键必须取自 profile_schema 的词表」，这个任务把它兑现。
+**这个任务解决什么问题**：Task 9 的工具描述里承诺了「键必须取自 profile_schema 的词表」，这个任务把它兑现。
 
-**为什么键名必须受控**：Task 9 的频次确认建立在「同键即同偏好」这一条假设上。键名若自由生成，同一个偏好在三轮里可能变成 `preferences.题目风格`、`preferences.出题风格`、`preferences.题目偏好`，计数永远到不了阈值，偏好永远晋升不了——而且**不报任何错**。
+**为什么键名必须受控**：频次确认建立在「同键即同偏好」这一条假设上。键名如果自由生成，同一个偏好在三轮里可能变成 `preferences.题目风格`、`preferences.出题风格`、`preferences.题目偏好`，计数永远累积不到阈值，偏好永远晋升不了——而且**不报任何错**，这是最难排查的一类问题。
 
-**为什么词表放在 SKILL.md 而不是代码里**：`loader.py` 有 mtime 缓存，编辑 Markdown 下一次调用就生效。加一个新的画像维度不需要改表、不需要改代码、不需要重启，和 `question_variant` / `memory_refinement` 是同一套热加载机制。
+**为什么词表放在 SKILL.md 而不是代码里**：`loader.py` 有 mtime 缓存，编辑 Markdown 下一次调用就生效。加一个新的画像维度，不需要改表、不需要改代码、不需要重启，和 `question_variant`、`memory_refinement` 是同一套热加载机制。
 
 **词表外的键不丢弃，自动转存 `notes`**——既不静默失效，也不丢信息。
+
+**做完之后**：模型写画像时有一份明确的可用键清单；写错了也不会悄悄丢失，而是落到 `notes` 里。
+
+**前后依赖**：用到 `loader.py` 里已有的 `load_skill_code`。产出 `load_vocab` 和 `profile_schema/SKILL.md`，并给 Task 9 的工具加上分流逻辑。
+
+**实现时注意**：
+
+1. **`load_vocab` 会 `exec` 执行 Markdown 里的代码块**。SKILL.md 和代码在同一个仓库、同等信任，这样做没问题，但要清楚这条边界：任何能修改 SKILL.md 的人，都能在服务进程里执行任意代码。不要把这个目录开放给不受信任的编辑者。
+2. **空词表被当作「不做限制」**。分流那段写的是 `if allowed and sub_key not in allowed`，所以 SKILL.md 写坏了、解析不出 `VOCAB` 时，工具会退回到「什么键都接受」。这是有意的降级——词表出问题不该让画像写入整个失效——但也意味着词表失效时没人会发现，建议在 `load_vocab` 返回空字典时补一条 warning 日志。
+3. **触发词很宽**。`以后`、`每次都`、`我总是` 这类词在很多无关输入里都会出现，命中后只是让 Agent 多看一眼 Skill 清单，代价可以接受。
+4. **词表是给模型看的提示，不是硬校验**。真正拦截发生在工具里（词表外的键转存 `notes`）。模型看不看那份 Markdown、看了听不听，都不影响最终结果。
 
 **Files:**
 - Create: `backend/agents/skills/profile_schema/SKILL.md`
@@ -2424,10 +2611,31 @@ git commit -m "feat: 画像维度词表下沉到 SKILL.md，词表外的键自�
 
 ## Task 11: 向量层改用 retriever 检索
 
-现有的 `VectorStoreManager.query()` 走 `as_query_engine().query()`，那是 RAG 问答，内部会**额外调一次 LLM** 来合成答案。我们只要检索到的原文。
+**这个任务解决什么问题**：现有的 `VectorStoreManager.query()` 走的是 `as_query_engine().query()`，那是 RAG 问答——它会把检索结果再交给一个 LLM 合成答案。我们只要检索到的原文，多这一次调用就是多一份延迟和费用。更麻烦的是，这个 LLM 取自 LlamaIndex 的全局 `Settings`，默认是 OpenAI，而本项目根本没配 OpenAI，真调用起来会直接报错。
+
+**怎么做**：新增 `retrieve()`，用 `as_retriever()` 只做向量检索，不触发任何 LLM 调用；低于阈值的命中直接丢弃；任何异常都降级为空列表。同时**删掉 `query()`**：它没有任何调用方，而且已经不可用了——清理依赖时移除了 `llama-index-llms-openai`，`as_query_engine()` 解析默认 LLM 时会直接报 `ImportError: llama-index-llms-openai package not found`（本机暂时还能跑，只是因为这个包还留在虚拟环境里没卸载）。
+
+**做完之后**：拿到一个按相似度过滤好的原文列表，供 Task 12 注入 prompt。向量层从此是「增强」而不是「依赖」：它挂了，生题照常。
+
+**前后依赖**：用到 Task 3 的 `get_vector_executor()`（chromadb 是同步库，必须投递到线程池）。产出 `retrieve(query_text, user_id, top_k=3, min_score=0.3)`，Task 12 使用。
+
+**实现时注意**：
+
+1. **`min_score=0.3` 实际卡的不是余弦相似度**。`VectorStoreManager` 建 collection 时没有指定距离函数，chromadb 默认用 l2（平方欧氏距离），而 LlamaIndex 把距离换算成 `score = exp(-距离)`。用真实的 chromadb 实测过这组数字：
+
+   | 两个向量的关系 | 返回的 score |
+   |---|---|
+   | 完全相同 | 1.000 |
+   | 余弦 0.5 | 0.368 |
+   | 正交（余弦 0） | 0.135 |
+   | 完全相反 | 0.018 |
+
+   所以 `min_score=0.3` 相当于「平方欧氏距离 ≤ 1.204」，在向量已归一化的前提下，等价于「余弦 ≥ 0.398」。两点提醒：① DashScope 的 embedding 是否归一化，要用一次真实调用确认（算一下向量的模长是不是 1）；没归一化的话，这个阈值的含义会随向量长度漂移。② 想让阈值直接就是余弦，需要在建 collection 时指定 cosine 空间，但这会改变已有数据的检索行为，得重建 collection。
+2. **`PERSIST_DIR` 默认是相对路径 `./vector_memory`**，相对的是进程的工作目录。从 `backend/` 启动和从仓库根目录启动，用的是两个不同的库，表现就是「记忆突然都不见了」。部署时要固定工作目录，或者把 `VECTOR_MEMORY_DIR` 配成绝对路径。
+3. **测试用替身顶替 `_index`**，不连真实的 Chroma。要验证的是「阈值过滤」和「失败降级」这两段自己的逻辑，不是 Chroma 本身。
 
 **Files:**
-- Modify: `backend/agents/memory/vector_store_manager.py`（新增 `retrieve`）
+- Modify: `backend/agents/memory/vector_store_manager.py`（新增 `retrieve`，删除 `query`）
 - Create: `backend/tests/test_vector_retrieve.py`
 
 **Interfaces:**
@@ -2558,23 +2766,50 @@ Expected: FAIL，`AttributeError: 'VectorStoreManager' object has no attribute '
             return []
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [ ] **Step 4: 删除已经失效的 `query()`**
+
+删掉 `backend/agents/memory/vector_store_manager.py` 里的 `query()` 方法（连同它的 `as_query_engine` 调用）。
+
+两个理由：它没有任何调用方；而且清理依赖时移除了 `llama-index-llms-openai`，`as_query_engine()` 要解析一个默认 LLM，在按 `requirements.txt` 装出来的环境（CI、Docker 镜像）里会直接报 `ImportError: llama-index-llms-openai package not found`。留着一段不能用的代码，只会让后来的人误以为可以调。
+
+删完确认没有别的地方在用：
+
+```bash
+cd backend && grep -rn "\.query(" --include=*.py . | grep -i vector
+```
+
+Expected: 没有输出。
+
+- [ ] **Step 5: 运行测试确认通过**
 
 Run: `cd backend && python -m pytest tests/test_vector_retrieve.py -v`
 Expected: 4 passed
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
 git add backend/agents/memory/vector_store_manager.py backend/tests/test_vector_retrieve.py
-git commit -m "feat: 向量层新增 retrieve，只检索不做 RAG 合成"
+git commit -m "feat: 向量层新增 retrieve，只检索不做 RAG 合成；删除失效的 query"
 ```
 
 ---
 
 ## Task 12: 工具级定点注入向量记忆
 
-只在生题和通用问答两个工具执行前检索一次，ReAct 主循环完全不碰向量库。
+**这个任务解决什么问题**：向量库里已经有归档的记忆了，但没有任何地方会去读它。这个任务把它接进生题和通用问答两条链路。
+
+**为什么是「工具级定点注入」而不是「每轮请求统一检索」**：ReAct 主循环每轮都检索的话，路由决策阶段也会被无关的历史记忆干扰（模型看到「用户不喜欢雷同题目」，可能误判成用户现在要生题），而且每轮都要付一次向量化和检索的成本。定点注入只在真要生成内容时付一次。
+
+**做完之后**：用户之前说过「题目不要和原题太像」，下次生题时这条偏好会被检索出来，拼进生题的 system prompt。
+
+**前后依赖**：用到 Task 11 的 `retrieve`。产出 `recall_context(query, user_id)`，以及两个工具新增的 `user_id` 参数；`tool_exec_node` 负责从 `GraphState` 注入这个参数。
+
+**实现时注意**：
+
+1. **效果要等短期记忆溢出之后才看得到**。向量库里的内容来自归档，而归档只在短期记忆超过 10 条时才发生。新会话里说完偏好、马上生题，是检索不到的——这不是 bug。人工验证时要先把窗口填满。
+2. **`recall.py` 在模块顶部导入 `VectorStoreManager`**，于是「导入工具」就会连带导入 chromadb 和 LlamaIndex。RAG 计划里正是因为这条链路，才给几个测试加了 `importorskip`。想解耦的话，可以像 `memory_manager` 那样改成延迟导入。
+3. **`recall_context` 里 `_store()` 的构造没有保护**。`retrieve` 内部已经捕获了异常，但 `VectorStoreManager()` 这一步本身抛异常时（比如 chromadb 坏了），异常会一路抛到工具的 `try` 里，让整次生题变成「生成变式题失败」——这与「向量层只降级、不失败」的原则冲突。稳妥的做法是把 `recall_context` 的函数体整个包进 `try`。
+4. **`tool_exec_node` 里注入 `user_id` 的工具名集合是硬编码的**。以后新增需要 `user_id` 的工具，很容易漏掉，表现是工具收到 `user_id=None`。
 
 **Files:**
 - Modify: `backend/agents/tools/question_set_tool.py`
@@ -2802,9 +3037,21 @@ git commit -m "feat: 生题与问答工具执行前定点注入向量记忆"
 
 ## Task 13: 长期画像注入 ReAct system prompt
 
-画像现在每轮都查了却被丢弃。把它注入 **system prompt** 而不是 `user_input`——画像是「这个学生是谁」的稳定背景，混进 `user_input` 会让模型把它当成当前诉求的一部分。
+**这个任务解决什么问题**：长期画像每轮都查了，却被丢掉。`get_memory_for_planner` 返回 `short_memory` 和 `long_memory` 两部分，而 API 只用了前者——查库的钱花了，画像却从没影响过模型。
 
-由 `agent_api` 在构建 `GraphState` 时填好文本，`react_think_node` 不做任何 IO。
+**为什么注入 system prompt 而不是拼进 `user_input`**：画像是「这个学生是谁」的稳定背景信息。混进 `user_input`，模型会把它当成本次诉求的一部分，比如看到「薄弱知识点：函数」就以为用户现在要讲函数。放进 system prompt，并明确写上「这不是本次的提问内容，不要直接复述」，才是正确的位置。
+
+**为什么在 API 层格式化**：`react_think_node` 每轮都会执行，节点里不能做 IO。API 层在构建 `GraphState` 时查一次、格式化成一段文本放进 `profile_text`，之后每轮直接取用。
+
+**做完之后**：模型在决定调哪个工具、怎么回答时，能看到学生的年级、学科、薄弱点和长期偏好。
+
+**前后依赖**：用到 `get_memory_for_planner` 返回的 `long_memory`（Task 8 之后它还会带上 `notes`）。产出 `GraphState.profile_text`、`format_profile`，以及 `build_react_system_prompt` 的新参数。
+
+**实现时注意**：
+
+1. **`notes` 不进 prompt**，有一条测试专门守着这一点。`notes` 是自由文本、最多能涨到 50 条，全塞进去会把每轮的输入撑大，也会稀释真正重要的信息。它只在 `user_profile_query_tool` 被主动调用时才返回。
+2. **`GraphState` 是 TypedDict，新增的键不会自动出现在已有的构造处**。`agent_api` 里有两个地方构建 state（`analyse` 和 `_stream_generator`），两处都要改，漏掉一个的表现是画像在流式接口上不生效。所以节点里读的是 `state.get('profile_text', '')`，少一个键也不会崩。
+3. **画像会进入每一轮的 prompt**，轮数越多、成本越高。`format_profile` 里 `weak_points` 只列键名不列值，就是为了控制这段文本的长度。
 
 **Files:**
 - Modify: `backend/agents/agent/tools.py`（`GraphState` 新增 `profile_text`）
@@ -3004,7 +3251,22 @@ git commit -m "feat: 长期画像注入 ReAct system prompt，不再查了就丢
 
 ## Task 14: 更新 CLAUDE.md
 
-`CLAUDE.md` 描述的仍是改造前、甚至是更早期的结构（写的是 `agents/skills/` 放 BaseTool、`SKILL_MAP`、节点名 `skill_exec_node`），与实际代码严重脱节。
+**这个任务解决什么问题**：`CLAUDE.md` 描述的还是改造前、甚至更早期的结构，和实际代码严重脱节。它是新人和 AI 读这个项目时的第一份地图，过时的地图比没有地图更糟糕——照着它写代码，会一路找不到文件。
+
+**现在错在哪**（至少这些）：
+
+- 工具注册表说在 `agents/skills/` 的 `SKILL_MAP`，实际在 `backend/agents/tools/__init__.py`，是 `TOOLS` / `TOOL_MAP`
+- 图节点名写的是 `react_think_node` / `skill_exec_node`，实际是 `react_think` / `execute_tool`
+- 没有区分 `agents/skills/`（Markdown 剧本层）和 `agents/tools/`（可执行工具），这是两个概念
+- 工具清单缺了 `user_profile_save_tool`、`user_profile_query_tool`、`user_profile_delete_tool`、`load_skill_tool`
+- 启动方式写的 `python main.py` 在 `backend/` 下跑不通（代码用的是 `backend.*` 绝对导入）
+- 「仓库中不包含前端」已经不成立，仓库里有一个 Vue 3 + Vite 的前端
+
+**还要补什么**：本次改造引入的约定——短期记忆是 Redis LIST、写入与淘汰由 Lua 原子完成（不要再做读-改-写）、归档在后台任务里进行、偏好走候选池、画像键名定义在 SKILL.md 里、向量层只在两个工具里定点检索、阻塞操作一律投递到专属线程池。
+
+**前后依赖**：放在最后做，这样所有约定都已经定型。
+
+**实现时注意**：另外两份计划也会改 `CLAUDE.md`——RAG 计划的 Task 23 增加 RAG 一节，部署计划的 Task 9 增加 CI/CD 与部署一节。三者各加各的章节，不要互相覆盖；谁后做，谁负责检查前面的内容还在不在。
 
 **Files:**
 - Modify: `CLAUDE.md`
@@ -3046,17 +3308,24 @@ git commit -m "docs: 更新 CLAUDE.md 至改造后的实际架构"
 
 ## Task 15: 归档精炼提速：截断输入、单次限时、耗时日志
 
-**前提：以当前代码为准。** 上面 Task 6 的代码块里，`_archive` 把多条记录一起精炼再按 `zip` 顺序配对。模型输出条数和输入对不上时，会 ack 错条目，这个写法已经废弃。实际实现改成了逐条归档，由 `_archive_one` 负责单条，本任务在它的基础上修改。
+**这个任务解决什么问题**：归档时每条记录都要调用一次 LLM，而**这个调用没有任何超时**。我在当前环境里查过：`ChatOpenAI` 的 `request_timeout` 是 None，底层 httpx 的超时是 `Timeout(timeout=None)`，服务端一旦不响应，请求就会一直挂着；`max_retries=2` 只在出错时重试，卡住不算出错。这类任务到关停时一定会超时，被取消后下次启动重做一遍。
 
-**要解决的问题**：归档每条记录都要调用一次 LLM，而 LLM 客户端**没有设置超时**。`ChatOpenAI` 的 `request_timeout` 是 None，底层 httpx 是 `Timeout(timeout=None)`，服务端一旦不响应，请求就会一直挂着；`max_retries=2` 只在出错时重试，卡住不算出错。这类任务到关停时一定会超时，被取消后下次启动再重做一遍。另一方面，交给精炼的 `model_memory` 是 Agent 的完整回答，生成变式题时可能是整套题加解析，拖慢调用、浪费费用，而精炼并不需要这么多内容。
+另一头是输入太长：交给精炼的 `model_memory` 是 Agent 的完整回答，生成变式题时可能是整套题加解析，既拖慢调用又浪费费用，而精炼并不需要这么多内容。
 
-**做法**：
+**怎么做**，三件小事：
 
 1. 截断精炼的输入：`user_memory` 最多 1000 字，`model_memory` 最多 500 字
-2. 单次精炼限时：20 秒起，每千字加 10 秒，最多 60 秒。截断之后，输入最长约 1500 字，限时约 35 秒。超时的条目留在 pending，等下次重试
+2. 单次精炼限时：20 秒起，每千字加 10 秒，最多 60 秒。截断之后输入最长约 1500 字，限时约 35 秒。超时的条目留在 pending，等下次重试
 3. 每次精炼都记下输入字数和耗时，用数据确认慢在哪里，再决定要不要做更大的改动
 
+**做完之后**：归档不会再被一个卡死的请求拖住；关停时被取消的任务，下次启动能在可预期的时间内补做完。
+
+**前提：以当前代码为准**。上面 Task 6 的代码块里，`_archive` 把多条记录一起精炼再按 `zip` 顺序配对。模型输出条数和输入对不上时，会 ack 错条目，这个写法已经废弃。实际实现改成了逐条归档，由 `_archive_one` 负责单条，本任务在它的基础上修改。
+
+**前后依赖**：只依赖 Task 6，可以在 Task 6 之后的任何时候做。
+
 **不做的事：不给「超时过的任务」在关停时多留时间。** 理由有四个：
+
 - 耗时主要花在生成输出和服务端排队上，输入长度只影响读取输入那一步，而这一步很快。
 - 卡住的请求，给再多时间也不会返回。
 - 关停时间的上限由部署环境决定（`docker stop` 默认 10 秒，k8s 默认 30 秒），超过就被 SIGKILL。
