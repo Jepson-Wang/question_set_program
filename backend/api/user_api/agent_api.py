@@ -7,7 +7,7 @@ from typing import Optional
 from backend.agents.memory.long_term_memory import LongTermMemory
 from backend.agents.memory.memory_manager import MemoryManager
 from backend.agents.memory.short_term_memory import ShortTermMemory, MemoryUnit
-from backend.agents.memory.vector_store_manager import VectorStoreManager
+from backend.dao.memory_mapper import MemoryMapper
 from backend.dao.user_profile_mapper import UserProfileMapper
 from backend.model import AsyncSessionLocal
 
@@ -31,23 +31,32 @@ agent_router = APIRouter(prefix="/agent", tags=["agent"])
 user_profile_mapper = UserProfileMapper(AsyncSessionLocal)
 short_term_memory = ShortTermMemory(max_memory_size=10)
 long_term_memory = LongTermMemory(user_profile_mapper, short_term_memory)
-VectorStoreManager = VectorStoreManager()
-memory_manager = MemoryManager(long_term_memory, short_term_memory, VectorStoreManager)
+memory_mapper = MemoryMapper(AsyncSessionLocal)
+memory_manager = MemoryManager(long_term_memory, short_term_memory, memory_mapper)
 
 
-def _format_memory_context(short_memories: list) -> str:
-    """将最近3轮原始短期记忆格式化为对话上下文字符串，直接拼接不经过LLM"""
-    if not short_memories:
-        return ""
+def _format_memory_context(short_memories: list, session_digest: str = "") -> str:
+    """
+    拼出注入 user_input 的上下文：先放本次会话的要点，再放最近 3 轮原文。
+    要点是早期对话压缩来的，原文是刚刚发生的，两者都不经过 LLM，直接拼接。
+    """
+    lines: list[str] = []
+    if session_digest:
+        lines.append("【本次会话要点】")
+        lines.append(session_digest)
+
     recent = short_memories[:3]
-    lines = ["【近期对话记录】"]
-    for mem in reversed(recent):  # 从旧到新展示，保持时序
-        user_mem = mem.get('memory', {}).get('user_memory', '')
-        model_mem = mem.get('memory', {}).get('model_memory', '')
-        if user_mem:
-            lines.append(f"用户：{user_mem}")
-        if model_mem:
-            lines.append(f"助手：{model_mem}")
+    if recent:
+        if lines:
+            lines.append("")
+        lines.append("【近期对话记录】")
+        for mem in reversed(recent):  # 从旧到新展示，保持时序
+            user_mem = mem.get('memory', {}).get('user_memory', '')
+            model_mem = mem.get('memory', {}).get('model_memory', '')
+            if user_mem:
+                lines.append(f"用户：{user_mem}")
+            if model_mem:
+                lines.append(f"助手：{model_mem}")
     return "\n".join(lines)
 
 
@@ -63,7 +72,7 @@ async def analyse(request: TextRequest, token: str = None, user: User = Depends(
         # 获取近3轮短期记忆，格式化后拼接到 user_input 头部
         memory_data = await memory_manager.get_memory_for_planner(user_id, session_id)
         short_memories = memory_data.get('short_memory', [])
-        memory_context = _format_memory_context(short_memories)
+        memory_context = _format_memory_context(short_memories, memory_data.get('session_digest', ''))
 
         if memory_context:
             user_input = f"{memory_context}\n\n【当前问题】\n{text}"
@@ -111,7 +120,7 @@ async def _stream_generator(text: str, user_id: int, session_id: int):
     """
     memory_data = await memory_manager.get_memory_for_planner(user_id, session_id)
     short_memories = memory_data.get('short_memory', [])
-    memory_context = _format_memory_context(short_memories)
+    memory_context = _format_memory_context(short_memories, memory_data.get('session_digest', ''))
 
     if memory_context:
         user_input = f"{memory_context}\n\n【当前问题】\n{text}"
