@@ -1,0 +1,6 @@
+target-version = 'py314'
+
+[lint]
+# F = 未使用的导入和变量，未定义的名字等
+# E9 = 语法错误
+select = ["F","E9"]

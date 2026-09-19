@@ -1,5 +1,4 @@
 import pytest
-from sympy import Lambda
 
 from backend.agents.tools import TOOLS, TOOL_MAP
 

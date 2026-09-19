@@ -7,7 +7,6 @@ from typing import Optional
 
 from backend.schemas.request.user_profile_update_request import UserProfileUpdateRequest
 from backend.schemas.response.user_profile_response import UserProfileResponse
-from fastapi import Depends
 
 class UserProfileMapper:
     def __init__(self, session_factory: AsyncSessionLocal):
