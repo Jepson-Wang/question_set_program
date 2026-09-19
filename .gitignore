@@ -14,8 +14,6 @@ vector_memory/
 backend/vector_memory/
 backend/chroma_db/
 
-# Vite 的依赖缓存，构建时自动重建
-frontend/.vite/
 
 # 覆盖率与测试报告产物（跑一次测试生成一次）
 .coverage

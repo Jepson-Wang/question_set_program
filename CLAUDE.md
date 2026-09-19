@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **学生学情分析系统** — An AI-powered tutoring backend. Users submit questions or requests; a ReAct agent routes to the appropriate skill (knowledge extraction, variant question generation, general Q&A, or memory retrieval), while a three-tier memory system maintains conversational continuity.
 
-Backend code lives under `backend/`. A Vue 3 + Vite frontend lives under `frontend/`; it is not covered by these notes.
+Backend code lives under `backend/`. A React 19 + Vite + TypeScript frontend lives under `frontend/`; it is a fresh scaffold (Ant Design, React Router, Zustand, axios) and is not covered by these notes. It replaced a Vue 3 client that was deleted in `3bd21d6` — check git history if you need to see what that did.
 
 ## Running the Server
 

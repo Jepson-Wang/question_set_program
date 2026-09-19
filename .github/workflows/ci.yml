@@ -138,4 +138,5 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - run: npm ci
+      # build 脚本是 tsc -b && vite build，类型错误会让这一步失败
       - run: npm run build
