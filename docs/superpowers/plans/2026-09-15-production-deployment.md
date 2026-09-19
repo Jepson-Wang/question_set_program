@@ -620,7 +620,12 @@ volumes:
 
 **⑨ `profiles`（P8）**。`certbot` 只在申请和续期证书时才需要。放进 `tools` 这个 profile 之后，`docker compose up` 不会启动它；需要时用 `docker compose run --rm certbot ...` 临时运行，运行完容器自动删除。
 
-**⑩ 以后接入 RAG 时，记得补数据卷**。现在挂了两个卷：记忆的向量库（`/app/vector_memory`）和日志。RAG 知识库的目录是相对 `backend/` 解析的，也就是容器里的 `/app/backend/rag_db`、`/app/backend/rag_uploads`、`/app/backend/rag_eval`，这三个路径都在镜像内部，**不挂卷的话，每次部署重建容器，入库的题库和向量都会被清空**。RAG 上线时要在 `volumes` 里加上这三项（或者把 `RAG_DB_DIR` 等配置指到已经挂载的目录下）。
+**⑩ 以后接入 RAG 时，记得补数据卷**。现在挂了两个卷：`/app/vector_memory` 和日志。
+
+> **`vector_memory` 这个卷现在是空的**：记忆计划改版后对话记忆存进了 MySQL，向量库只剩 RAG 要用（见记忆计划开头的设计变更）。
+> 卷先留着——它是镜像里唯一已经 `chown` 给 uid 10001 的可写数据目录，RAG 上线时把 `RAG_DB_DIR` 指到它下面就能直接用，
+> 不必再改 Dockerfile 的权限。也就是说，这条注意事项没有作废，只是「现在卷里没数据」。
+RAG 知识库的目录是相对 `backend/` 解析的，也就是容器里的 `/app/backend/rag_db`、`/app/backend/rag_uploads`、`/app/backend/rag_eval`，这三个路径都在镜像内部，**不挂卷的话，每次部署重建容器，入库的题库和向量都会被清空**。RAG 上线时要在 `volumes` 里加上这三项（或者把 `RAG_DB_DIR` 等配置指到已经挂载的目录下）。
 
 - [ ] **Step 2: Nginx 配置**
 

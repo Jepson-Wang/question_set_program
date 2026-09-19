@@ -2,7 +2,7 @@
 集中管理进程级线程池，提供获取与关停入口
 """
 import threading
-from concurrent.futures.thread import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 
 from backend.middleware.logging import get_logger
 
@@ -22,11 +22,11 @@ def get_vector_executor() -> ThreadPoolExecutor:
                     max_workers=VECTOR_POOL_SIZE,
                     thread_name_prefix="vec",
                 )
-                logger.info("向量库线程池一创建，max_workers=%s",VECTOR_POOL_SIZE)
+                logger.info("向量库线程池已创建，max_workers=%s",VECTOR_POOL_SIZE)
     return _vector_executor
 
 def shutdown_executors(wait: bool = True) -> None:
-    global  _vector_executor
+    global _vector_executor
     with _lock:
         if _vector_executor is not None:
             _vector_executor.shutdown(wait=wait)

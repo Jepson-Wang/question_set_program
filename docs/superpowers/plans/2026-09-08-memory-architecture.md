@@ -2,24 +2,31 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把短期记忆从「JSON 字符串 RMW」换成「Redis LIST + Lua 原子淘汰 + 后台归档」，消除并发丢消息与摘要卡顿；同时打通长期画像与向量层的读取链路，并清掉事件循环里的阻塞点。
+**Goal:** 把短期记忆从「JSON 字符串 RMW」换成「Redis LIST + Lua 原子淘汰 + 后台归档」，消除并发丢消息与摘要卡顿；把溢出的对话原文沉淀到 MySQL 并维护一份会话要点，注入后续请求；同时打通长期画像的读取链路，并清掉事件循环里的阻塞点。
 
-**Architecture:** 短期窗口用 Redis LIST 存储，「入队 + 超限淘汰」在一次 Lua EVAL 里原子完成，被淘汰的条目通过 `RPOPLPUSH` 原子搬进 pending 队列后由后台 `asyncio.Task` 做 LLM 精炼并写入 Chroma——因为被归档的条目已经物理移出窗口，读路径看不到它，所以不需要任何锁。画像走「事实类直写、偏好类候选池二次命中才晋升」，向量层只在生题/问答工具执行前定点检索注入。
+**Architecture:** 短期窗口用 Redis LIST 存储，「入队 + 超限淘汰」在一次 Lua EVAL 里原子完成，被淘汰的条目通过 `RPOPLPUSH` 原子搬进 pending 队列，再由后台 `asyncio.Task` 写进 MySQL——因为被归档的条目已经物理移出窗口，读路径看不到它，所以不需要任何锁。记忆分三层：Redis 存最近几轮原文，MySQL 的 `memory_record` 存全部原文（只增不改）、`memory_digest` 存会话要点（永远从原文重算，不在摘要上继续摘要），`user_profile` 存跨会话的稳定画像，走「事实类直写、偏好类候选池二次命中才晋升」。请求上下文 = 会话要点 + 最近 3 轮原文 + 画像。
 
-**Tech Stack:** Python 3.14.3 / FastAPI 0.135.1 / LangGraph 1.0.10 / langchain-core 1.2.17 / redis 7.3.0 / SQLAlchemy 2.0.48 / llama-index-core 0.14.18 / chromadb 1.5.5 / pytest 9.0.2
+**Tech Stack:** Python 3.14.3 / FastAPI 0.135.1 / LangGraph 1.0.10 / langchain-core 1.2.17 / redis 7.3.0 / SQLAlchemy 2.0.48（MySQL 用 asyncmy，测试用 aiosqlite）/ pytest 9.0.2
+
+> **设计变更（2026-09-16）**：记忆层不再使用向量库。原计划把归档的记忆经 LLM 精炼后写入 Chroma，再按语义召回；现在改为「原文进 MySQL，只增不改；会话要点由原文重算」。
+> 原因：稳定信息本来就该沉淀到结构化的 `user_profile`，向量层剩下的只是情景细节，而单会话的数据量很小，按相关性挑 3 条和「整段要点一起给」差别不大；代价却是多一个存储、每条要 embedding、这份数据还不在 `mysqldump` 的备份范围里。
+> 受影响的任务：Task 11、12、15 重写，新增 Task 16；Task 6 的归档目标在 Task 12 改为 MySQL。RAG 知识库仍然要用向量库，那是另一回事（见 RAG 计划）。
 
 **Spec:** `docs/superpowers/specs/2026-09-08-memory-architecture-design.md`
 
 ## Global Constraints
 
 - 部署形态为**单机单进程**，互斥一律用进程内机制，禁止引入 Redis 分布式锁。
-- 所有 I/O（DB、Redis、LLM、向量库）保持 async；新增代码不得在事件循环里做同步阻塞调用。
+- 所有 I/O（DB、Redis、LLM）保持 async；新增代码不得在事件循环里做同步阻塞调用。
 - Lua 脚本内使用 `RPOPLPUSH` 而非 `LMOVE`，以兼容 Redis 6.2 以下版本。
 - 短期窗口 key：`stm:{user_id}:{session_id}`；待归档队列 key：`stm:pending:{user_id}:{session_id}`。
 - 窗口 TTL `86400` 秒；pending 队列 TTL `604800` 秒；画像候选池 TTL `604800` 秒。
 - `max_memory_size` 默认 `10`；画像候选池晋升阈值 `promote_threshold` 默认 `2`。
-- 向量检索相似度阈值 `min_score` 默认 `0.3`，`top_k` 默认 `3`。
-- 向量库专属线程池 `max_workers=4`，`thread_name_prefix="vec"`。
+- 对话原文表 `memory_record` 只增不改；用原始条目的 sha1 做唯一键，归档重试不会写出第二行。
+- 会话要点表 `memory_digest` 一个会话一行；每攒够 `DIGEST_EVERY = 5` 条新记录重算一次，单次最多回看 `DIGEST_SOURCE_LIMIT = 40` 条原文。
+- 摘要**永远从原文重算**，绝不在上一版摘要的基础上再摘要。
+- 注入请求的上下文固定为：会话要点 + 最近 3 轮原文（+ 画像，见 Task 13）。
+- 线程池 `backend/core/executors.py` 仍然保留（`max_workers=4`，`thread_name_prefix="vec"`），记忆层已经用不到它，留给 RAG 知识库。
 - 不写数据迁移脚本：短期记忆换 key 前缀，旧数据靠 24h TTL 自然过期。
 - 提交信息用中文，遵循 `feat:` / `fix:` / `refactor:` / `test:` 前缀。
 
@@ -33,7 +40,9 @@
 
 Task 0 是测试基建，必须最先做。
 
-Task 15 是后加的优化（归档精炼的截断、限时与耗时日志），只依赖 Task 6，可以在 Task 6 之后任何时候做。
+Task 11、12 把归档目标从向量库换成 MySQL（见开头的设计变更），必须在 Task 6、7 之后做。
+
+Task 15（摘要的输入截断与限时）和 Task 16（会话要点注入上下文）都只依赖 Task 12，可以在它之后任何时候做。
 
 ## 文件结构
 
@@ -50,23 +59,27 @@ Task 15 是后加的优化（归档精炼的截断、限时与耗时日志），
 | `backend/tests/test_short_term_memory.py` | 短期记忆 LIST 化与原子淘汰的测试 |
 | `backend/tests/test_memory_manager.py` | 后台归档、ack、启动恢复、关停的测试 |
 | `backend/tests/test_profile_candidates.py` | 候选池与画像写入判定的测试 |
-| `backend/tests/test_vector_retrieve.py` | 向量检索阈值过滤与降级的测试 |
+| `backend/model/memory.py` | 对话原文表与会话要点表 |
+| `backend/dao/memory_mapper.py` | 记忆表的数据访问层 |
+| `backend/tests/test_memory_mapper.py` | 记忆表读写与去重的测试（跑在 SQLite 上） |
+| `backend/agents/agent/session_digest_agent.py` | 会话要点生成 |
+| `backend/agents/skills/session_digest/SKILL.md` | 会话要点的提示词 |
+| `backend/tests/test_session_digest_agent.py` | 要点生成、输入截断与限时的测试 |
+| `backend/tests/test_memory_context.py` | 注入上下文的拼装测试 |
 | `backend/tests/test_react_agent_async.py` | ReAct 节点异步化与画像注入的测试 |
 | `backend/tests/test_tools_sync_disabled.py` | 同步 `_run` 路径已禁用的测试 |
 | `backend/tests/test_config_env.py` | 环境变量加载与工作目录无关性的测试 |
 | `backend/tests/test_profile_merge.py` | JSON 字段合并与 notes 追加的测试 |
 | `backend/tests/test_profile_schema_skill.py` | 词表加载与词表外键分流的测试 |
-| `backend/tests/test_recall_injection.py` | 向量召回格式化与工具注入的测试 |
-| `backend/tests/test_extract_memory_agent.py` | 精炼输入截断、限时与耗时日志的测试 |
 
 **修改**
 
 | 文件 | 改动 |
 |---|---|
 | `backend/agents/memory/short_term_memory.py` | 全面重写为 Redis LIST + Lua 脚本 |
-| `backend/agents/memory/memory_manager.py` | 归档转后台任务，新增 ack / 启动恢复 / 关停；精炼超时不打错误堆栈（Task 15） |
-| `backend/agents/agent/extract_memory_agent.py` | 精炼输入截断、按长度限时、记录耗时（Task 15） |
-| `backend/agents/memory/vector_store_manager.py` | 新增 `retrieve()`，改用专属线程池 |
+| `backend/agents/memory/memory_manager.py` | 归档转后台任务，新增 ack / 启动恢复 / 关停 |
+| `backend/agents/memory/memory_manager.py`（Task 12 再改一次） | 归档目标由向量库改为 MySQL，并维护会话要点 |
+| `backend/api/user_api/agent_api.py` | 记忆层接线改为 `MemoryMapper`；上下文加入会话要点 |
 | `backend/agents/agent/react_agent.py` | 节点改 async；system prompt 增加画像段 |
 | `backend/agents/agent/get_llm.py` | 改调 `load_env()`（原本完全不加载 .env） |
 | `backend/utils/redis_client.py` | 改调 `load_env()`（原本完全不加载 .env） |
@@ -74,10 +87,10 @@ Task 15 是后加的优化（归档精炼的截断、限时与耗时日志），
 | `backend/agents/agent/tools.py` | `GraphState` 新增 `profile_text` 字段 |
 | `backend/agents/agent/common_agent.py` | 删除同步 `common_tool` |
 | `backend/agents/agent/extract_agent.py` | 删除同步 `extract_tool` |
-| `backend/agents/agent/question_set_agent.py` | 删除同步 `question_set_tool`；新增向量注入 |
-| `backend/agents/tools/common_tool.py` | `_run` 禁用；`_arun` 前置向量检索 |
+| `backend/agents/agent/question_set_agent.py` | 删除同步 `question_set_tool` |
+| `backend/agents/tools/common_tool.py` | `_run` 禁用 |
 | `backend/agents/tools/extract_knowledge_tool.py` | `_run` 禁用 |
-| `backend/agents/tools/question_set_tool.py` | `_run` 禁用；`_arun` 前置向量检索 |
+| `backend/agents/tools/question_set_tool.py` | `_run` 禁用 |
 | `backend/agents/tools/user_profile_save_tool.py` | 接入候选池；按词表分流，词表外的键转存 `notes` |
 | `backend/agents/tools/user_profile_query_tool.py` | 返回结果补上 `notes` |
 | `backend/agents/skills/skill_runner.py` | 新增 `load_vocab`，读取 SKILL.md 里的词表 |
@@ -134,11 +147,15 @@ pip show pytest-asyncio | grep -i version
 
 ```ini
 [pytest]
+# 如果不加asyncio的话，需要在每个def开头显式写入@pytest.mark.asyncio装饰器，否则会静默跳过，不执行
 asyncio_mode = auto
+# 限定test的收集范围，不写的话就会全局扫描，将venv中的引用库的测试文件也给测试了，测试更耗时，但无用
 testpaths = tests
-python_files = test_*.py
+# 只屏蔽改不了的第三方警告；自己代码发出的警告要去改代码，不要在这里屏蔽。
+# 按消息内容匹配，而不是按模块：这条警告由 pydantic 发出，但通过 stacklevel
+# 归属到了 import 它的 langchain_core，按 pydantic 模块名是匹配不到的。
 filterwarnings =
-    ignore::UserWarning:pydantic.*
+    ignore:Core Pydantic V1 functionality isn't compatible:UserWarning
 ```
 
 `asyncio_mode = auto` 让 `async def test_*` 不用逐个加 `@pytest.mark.asyncio` 装饰器。
@@ -154,27 +171,43 @@ import os
 
 import pytest
 import pytest_asyncio
-import redis.asyncio as aioredis
+import redis.asyncio as redis
+
+from backend.core.config import load_env
+
+# conftest 不 import 任何项目模块，没人替它加载 .env，必须自己来。
+# 否则 REDIS_HOST 等一律读不到，全部回落 localhost，测试会以
+# 「Redis 没开」的面目集体 skip。
+load_env()
 
 TEST_DB = 15
 
 
 def _test_redis_url() -> str:
+    """拼测试库（db 15）的连接串，与生产库隔离。"""
     host = os.getenv("REDIS_HOST", "localhost")
     port = os.getenv("REDIS_PORT", "6379")
     password = os.getenv("REDIS_PASSWORD")
     username = os.getenv("REDIS_USERNAME")
+
+    # 用户名与密码之间是冒号；只有密码时要留一个空用户名位，
+    # 写成 redis://password@host 会被解析成「用户名=password，密码=None」
     if password and username:
         return f"redis://{username}:{password}@{host}:{port}/{TEST_DB}"
     if password:
         return f"redis://:{password}@{host}:{port}/{TEST_DB}"
+    if username:
+        return f"redis://{username}@{host}:{port}/{TEST_DB}"
     return f"redis://{host}:{port}/{TEST_DB}"
 
 
 @pytest_asyncio.fixture
 async def redis_test_client():
-    """指向 db 15 的独立客户端；每个测试前后各清一次库。"""
-    client = aioredis.from_url(
+    """
+    指向 db 15 的独立客户端；每个测试前后各清一次库，保证测试互不污染。
+    Redis 连不上时 skip 而不是报错——测试基建不该因为环境缺失而变成红色噪音。
+    """
+    client = redis.from_url(
         _test_redis_url(), encoding="utf-8", decode_responses=True
     )
     try:
@@ -196,10 +229,9 @@ async def redis_test_client():
 创建 `backend/tests/test_smoke.py`：
 
 ```python
-async def test_redis_fixture_is_isolated(redis_test_client):
-    await redis_test_client.set("k", "v")
+async def test_fixture_is_isolated(redis_test_client):
+    await redis_test_client.set("k","v")
     assert await redis_test_client.get("k") == "v"
-
 
 async def test_asyncio_auto_mode_works():
     import asyncio
@@ -272,38 +304,34 @@ import os
 
 
 def test_env_path_is_absolute_and_points_at_backend():
-    from backend.core.config import BACKEND_ROOT, ENV_PATH
+    """保证env_path是绝对路径，并且指向backend"""
+    from backend.core.config import BACKEND_ROOT,ENV_PATH
 
     assert ENV_PATH.is_absolute()
     assert ENV_PATH.name == ".env"
     assert ENV_PATH.parent == BACKEND_ROOT
     assert BACKEND_ROOT.name == "backend"
 
-
-def test_load_env_works_from_any_cwd(tmp_path, monkeypatch):
-    """核心保证：进程工作目录跟 backend/ 无关时，依然读得到 .env。"""
+def test_load_env_works_from_any_cwd(tmp_path,monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("API_KEY",raising=False)
 
     import backend.core.config as cfg
-    cfg._loaded = False          # 重置幂等标记，模拟首次加载
+    cfg._loaded = False
     cfg.load_env()
 
     assert os.getenv("API_KEY"), "换个工作目录就读不到 .env，说明用的是相对路径"
 
-
 def test_load_env_is_idempotent():
     import backend.core.config as cfg
-
     cfg._loaded = False
     cfg.load_env()
-    cfg.load_env()               # 第二次应当直接返回，不重复读盘
+    cfg.load_env()
     assert cfg._loaded is True
 
-
 def test_real_env_overrides_dotenv(monkeypatch):
-    """容器里注入的环境变量优先级必须高于 .env 文件。"""
-    monkeypatch.setenv("API_KEY", "sentinel-from-real-env")
+    """容器中注入的环境变量优先级必定高于.env文件"""
+    monkeypatch.setenv("API_KEY","sentinel-from-real-env")
 
     import backend.core.config as cfg
     cfg._loaded = False
@@ -311,12 +339,11 @@ def test_real_env_overrides_dotenv(monkeypatch):
 
     assert os.getenv("API_KEY") == "sentinel-from-real-env"
 
-
-def test_get_llm_reads_config_without_prior_load(tmp_path, monkeypatch):
-    """回归：get_llm 原本完全不加载 .env，靠导入顺序侥幸拿到值。"""
+def test_get_llm_reads_config_without_prior_load(tmp_path,monkeypatch):
+    """get_llm 原本完全不加载.env，靠导入拿到值"""
     monkeypatch.chdir(tmp_path)
     for key in ("API_KEY", "API_URL", "MODEL_NAME", "EMBEDDING_MODEL"):
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(key,raising=False)
 
     import backend.core.config as cfg
     cfg._loaded = False
@@ -326,16 +353,15 @@ def test_get_llm_reads_config_without_prior_load(tmp_path, monkeypatch):
     assert m.api_key, "get_llm 必须自己调 load_env，不能依赖导入顺序"
     assert m.base_url
 
-
-def test_redis_url_carries_credentials_without_prior_load(tmp_path, monkeypatch):
+def test_redis_url_carries_credentials_without_prior_load(tmp_path,monkeypatch):
     """
-    回归：redis_client 原本完全不加载 .env，密码读成 None，
-    表现为 AuthenticationError——一个和根因毫无关系的错误。
+    redis_clent原本完全不加载.env，密码读成None
+    表现为AuthenticationError -> 一个和根因毫无关系的错误
     """
     monkeypatch.chdir(tmp_path)
     for key in ("REDIS_URL", "REDIS_HOST", "REDIS_PORT",
                 "REDIS_PASSWORD", "REDIS_USERNAME"):
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.delenv(key,raising=False)
 
     import backend.core.config as cfg
     cfg._loaded = False
@@ -357,37 +383,21 @@ Expected: FAIL，`ModuleNotFoundError: No module named 'backend.core.config'`
 创建 `backend/core/config.py`：
 
 ```python
-"""
-环境变量的单一加载入口。
-
-为什么需要它：
-项目里原本有 11 处 load_dotenv，三种写法——不传参（从 cwd 逐级上找）、
-传 '.env'（相对 cwd）、以及压根不加载（get_llm.py、utils/redis_client.py）。
-前两种依赖「进程的工作目录恰好是 backend/」，第三种依赖「别的模块碰巧先导入」。
-任何一条不成立，os.getenv 就静默返回 None，然后以一个和根因毫无关系的面目
-炸掉——比如 Redis 密码读成 None，报出来的是 AuthenticationError。
-
-这里用绝对路径加载一次，所有读 env 的模块统一调 load_env()。
-"""
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# backend/core/config.py -> backend/
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = BACKEND_ROOT / ".env"
 
 _loaded = False
 
-
 def load_env() -> None:
     """
-    幂等地加载 backend/.env。
-
-    - 用绝对路径，不依赖当前工作目录
-    - 不覆盖已存在的真实环境变量（load_dotenv 的默认行为），
-      因此容器/CI 注入的配置优先级高于 .env 文件
+    幂等加载
+    用绝对路径，不依赖当前工作目录，不覆盖已存在的真实环境变量
     """
+
     global _loaded
     if _loaded:
         return
@@ -527,45 +537,41 @@ def _state(user_input="解方程 2x+9=5x-3"):
         "final_result": "",
     }
 
-
 class _FakeLLM:
-    """记录被调用的是同步还是异步入口。"""
+    """记录被调用的是同步还是异步入口"""
 
-    def __init__(self, content: str, recorder: dict):
+    def __init__(self,content:str,recorder:dict):
         self._content = content
         self._recorder = recorder
 
-    def bind_tools(self, tools):
+    def bind_tools(self,tools):
         return self
 
-    def invoke(self, messages):
+    def invoke(self,messages):
         self._recorder["sync"] = True
         return SimpleNamespace(content=self._content)
 
-    async def ainvoke(self, messages):
+    async def ainvoke(self,messages):
         self._recorder["async"] = True
         return SimpleNamespace(content=self._content)
 
-
 def test_react_think_node_is_coroutine_function():
-    assert inspect.iscoroutinefunction(react_agent.react_think_node), (
+    assert inspect.iscoroutinefunction(react_agent.react_think_node),(
         "react_think_node 必须是 async，否则 LangGraph 会把它丢进默认线程池，"
         "和向量库操作抢同一个池"
     )
-
 
 async def test_react_think_node_uses_ainvoke(monkeypatch):
     recorder = {}
     content = '{"thought":"够了","action":"","action_args":{},"final_result":"答案是 x=4"}'
     monkeypatch.setattr(
-        react_agent, "get_llm", lambda *a, **kw: _FakeLLM(content, recorder)
+        react_agent,"get_llm",lambda *a,**kw: _FakeLLM(content,recorder)
     )
 
     out = await react_agent.react_think_node(_state())
-
-    assert recorder == {"async": True}, "不允许走同步 invoke"
-    assert out["final_result"] == "答案是 x=4"
-    assert out["action"] == ""
+    assert recorder == {'async':True},'不允许走同步 invoke'
+    assert out['final_result'] == "答案是 x=4"
+    assert out['action'] == ""
     assert out["round"] == 1
 ```
 
@@ -617,10 +623,18 @@ git commit -m "refactor: react_think_node 改为异步，LLM 调用不再占用�
 
 ## Task 3: 向量库使用专属有界线程池
 
+> **使用者在 Task 12 变了**：本任务把 `vector_store_manager.py` 的三处 `run_in_executor(None, ...)` 改到专属池；
+> Task 12 删掉了向量记忆，这个文件不复存在。**线程池本身照常保留**——RAG 知识库要用同一个池（见 RAG 计划），
+> 「为什么需要专属有界池」的推理也完全不变，所以本任务照做，只是 Step 4 的改造对象换成 RAG 的向量层。
+
+**这个任务解决什么问题**：向量库的调用是同步的，只能靠 `run_in_executor` 丢到线程里跑。问题在于 `run_in_executor(None, ...)` 用的是**默认线程池**——一个全局共享资源，LangGraph 的同步节点、`asyncio.to_thread` 都在用它，大小只有 `min(32, cpu + 4)`。一次 embedding 风暴就能把它占满，饿死其他所有阻塞调用，而且从日志上完全看不出是谁占的。
+
+给向量库一个有界的专属池，把影响限制在向量层内部：池满了排队的只有向量任务，线程名带 `vec` 前缀，`py-spy` 或线程 dump 里一眼就能认出来是谁在阻塞。
+
 **Files:**
 - Create: `backend/core/executors.py`
 - Modify: `backend/agents/memory/vector_store_manager.py`（三处 `run_in_executor(None, ...)`）
-- Create: `backend/tests/test_executors.py`
+- Create: `backend/tests/test_executor.py`
 
 **Interfaces:**
 - Consumes: 无
@@ -630,7 +644,7 @@ git commit -m "refactor: react_think_node 改为异步，LLM 调用不再占用�
 
 - [ ] **Step 1: 写失败的测试**
 
-创建 `backend/tests/test_executors.py`：
+创建 `backend/tests/test_executor.py`：
 
 ```python
 import asyncio
@@ -642,30 +656,27 @@ from backend.core import executors
 def test_vector_executor_is_bounded_and_named():
     ex = executors.get_vector_executor()
     # ThreadPoolExecutor 没有公开的 max_workers 属性，池大小存在 _max_workers 里
-    assert ex._max_workers == 4, "必须有界，避免 embedding 风暴打满线程"
-    assert executors.get_vector_executor() is ex, "必须复用同一个池"
-
+    assert ex._max_workers == 4,"必须有界，避免embedding风暴打满线程"
+    assert executors.get_vector_executor() is ex,"必须复用同一个池"
 
 async def test_vector_executor_threads_are_prefixed():
-    """跑在向量池里的任务，线程名必须能一眼认出来，便于排查阻塞。"""
     loop = asyncio.get_running_loop()
     name = await loop.run_in_executor(
-        executors.get_vector_executor(), lambda: threading.current_thread().name
+        executors.get_vector_executor(),lambda: threading.current_thread().name
     )
-    assert name.startswith("vec"), f"线程名应以 vec 开头，实际为 {name}"
-
+    assert name.startswith("vec"),f"线程名应该以 vec 开头，实际为{name}"
 
 def test_shutdown_is_idempotent():
     executors.get_vector_executor()
     executors.shutdown_executors()
-    executors.shutdown_executors()  # 第二次不应抛异常
-    # 关停后再取应当拿到一个可用的新池
+    executors.shutdown_executors()  #重复执行两次
+    # 关闭后再取应该拿到一个可用的新池
     assert executors.get_vector_executor()._max_workers == 4
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd backend && python -m pytest tests/test_executors.py -v`
+Run: `cd backend && python -m pytest tests/test_executor.py -v`
 Expected: FAIL，`ModuleNotFoundError: backend.core.executors`
 
 - [ ] **Step 3: 实现 executors 模块**
@@ -674,12 +685,7 @@ Expected: FAIL，`ModuleNotFoundError: backend.core.executors`
 
 ```python
 """
-进程级线程池的集中管理。
-
-为什么不用 run_in_executor(None, ...)：
-默认线程池是全局共享资源，LangGraph 的同步节点、asyncio.to_thread 都在用它，
-大小只有 min(32, cpu+4)。一次 embedding 风暴会把它占满，饿死其他所有阻塞调用。
-给向量库一个有界的专属池，把影响限制在向量层内部。
+集中管理进程级线程池，提供获取与关停入口
 """
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -693,9 +699,7 @@ VECTOR_POOL_SIZE = 4
 _vector_executor: ThreadPoolExecutor | None = None
 _lock = threading.Lock()
 
-
 def get_vector_executor() -> ThreadPoolExecutor:
-    """获取向量库专属线程池（懒创建，进程内单例）。"""
     global _vector_executor
     if _vector_executor is None:
         with _lock:
@@ -704,18 +708,16 @@ def get_vector_executor() -> ThreadPoolExecutor:
                     max_workers=VECTOR_POOL_SIZE,
                     thread_name_prefix="vec",
                 )
-                logger.info("向量库线程池已创建，max_workers=%s", VECTOR_POOL_SIZE)
+                logger.info("向量库线程池已创建，max_workers=%s",VECTOR_POOL_SIZE)
     return _vector_executor
 
-
 def shutdown_executors(wait: bool = True) -> None:
-    """关停所有线程池；可重复调用。"""
     global _vector_executor
     with _lock:
         if _vector_executor is not None:
             _vector_executor.shutdown(wait=wait)
             _vector_executor = None
-            logger.info("向量库线程池已关停")
+            logger.info("向量库线程池已关闭")
 ```
 
 - [ ] **Step 4: 让向量库使用这个池**
@@ -747,13 +749,13 @@ Expected: 无输出
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `cd backend && python -m pytest tests/test_executors.py -v`
+Run: `cd backend && python -m pytest tests/test_executor.py -v`
 Expected: 3 passed
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add backend/core/executors.py backend/agents/memory/vector_store_manager.py backend/tests/test_executors.py
+git add backend/core/executors.py backend/agents/memory/vector_store_manager.py backend/tests/test_executor.py
 git commit -m "refactor: 向量库改用专属有界线程池，避免与默认池互相饿死"
 ```
 
@@ -782,25 +784,32 @@ git commit -m "refactor: 向量库改用专属有界线程池，避免与默认�
 
 ```python
 import pytest
+from sympy import Lambda
 
-from backend.agents.tools import TOOLS
+from backend.agents.tools import TOOLS, TOOL_MAP
+
+# 例外：load_skill_tool 只是读一个很小的 SKILL.md（loader 还带 mtime 缓存），同步实现不会阻塞事件循环。
+# 把例外写成清单，比在测试里 skip 更清楚：结果里不会多出一条跳过，新增工具也不会悄悄跟着被放过。
+SYNC_ALLOWED = {"load_skill_tool"}
 
 
-@pytest.mark.parametrize("tool", TOOLS, ids=lambda t: t.name)
+@pytest.mark.parametrize("tool",[t for t in TOOLS if t.name not in SYNC_ALLOWED],ids=lambda t:t.name)
 def test_sync_run_is_disabled(tool):
-    """所有工具都只走异步路径；同步 _run 必须显式拒绝，不能悄悄阻塞事件循环。"""
-    if tool.name == "load_skill_tool":
-        pytest.skip("load_skill_tool 是纯文件读取，同步实现无阻塞风险")
+    """除清单里的例外之外，所有工具只走异步路径，同步_run必须显式拒绝，不能悄悄阻塞事件循环"""
     with pytest.raises(NotImplementedError):
         tool._run()
 
+def test_sync_allowed_tool_really_works():
+    """例外也要测：load_skill_tool 的同步入口要能正常读出剧本，而不是抛异常"""
+    result = TOOL_MAP["load_skill_tool"]._run(name="question_variant")
+    assert "【Skill: question_variant】已加载" in result
 
 def test_sync_agent_functions_are_gone():
-    from backend.agents.agent import common_agent, extract_agent, question_set_agent
+    from backend.agents.agent import common_agent,extract_agent,question_set_agent
 
-    assert not hasattr(common_agent, "common_tool")
-    assert not hasattr(extract_agent, "extract_tool")
-    assert not hasattr(question_set_agent, "question_set_tool")
+    assert not hasattr(common_agent,"common_tool")
+    assert not hasattr(extract_agent,"extract_tool")
+    assert not hasattr(question_set_agent,"question_set_tool")
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -900,96 +909,84 @@ import json
 
 import pytest
 
-from backend.agents.memory.short_term_memory import MemoryUnit, ShortTermMemory
+from backend.agents.memory.short_term_memory import ShortTermMemory, MemoryUnit
 
-USER, SESSION = 1, 1
-
+USER,SESSION = 1,1
 
 @pytest.fixture
-def stm(redis_test_client, monkeypatch):
-    """把 ShortTermMemory 指向测试库 db 15。"""
+def stm(redis_test_client,monkeypatch):
+    """把ShortTermMemory 指向测试库db 15"""
     memory = ShortTermMemory(max_memory_size=3)
-    monkeypatch.setattr(memory, "_client", redis_test_client)
+    monkeypatch.setattr(memory,"_client",redis_test_client)
     return memory
-
 
 async def test_newest_first(stm):
     for i in range(3):
-        await stm.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+        await stm.add_memory(USER,SESSION,MemoryUnit(f"问题{i}",f"回答{i}"))
 
-    got = await stm.get_latest_memories(USER, SESSION, limit=3)
-    assert [m["memory"]["user_memory"] for m in got] == ["问题2", "问题1", "问题0"]
-
+    got = await stm.get_latest_memories(USER,SESSION,limit=3)
+    assert [m["memory"]["user_memory"] for m in got] == ["问题2","问题1","问题0"]
 
 async def test_no_eviction_below_limit(stm):
-    evicted = await stm.add_memory(USER, SESSION, MemoryUnit("问题0", "回答0"))
+    evicted = await stm.add_memory(USER,SESSION,MemoryUnit("问题0","回答0"))
     assert evicted == []
-    assert await stm.get_memory_size(USER, SESSION) == 1
-
+    assert await stm.get_memory_size(USER,SESSION) == 1
 
 async def test_eviction_moves_oldest_to_pending(stm):
     for i in range(3):
-        await stm.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+        await stm.add_memory(USER,SESSION,MemoryUnit(f"问题{i}",f"回答{i}"))
 
-    evicted = await stm.add_memory(USER, SESSION, MemoryUnit("问题3", "回答3"))
-
+    evicted = await stm.add_memory(USER,SESSION,MemoryUnit("问题3","回答3"))
     assert len(evicted) == 1
     assert json.loads(evicted[0])["memory"]["user_memory"] == "问题0"
-    assert await stm.get_memory_size(USER, SESSION) == 3
-    pending = await stm.get_pending(USER, SESSION)
-    assert pending == evicted, "被淘汰的条目必须进入 pending，不能凭空消失"
-
+    assert await stm.get_memory_size(USER,SESSION) == 3
+    pending = await stm.get_pending(USER,SESSION)
+    assert pending == evicted
 
 async def test_evicted_item_is_invisible_to_readers(stm):
-    """验收标准 3：正在被归档的记忆，读路径物理上看不到。"""
     for i in range(4):
-        await stm.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+        await stm.add_memory(USER,SESSION,MemoryUnit(f"问题{i}",f"回答{i}"))
 
-    visible = await stm.get_latest_memories(USER, SESSION, limit=10)
+    visible = await stm.get_latest_memories(USER,SESSION,limit=10)
     assert "问题0" not in [m["memory"]["user_memory"] for m in visible]
 
-
 async def test_concurrent_writes_lose_nothing(stm):
-    """验收标准 1：20 个并发写入，窗口 + pending 必须恰好等于 20 条，一条不丢。"""
     results = await asyncio.gather(*[
-        stm.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+        stm.add_memory(USER,SESSION,MemoryUnit(f"问题{i}",f"回答{i}"))
         for i in range(20)
     ])
 
-    in_window = await stm.get_latest_memories(USER, SESSION, limit=100)
-    in_pending = await stm.get_pending(USER, SESSION)
+    in_window = await stm.get_latest_memories(USER,SESSION,limit = 100)
+    in_pending = await stm.get_pending(USER,SESSION)
 
-    assert len(in_window) == 3, "窗口必须严格等于 max_memory_size"
-    assert len(in_window) + len(in_pending) == 20, "并发写入不得丢消息"
+    assert len(in_window) == 3,"窗口大小必须严格等于max_memory_size"
+    assert len(in_window) + len(in_pending) == 20,"并发写入不会丢失消息"
 
     evicted_total = sum(len(r) for r in results)
-    assert evicted_total == len(in_pending), "每条被淘汰的记忆都应被返回给调用方一次"
-
+    assert evicted_total == len(in_pending),"每条被淘汰的记忆都应该被返回给调用方一次"
 
 async def test_ack_removes_from_pending(stm):
     for i in range(4):
-        await stm.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+        await stm.add_memory(USER,SESSION,MemoryUnit(f"问题{i}",f"回答{i}"))
 
-    pending = await stm.get_pending(USER, SESSION)
-    removed = await stm.ack_archived(USER, SESSION, pending[0])
+    pending = await stm.get_pending(USER,SESSION)
+    removed = await stm.ack_archived(USER,SESSION,pending[0])
 
     assert removed == 1
-    assert await stm.get_pending(USER, SESSION) == []
-
+    assert await stm.get_pending(USER,SESSION) == []
 
 async def test_ttl_is_set(stm):
-    await stm.add_memory(USER, SESSION, MemoryUnit("问题", "回答"))
-    ttl = await stm._client.ttl(ShortTermMemory.key(USER, SESSION))
+    await stm.add_memory(USER,SESSION,MemoryUnit('问题','回答'))
+    ttl = await stm._client.ttl(ShortTermMemory.key(USER,SESSION))
     assert 0 < ttl <= 86400
-
 
 async def test_scan_pending_keys(stm):
     for i in range(4):
-        await stm.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+        await stm.add_memory(USER,SESSION,MemoryUnit(f"问题{i}",f"回答{i}"))
 
     keys = await stm.scan_pending_keys()
-    assert ShortTermMemory.pending_key(USER, SESSION) in keys
-    assert ShortTermMemory.parse_pending_key(keys[0]) == (USER, SESSION)
+    assert ShortTermMemory.pending_key(USER,SESSION) in keys
+    assert ShortTermMemory.parse_pending_key(keys[0]) == (USER,SESSION)
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -1006,36 +1003,31 @@ Expected: 大量 FAIL / ERROR（`ShortTermMemory` 没有 `_client`、`key`、`ge
 短期会话记忆：Redis LIST 实现。
 
 为什么是 LIST 而不是「hash 字段里的 JSON 字符串」：
-旧实现每次写入都要「读出整个列表 → Python 里 insert → 整个写回」，
-是一次没有任何保护的 read-modify-write。两个并发请求即使都不触发摘要
-也会丢消息（读-读-写-写）。改成 LIST 后，写入是 Redis 服务端的原子操作。
+旧实现每次写入都要「读出整个列表 -> Python 里 insert -> 整个写回」，
+是一次没有任何保护的 read-modify-write，两个并发请求会丢消息（读-读-写-写）。
+改成 LIST 后，写入是 Redis 服务端的原子操作。
 
 淘汰同样在服务端完成：LPUSH 与「超限时 RPOPLPUSH 到 pending 队列」
 打包进一次 Lua EVAL 原子执行。被淘汰的条目在这一刻就已经物理移出窗口，
-后续的归档（LLM 精炼 + 写向量库）读不到它、也不会被新消息插入干扰，
-所以整条链路不需要任何锁。
+后续的归档读不到它、也不会被新消息插入干扰，所以整条链路不需要任何锁。
 
 存储结构：
 - stm:{user_id}:{session_id}          LIST，index 0 为最新，长度上限 max_memory_size
 - stm:pending:{user_id}:{session_id}  LIST，待归档队列，归档成功后 LREM 移除
 """
 import json
+from typing import Dict, List, Any, Optional
 from datetime import datetime
-from typing import Any, Dict, List
-
-from redis.exceptions import RedisError
 
 from backend.middleware.logging import get_logger
 from backend.utils.redis_client import get_redis_client
+from redis.exceptions import RedisError
 
 logger = get_logger(__name__)
 
-DEFAULT_TTL = 86400          # 窗口 24 小时
-DEFAULT_PENDING_TTL = 604800  # pending 7 天，给崩溃恢复留足余量
+DEFAULT_TTL = 86400
+DEFAULT_PENDING_TTL = 604800
 
-# KEYS[1]=窗口 key  KEYS[2]=pending key
-# ARGV[1]=新记忆 JSON  ARGV[2]=最大条数  ARGV[3]=窗口 TTL  ARGV[4]=pending TTL
-# 用 RPOPLPUSH 而非 LMOVE：语义等价，但兼容 Redis 6.2 以下版本
 _PUSH_AND_EVICT_LUA = """
 redis.call('LPUSH', KEYS[1], ARGV[1])
 redis.call('EXPIRE', KEYS[1], ARGV[3])
@@ -1051,9 +1043,12 @@ end
 return evicted
 """
 
+_short_term_memory: Optional[ShortTermMemory] = None
+
 
 class MemoryUnit(dict):
     def __init__(self, user_memory: str = "", model_memory: str = ""):
+        # 注意：这里不要使用 typing.Dict（不可实例化），而要用普通 dict。
         super().__init__(
             memory={
                 "user_memory": user_memory,
@@ -1065,144 +1060,140 @@ class MemoryUnit(dict):
 
 class ShortTermMemory:
     def __init__(
-        self,
-        max_memory_size: int = 10,
-        ttl: int = DEFAULT_TTL,
-        pending_ttl: int = DEFAULT_PENDING_TTL,
+            self,
+            max_memory_size: int = 10,
+            ttl: int = DEFAULT_TTL,
+            pending_ttl = DEFAULT_PENDING_TTL
     ):
+        """
+        初始化短期记忆模块
+        
+        Args:
+            max_memory_size: 最大记忆条数
+            redis_client: Redis客户端实例，可选，若不传则自动获取全局实例
+        """
         self.max_memory_size = max_memory_size
+        self._client = get_redis_client().client
         self.ttl = ttl
         self.pending_ttl = pending_ttl
-        self._client = get_redis_client().client
         self._push_script = None
 
-    # ---------- key 约定 ----------
-
     @staticmethod
-    def key(user_id: int, session_id: int) -> str:
+    def key(user_id: int,session_id: int) -> str:
         return f"stm:{user_id}:{session_id}"
 
     @staticmethod
-    def pending_key(user_id: int, session_id: int) -> str:
+    def pending_key(user_id: int,session_id: int) -> str:
         return f"stm:pending:{user_id}:{session_id}"
 
     @staticmethod
-    def parse_pending_key(key: str) -> tuple[int, int]:
-        """从 stm:pending:{u}:{s} 反解出 (user_id, session_id)。"""
+    def parse_pending_key(key: str) -> tuple[int,int]:
         parts = key.split(":")
-        return int(parts[2]), int(parts[3])
+        return int(parts[2]),int(parts[3])
 
     def _script(self):
-        """懒注册 Lua 脚本；redis-py 会自动 EVALSHA，NOSCRIPT 时回退 EVAL。"""
         if self._push_script is None:
             self._push_script = self._client.register_script(_PUSH_AND_EVICT_LUA)
         return self._push_script
 
-    # ---------- 写 ----------
-
-    async def add_memory(
-        self, user_id: int, session_id: int, memory: MemoryUnit
-    ) -> List[str]:
+    async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit) -> List[str]:
         """
-        原子地写入一条记忆，并把超出窗口的最旧记忆搬进 pending 队列。
+        原子写入一条记忆，并把超过窗口容量的最旧记忆搬进pending队列
 
-        :return: 本次被挤出窗口的原始 JSON 字符串列表（通常 0 或 1 条）。
-                 调用方负责把它们归档，并在成功后调用 ack_archived。
+        :return: 本次被挤出窗口的原始JSON字符串列表，调用方将他们归档
         """
         try:
             evicted = await self._script()(
-                keys=[
-                    self.key(user_id, session_id),
-                    self.pending_key(user_id, session_id),
+                keys = [
+                    self.key(user_id,session_id),
+                    self.pending_key(user_id,session_id)
                 ],
-                args=[
-                    json.dumps(memory, ensure_ascii=False),
+                args = [
+                    json.dumps(memory,ensure_ascii=False),
                     self.max_memory_size,
                     self.ttl,
-                    self.pending_ttl,
+                    self.pending_ttl
                 ],
             )
             return list(evicted or [])
         except RedisError as e:
-            logger.error("写入短期记忆失败：%s", e, exc_info=True)
+            logger.error("写入短期记忆失败: %s",e,exc_info=True)
             return []
+        
 
-    async def ack_archived(self, user_id: int, session_id: int, raw_item: str) -> int:
+    async def ack_archived(self,user_id: int,session_id: int,raw_item: str) -> int:
         """
-        归档成功后，把该条目从 pending 队列移除。
-        用原始 JSON 字符串精确匹配，保证幂等：重复归档最多产生一条重复向量，不会丢数据。
-
-        :return: 实际移除的条数（0 表示已被移除过）
+        归档成功后，把该条目从pending队列中删除
+        :return: 实际移除的条数
         """
         try:
             return await self._client.lrem(
-                self.pending_key(user_id, session_id), 1, raw_item
+                self.pending_key(user_id,session_id),1,raw_item
             )
         except RedisError as e:
-            logger.error("移除 pending 条目失败：%s", e, exc_info=True)
+            logger.error("移除pending条目失败: %s",e,exc_info=True)
             return 0
 
-    async def clear_all(self, user_id: int, session_id: int) -> None:
-        """清空该会话的窗口与 pending 队列。"""
+
+    async def clear_all(self,user_id: int,session_id: int) -> None:
+        """清空会话窗口和pending队列"""
         await self._client.delete(
-            self.key(user_id, session_id),
-            self.pending_key(user_id, session_id),
+            self.key(user_id,session_id),
+            self.pending_key(user_id,session_id),
         )
 
-    # ---------- 读 ----------
-
-    async def get_latest_memories(
-        self, user_id: int, session_id: int, limit: int = 5
-    ) -> List[Dict[str, Any]]:
-        """获取最新 N 条记忆（index 0 为最新）。"""
+    async def get_latest_memories(self, user_id: int, session_id: int, limit: int = 5) -> List[Dict[str, Any]]:
+        """获取最新N条记忆"""
         try:
             raw = await self._client.lrange(
-                self.key(user_id, session_id), 0, limit - 1
+                self.key(user_id,session_id),0,limit-1
             )
         except RedisError as e:
-            # Redis 不可用时返回空记忆，不让整个接口失败
-            logger.error("读取短期记忆失败：%s", e)
+            logger.error("读取短期记忆失败: %s",e)
             return []
 
-        result: List[Dict[str, Any]] = []
+        result: List[Dict[str,Any]] = []
         for item in raw:
             try:
                 result.append(json.loads(item))
             except json.JSONDecodeError:
-                logger.error("短期记忆反序列化失败，已跳过：%s", item[:100])
+                logger.error("短期记忆反序列化失败，已跳过: %s",item[:100])
         return result
 
     async def get_memory_size(self, user_id: int, session_id: int) -> int:
         try:
-            return await self._client.llen(self.key(user_id, session_id))
+            return await self._client.llen(self.key(user_id,session_id))
         except RedisError:
             return 0
 
-    async def get_pending(self, user_id: int, session_id: int) -> List[str]:
-        """待归档队列的原始 JSON 字符串列表。"""
+    async def get_pending(self,user_id: int,session_id: int) -> List[str]:
         try:
             return await self._client.lrange(
-                self.pending_key(user_id, session_id), 0, -1
+                self.pending_key(user_id,session_id),0,-1
             )
         except RedisError:
             return []
 
     async def scan_pending_keys(self) -> List[str]:
-        """
-        扫出所有非空的 pending 队列 key，供启动恢复使用。
-        用 SCAN 而非 KEYS，避免阻塞 Redis。
-        """
-        keys: List[str] = []
+        keys:List[str] = []
         try:
-            async for key in self._client.scan_iter(match="stm:pending:*", count=100):
+            async for key in self._client.scan_iter(match="stm:pending:*",count = 100):
                 keys.append(key)
         except RedisError as e:
-            logger.error("扫描 pending 队列失败：%s", e)
+            logger.error("扫描 pending 队列失败: %s", e)
         return keys
 
 
 async def get_short_term_memory() -> ShortTermMemory:
-    return ShortTermMemory()
+    """
+    获取短期记忆实例
+    
+    Returns: ShortTermMemory实例
+    """
+    global _short_term_memory
+    if _short_term_memory is None:
+        _short_term_memory = ShortTermMemory()
+    return _short_term_memory #type: ignore
 ```
 
 - [ ] **Step 4: 运行测试确认通过**
@@ -1222,6 +1213,9 @@ git commit -m "feat: 短期记忆改用 Redis LIST + Lua 原子淘汰，消除�
 ---
 
 ## Task 6: 归档转为后台任务
+
+> **归档的目标在 Task 12 改了**：本任务完成时写入的是向量库（当时的设计），Task 12 把目标换成 MySQL 的 `memory_record`。
+> 「后台任务 + pending 重试 + 关停等待」这套骨架两者完全一样，所以本任务的内容仍然有效，只是最后一步的写入对象不同。
 
 **这个任务解决什么问题**：短期记忆溢出时，被挤出窗口的记录要先经 LLM 精炼，再写进向量库。现在这一步是在请求路径上同步做的——用户发一条消息恰好触发溢出，就得等一次 LLM 摘要（几秒）才能拿到回复。
 
@@ -1756,7 +1750,7 @@ async def shutdown_event():
     logger.info("资源已全部释放")
 ```
 
-顺序很重要：归档任务还要用 Redis 和向量库，所以必须在 `shutdown_executors` / `close_redis` **之前**完成。
+顺序很重要：归档任务还要用 Redis 和数据库，所以必须在 `shutdown_executors` / `close_redis` **之前**完成。
 
 - [ ] **Step 4: 运行全部测试**
 
@@ -2609,428 +2603,999 @@ git commit -m "feat: 画像维度词表下沉到 SKILL.md，词表外的键自�
 
 ---
 
-## Task 11: 向量层改用 retriever 检索
+## Task 11: 记忆表与数据访问层
 
-**这个任务解决什么问题**：现有的 `VectorStoreManager.query()` 走的是 `as_query_engine().query()`，那是 RAG 问答——它会把检索结果再交给一个 LLM 合成答案。我们只要检索到的原文，多这一次调用就是多一份延迟和费用。更麻烦的是，这个 LLM 取自 LlamaIndex 的全局 `Settings`，默认是 OpenAI，而本项目根本没配 OpenAI，真调用起来会直接报错。
+**这个任务解决什么问题**：归档下来的对话要有个地方存。这里建两张表：`memory_record` 存原文，`memory_digest` 存会话要点。
 
-**怎么做**：新增 `retrieve()`，用 `as_retriever()` 只做向量检索，不触发任何 LLM 调用；低于阈值的命中直接丢弃；任何异常都降级为空列表。同时**删掉 `query()`**：它没有任何调用方，而且已经不可用了——清理依赖时移除了 `llama-index-llms-openai`，`as_query_engine()` 解析默认 LLM 时会直接报 `ImportError: llama-index-llms-openai package not found`（本机暂时还能跑，只是因为这个包还留在虚拟环境里没卸载）。
+**为什么原文只增不改、不做压缩**：「太长了就压缩」最容易写成「在上一版摘要的基础上继续摘要」，压到第五轮，最早的内容已经被改写过五次，细节没了，甚至可能被改得和原意不符，而且原文已经不在，无从回溯。把两件事分开就没有这个问题：原文一条几百字节，存得起，永不改动；要点是派生数据，随时可以从原文重算，摘坏了、换了提示词，重跑一遍就行。
 
-**做完之后**：拿到一个按相似度过滤好的原文列表，供 Task 12 注入 prompt。向量层从此是「增强」而不是「依赖」：它挂了，生题照常。
+**为什么放 MySQL 而不是向量库**：见文档开头的设计变更说明。顺带两个好处：`mysqldump` 天然覆盖这份数据（向量库的目录不在备份范围里），排查问题时可以直接用 SQL 按会话、按时间翻原文。
 
-**前后依赖**：用到 Task 3 的 `get_vector_executor()`（chromadb 是同步库，必须投递到线程池）。产出 `retrieve(query_text, user_id, top_k=3, min_score=0.3)`，Task 12 使用。
+**做完之后**：有了可用的读写接口，Task 12 的归档就有地方落了。
+
+**前后依赖**：不依赖前面的任务，产出 `MemoryMapper`，Task 12 使用。
 
 **实现时注意**：
 
-1. **`min_score=0.3` 实际卡的不是余弦相似度**。`VectorStoreManager` 建 collection 时没有指定距离函数，chromadb 默认用 l2（平方欧氏距离），而 LlamaIndex 把距离换算成 `score = exp(-距离)`。用真实的 chromadb 实测过这组数字：
-
-   | 两个向量的关系 | 返回的 score |
-   |---|---|
-   | 完全相同 | 1.000 |
-   | 余弦 0.5 | 0.368 |
-   | 正交（余弦 0） | 0.135 |
-   | 完全相反 | 0.018 |
-
-   所以 `min_score=0.3` 相当于「平方欧氏距离 ≤ 1.204」，在向量已归一化的前提下，等价于「余弦 ≥ 0.398」。两点提醒：① DashScope 的 embedding 是否归一化，要用一次真实调用确认（算一下向量的模长是不是 1）；没归一化的话，这个阈值的含义会随向量长度漂移。② 想让阈值直接就是余弦，需要在建 collection 时指定 cosine 空间，但这会改变已有数据的检索行为，得重建 collection。
-2. **`PERSIST_DIR` 默认是相对路径 `./vector_memory`**，相对的是进程的工作目录。从 `backend/` 启动和从仓库根目录启动，用的是两个不同的库，表现就是「记忆突然都不见了」。部署时要固定工作目录，或者把 `VECTOR_MEMORY_DIR` 配成绝对路径。
-3. **测试用替身顶替 `_index`**，不连真实的 Chroma。要验证的是「阈值过滤」和「失败降级」这两段自己的逻辑，不是 Chroma 本身。
+1. **归档是「至少一次」语义**：写库成功、ack 失败时会重试同一条。用原始条目的 sha1 做唯一键，重复写入被数据库直接挡下，比「先查再写」可靠（后者仍有并发窗口）。
+2. **DAO 返回 dict 和 dataclass，不返回 ORM 对象**：会话一关，ORM 对象就是游离状态，调用方再访问属性会踩 `DetachedInstanceError`。
+3. **表是靠 `Base.metadata.create_all` 建的**，而 `create_all` 只会建「已经被导入的模型类」对应的表。`dao/memory_mapper.py` 导入了 `model/memory.py`，`agent_api` 又导入了 `MemoryMapper`，所以启动钩子跑到 `create_all` 时这两张表已经注册进 metadata 了。新增模型时务必确认这条导入链，否则表不会被创建，而且不报错。
 
 **Files:**
-- Modify: `backend/agents/memory/vector_store_manager.py`（新增 `retrieve`，删除 `query`）
-- Create: `backend/tests/test_vector_retrieve.py`
+- Create: `backend/model/memory.py`
+- Create: `backend/dao/memory_mapper.py`
+- Test: `backend/tests/test_memory_mapper.py`
 
 **Interfaces:**
-- Consumes: Task 3 的 `get_vector_executor()`
-- Produces: `async VectorStoreManager.retrieve(query_text: str, user_id: int | None = None, top_k: int = 3, min_score: float = 0.3) -> list[str]`
+- Consumes: `backend.model.Base`、`AsyncSessionLocal`
+- Produces:
+  - `MemoryRecord`（表 `memory_record`）：`id, user_id, session_id, user_text, model_text, fingerprint(唯一), created_at`
+  - `MemoryDigest`（表 `memory_digest`）：`id, user_id, session_id, summary, covered_until_id, updated_at`，`(user_id, session_id)` 唯一
+  - `DigestState(summary: str, covered_until_id: int)`
+  - `MemoryMapper(session_factory)`：
+    - `async add_record(user_id, session_id, user_text, model_text, fingerprint) -> bool`（fingerprint 重复时返回 False）
+    - `async list_records(user_id, session_id, limit) -> list[dict]`（最近 limit 条，按时间从旧到新）
+    - `async count_since(user_id, session_id, after_id) -> tuple[int, int]`（未覆盖条数, 最大记录 id）
+    - `async get_digest(user_id, session_id) -> DigestState | None`
+    - `async save_digest(user_id, session_id, summary, covered_until_id) -> None`
+  - `get_memory_mapper() -> MemoryMapper`（进程内单例）
 
 - [ ] **Step 1: 写失败的测试**
 
-创建 `backend/tests/test_vector_retrieve.py`：
+创建 `backend/tests/test_memory_mapper.py`：
 
 ```python
-from types import SimpleNamespace
+"""
+记忆表的数据访问测试。跑在临时的 SQLite 文件库上：DAO 只依赖会话工厂，
+换个数据库照样能测，不需要本机装 MySQL，也不会碰到生产库。
+"""
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-import pytest
+from backend.dao.memory_mapper import MemoryMapper
+from backend.model import Base
+from backend.model.memory import MemoryDigest, MemoryRecord  # noqa: F401  建表需要先导入模型
 
-from backend.agents.memory.vector_store_manager import VectorStoreManager
-
-
-def _node(text: str, score: float):
-    """伪造 LlamaIndex 的 NodeWithScore。"""
-    return SimpleNamespace(score=score, node=SimpleNamespace(get_content=lambda: text))
-
-
-@pytest.fixture
-def manager(monkeypatch):
-    """绕过重量级 __init__，只装配 retrieve 需要的部件。"""
-    m = VectorStoreManager.__new__(VectorStoreManager)
-    m.embed_model = object()
-    m._index = None
-    return m
+USER, SESSION = 7, 7
 
 
-def _stub_retriever(manager, monkeypatch, nodes):
-    class FakeRetriever:
-        def retrieve(self, query):
-            return nodes
-
-    manager._index = SimpleNamespace(as_retriever=lambda **kw: FakeRetriever())
-
-
-async def test_returns_texts_above_threshold(manager, monkeypatch):
-    _stub_retriever(manager, monkeypatch, [
-        _node("用户偏好带解析的题目", 0.82),
-        _node("用户是七年级学生", 0.55),
-    ])
-    got = await manager.retrieve("生成一道变式题", user_id=1)
-    assert got == ["用户偏好带解析的题目", "用户是七年级学生"]
+@pytest_asyncio.fixture
+async def mapper(tmp_path):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield MemoryMapper(async_sessionmaker(engine, expire_on_commit=False))
+    await engine.dispose()
 
 
-async def test_filters_low_score_hits(manager, monkeypatch):
-    """低相关命中必须丢弃——这正是「无关内容干扰模型」的直接防线。"""
-    _stub_retriever(manager, monkeypatch, [
-        _node("高相关", 0.9),
-        _node("八竿子打不着", 0.11),
-    ])
-    got = await manager.retrieve("生成一道变式题", user_id=1, min_score=0.3)
-    assert got == ["高相关"]
+async def _add(mapper, n: int, session_id: int = SESSION) -> None:
+    for i in range(n):
+        await mapper.add_record(USER, session_id, f"问题{i}", f"回答{i}", f"fp{session_id}-{i}")
 
 
-async def test_no_hits_returns_empty(manager, monkeypatch):
-    _stub_retriever(manager, monkeypatch, [])
-    assert await manager.retrieve("随便问问", user_id=1) == []
+async def test_records_come_back_oldest_first(mapper):
+    """摘要要按时序读，所以取出来必须是从旧到新"""
+    await _add(mapper, 3)
+    assert [r["user_text"] for r in await mapper.list_records(USER, SESSION, limit=10)] == ["问题0", "问题1", "问题2"]
 
 
-async def test_failure_degrades_to_empty(manager):
-    """向量层是增强不是依赖：检索失败时返回空列表，不能抛异常打断工具。"""
-    class Boom:
-        def as_retriever(self, **kw):
-            raise RuntimeError("chroma 挂了")
+async def test_limit_keeps_the_newest(mapper):
+    """超过上限时保留最近的几条，而不是最早的几条"""
+    await _add(mapper, 5)
+    assert [r["user_text"] for r in await mapper.list_records(USER, SESSION, limit=2)] == ["问题3", "问题4"]
 
-    manager._index = Boom()
-    assert await manager.retrieve("生成一道变式题", user_id=1) == []
+
+async def test_duplicate_fingerprint_is_ignored(mapper):
+    """归档是「至少一次」，重试会把同一条再写一遍；靠唯一键挡住，不能出现两条"""
+    assert await mapper.add_record(USER, SESSION, "问题", "回答", "same-fp") is True
+    assert await mapper.add_record(USER, SESSION, "问题", "回答", "same-fp") is False
+    assert len(await mapper.list_records(USER, SESSION, limit=10)) == 1
+
+
+async def test_sessions_are_isolated(mapper):
+    await _add(mapper, 2, session_id=1)
+    await _add(mapper, 3, session_id=2)
+    assert len(await mapper.list_records(USER, 1, limit=10)) == 2
+    assert len(await mapper.list_records(USER, 2, limit=10)) == 3
+
+
+async def test_count_since_tracks_uncovered_records(mapper):
+    await _add(mapper, 3)
+    pending, latest = await mapper.count_since(USER, SESSION, after_id=0)
+    assert (pending, latest) == (3, 3)
+    pending, latest = await mapper.count_since(USER, SESSION, after_id=2)
+    assert (pending, latest) == (1, 3)
+
+
+async def test_count_since_on_empty_session(mapper):
+    assert await mapper.count_since(USER, 999, after_id=0) == (0, 0)
+
+
+async def test_digest_is_created_then_updated(mapper):
+    assert await mapper.get_digest(USER, SESSION) is None
+
+    await mapper.save_digest(USER, SESSION, "第一版摘要", covered_until_id=3)
+    first = await mapper.get_digest(USER, SESSION)
+    assert (first.summary, first.covered_until_id) == ("第一版摘要", 3)
+
+    await mapper.save_digest(USER, SESSION, "第二版摘要", covered_until_id=8)
+    second = await mapper.get_digest(USER, SESSION)
+    assert (second.summary, second.covered_until_id) == ("第二版摘要", 8)
+    assert len(await mapper.list_records(USER, SESSION, limit=10)) == 0, "保存摘要不应影响原文"
 ```
+
+测试跑在临时的 SQLite 文件库上：DAO 只依赖会话工厂，换个数据库照样测，既不需要本机装 MySQL，也不会碰到真实数据。`aiosqlite` 已经在 `requirements.txt` 里。
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd backend && python -m pytest tests/test_vector_retrieve.py -v`
-Expected: FAIL，`AttributeError: 'VectorStoreManager' object has no attribute 'retrieve'`
+Run: `cd backend && python -m pytest tests/test_memory_mapper.py -v`
+Expected: 收集阶段报 `ModuleNotFoundError: No module named 'backend.dao.memory_mapper'`
 
-- [ ] **Step 3: 实现 retrieve**
+- [ ] **Step 3: 建表**
 
-在 `backend/agents/memory/vector_store_manager.py` 的 `query` 方法之后加入：
+创建 `backend/model/memory.py`：
 
 ```python
-    async def retrieve(
-        self,
-        query_text: str,
-        user_id: int = None,
-        top_k: int = 3,
-        min_score: float = 0.3,
-    ) -> list[str]:
-        """
-        纯向量检索，返回命中的原文列表。
+from sqlalchemy import Column, DateTime, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy.sql import func
 
-        与 query() 的区别：query() 走 as_query_engine()，那是 RAG 问答，
-        内部会额外调一次 LLM 合成答案。这里只要检索结果本身，用 as_retriever()，
-        不触发任何 LLM 调用。
+from backend.model import Base
 
-        低于 min_score 的命中直接丢弃，避免无关内容干扰模型。
-        任何异常都降级为空列表：向量层是增强，不是依赖。
-        """
-        try:
-            filters = None
-            if user_id is not None:
-                filters = MetadataFilters(
-                    filters=[ExactMatchFilter(key="user_id", value=user_id)]
-                )
 
-            retriever = self._index.as_retriever(
-                similarity_top_k=top_k,
-                filters=filters,
-                embed_model=self.embed_model,
-            )
-            loop = asyncio.get_running_loop()
-            nodes = await loop.run_in_executor(
-                get_vector_executor(), partial(retriever.retrieve, query_text)
-            )
+class MemoryRecord(Base):
+    """
+    一轮对话的原文，只增不改。
 
-            texts: list[str] = []
-            for node in nodes or []:
-                score = getattr(node, "score", None)
-                if score is not None and score < min_score:
-                    continue
-                texts.append(node.node.get_content())
-            return texts
-        except Exception as e:
-            logger.error("向量检索失败，本次跳过记忆注入：%s", e, exc_info=True)
-            return []
+    短期窗口（Redis）挤出来的记录会落到这里。原文永不压缩：一条几百字节，存得起；
+    摘要是从它重算出来的派生数据，摘坏了、换了提示词，重跑一遍就行。
+    """
+    __tablename__ = 'memory_record'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='主键')
+    user_id = Column(Integer, nullable=False, comment='用户ID')
+    session_id = Column(Integer, nullable=False, comment='会话ID')
+    user_text = Column(Text, nullable=False, comment='用户说的话')
+    model_text = Column(Text, nullable=False, comment='模型的回答')
+    # 归档是「至少一次」语义：写库成功但 ack 失败时会重试。用原始条目的哈希做唯一键，
+    # 重复写入会被数据库直接拦下，不需要先查再写（那样仍然有并发窗口）
+    fingerprint = Column(String(40), nullable=False, unique=True, comment='原始条目的 sha1，用于去重')
+    created_at = Column(DateTime, nullable=False, default=func.current_timestamp(), comment='归档时间')
+
+    __table_args__ = (
+        Index('ix_memory_record_session', 'user_id', 'session_id', 'id'),
+    )
+
+
+class MemoryDigest(Base):
+    """
+    一个会话一条摘要，由 memory_record 的原文重算得到。
+
+    covered_until_id 记录这份摘要覆盖到了哪条记录，用来判断「新攒了多少条还没进摘要」。
+    """
+    __tablename__ = 'memory_digest'
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='主键')
+    user_id = Column(Integer, nullable=False, comment='用户ID')
+    session_id = Column(Integer, nullable=False, comment='会话ID')
+    summary = Column(Text, nullable=False, comment='会话要点摘要')
+    covered_until_id = Column(Integer, nullable=False, comment='摘要覆盖到的最大 memory_record.id')
+    updated_at = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp(), comment='更新时间')
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'session_id', name='uq_memory_digest_session'),
+    )
 ```
 
-- [ ] **Step 4: 删除已经失效的 `query()`**
+`id` 用 `Integer` 而不是 `BigInteger`：SQLite 只把 `INTEGER PRIMARY KEY` 当作自增的 rowid 别名，写成 `BIGINT` 时自增行为要额外适配，而 21 亿行对这个项目绰绰有余。
 
-删掉 `backend/agents/memory/vector_store_manager.py` 里的 `query()` 方法（连同它的 `as_query_engine` 调用）。
+- [ ] **Step 4: 写数据访问层**
 
-两个理由：它没有任何调用方；而且清理依赖时移除了 `llama-index-llms-openai`，`as_query_engine()` 要解析一个默认 LLM，在按 `requirements.txt` 装出来的环境（CI、Docker 镜像）里会直接报 `ImportError: llama-index-llms-openai package not found`。留着一段不能用的代码，只会让后来的人误以为可以调。
+创建 `backend/dao/memory_mapper.py`：
 
-删完确认没有别的地方在用：
+```python
+"""
+对话记忆的数据访问层：原文表 memory_record、会话摘要表 memory_digest。
 
-```bash
-cd backend && grep -rn "\.query(" --include=*.py . | grep -i vector
+返回的都是普通 dict 和 dataclass，不是 ORM 对象：会话一关，ORM 对象就处于游离状态，
+调用方再访问属性容易踩到 DetachedInstanceError。
+"""
+from dataclasses import dataclass
+from typing import Optional
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+
+from backend.model.memory import MemoryDigest, MemoryRecord
+
+
+@dataclass
+class DigestState:
+    summary: str
+    covered_until_id: int
+
+
+class MemoryMapper:
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+    async def add_record(self, user_id: int, session_id: int, user_text: str,
+                         model_text: str, fingerprint: str) -> bool:
+        """
+        写入一条对话原文。返回是否真的写入：fingerprint 已存在说明这条之前归档过，
+        返回 False（幂等，调用方照常 ack 即可）。
+        """
+        async with self.session_factory() as session:
+            session.add(MemoryRecord(
+                user_id=user_id, session_id=session_id,
+                user_text=user_text, model_text=model_text, fingerprint=fingerprint,
+            ))
+            try:
+                await session.commit()
+                return True
+            except IntegrityError:
+                await session.rollback()
+                return False
+
+    async def list_records(self, user_id: int, session_id: int, limit: int) -> list[dict]:
+        """取这个会话最近 limit 条原文，按时间从旧到新返回（摘要要按时序读）"""
+        async with self.session_factory() as session:
+            stmt = (
+                select(MemoryRecord)
+                .where(MemoryRecord.user_id == user_id, MemoryRecord.session_id == session_id)
+                .order_by(MemoryRecord.id.desc())
+                .limit(limit)
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+        return [{"id": r.id, "user_text": r.user_text, "model_text": r.model_text} for r in reversed(rows)]
+
+    async def count_since(self, user_id: int, session_id: int, after_id: int) -> tuple[int, int]:
+        """返回 (id 大于 after_id 的记录条数, 这个会话最大的记录 id)。用来判断该不该重算摘要"""
+        async with self.session_factory() as session:
+            base = (MemoryRecord.user_id == user_id, MemoryRecord.session_id == session_id)
+            pending = (await session.execute(
+                select(func.count()).select_from(MemoryRecord).where(*base, MemoryRecord.id > after_id)
+            )).scalar_one()
+            latest = (await session.execute(
+                select(func.max(MemoryRecord.id)).where(*base)
+            )).scalar()
+        return pending, latest or 0
+
+    async def get_digest(self, user_id: int, session_id: int) -> Optional[DigestState]:
+        async with self.session_factory() as session:
+            stmt = select(MemoryDigest).where(
+                MemoryDigest.user_id == user_id, MemoryDigest.session_id == session_id
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                return None
+            return DigestState(summary=row.summary, covered_until_id=row.covered_until_id)
+
+    async def save_digest(self, user_id: int, session_id: int, summary: str, covered_until_id: int) -> None:
+        """有则更新、无则插入"""
+        async with self.session_factory() as session:
+            stmt = select(MemoryDigest).where(
+                MemoryDigest.user_id == user_id, MemoryDigest.session_id == session_id
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            if row is None:
+                session.add(MemoryDigest(
+                    user_id=user_id, session_id=session_id,
+                    summary=summary, covered_until_id=covered_until_id,
+                ))
+            else:
+                row.summary = summary
+                row.covered_until_id = covered_until_id
+            await session.commit()
+
+
+_mapper: Optional[MemoryMapper] = None
+
+
+def get_memory_mapper() -> MemoryMapper:
+    """进程内单例。与 get_short_term_memory 同一个用法。"""
+    global _mapper
+    if _mapper is None:
+        from backend.model import AsyncSessionLocal
+        _mapper = MemoryMapper(AsyncSessionLocal)
+    return _mapper
 ```
-
-Expected: 没有输出。
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `cd backend && python -m pytest tests/test_vector_retrieve.py -v`
-Expected: 4 passed
+Run: `cd backend && python -m pytest tests/test_memory_mapper.py -v`
+Expected: 7 passed
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add backend/agents/memory/vector_store_manager.py backend/tests/test_vector_retrieve.py
-git commit -m "feat: 向量层新增 retrieve，只检索不做 RAG 合成；删除失效的 query"
+git add backend/model/memory.py backend/dao/memory_mapper.py backend/tests/test_memory_mapper.py
+git commit -m "feat: 新增对话原文表与会话要点表及其数据访问层"
 ```
 
 ---
 
-## Task 12: 工具级定点注入向量记忆
+## Task 12: 归档写入 MySQL，并维护会话要点
 
-**这个任务解决什么问题**：向量库里已经有归档的记忆了，但没有任何地方会去读它。这个任务把它接进生题和通用问答两条链路。
+**这个任务解决什么问题**：Task 6 的归档把记录经 LLM 精炼后写进向量库。这个任务把落点换成 Task 11 的两张表：原文直接入库（**不再需要精炼那次 LLM 调用**），攒够几条之后再用一次调用重算会话要点。
 
-**为什么是「工具级定点注入」而不是「每轮请求统一检索」**：ReAct 主循环每轮都检索的话，路由决策阶段也会被无关的历史记忆干扰（模型看到「用户不喜欢雷同题目」，可能误判成用户现在要生题），而且每轮都要付一次向量化和检索的成本。定点注入只在真要生成内容时付一次。
+**为什么这样更省也更稳**：原来每归档一条就要调一次 LLM（精炼），现在每 5 条才调一次（摘要），调用次数降到五分之一；而且写原文这一步不依赖模型，模型出问题时记录照样落库，最多是要点晚一点更新。
 
-**做完之后**：用户之前说过「题目不要和原题太像」，下次生题时这条偏好会被检索出来，拼进生题的 system prompt。
+**做完之后**：溢出的对话不会再丢，`memory_digest` 里有一份随会话推进不断更新的要点，Task 16 把它注入请求上下文。应用也不再依赖 chromadb——删掉向量记忆模块之后，`import backend.main` 不会再加载 chromadb。
 
-**前后依赖**：用到 Task 11 的 `retrieve`。产出 `recall_context(query, user_id)`，以及两个工具新增的 `user_id` 参数；`tool_exec_node` 负责从 `GraphState` 注入这个参数。
+**前后依赖**：用到 Task 11 的 `MemoryMapper`、Task 6 的后台任务骨架。产出 `build_session_digest` 与新的 `MemoryManager` 构造签名，Task 15、16 使用。
 
 **实现时注意**：
 
-1. **效果要等短期记忆溢出之后才看得到**。向量库里的内容来自归档，而归档只在短期记忆超过 10 条时才发生。新会话里说完偏好、马上生题，是检索不到的——这不是 bug。人工验证时要先把窗口填满。
-2. **`recall.py` 在模块顶部导入 `VectorStoreManager`**，于是「导入工具」就会连带导入 chromadb 和 LlamaIndex。RAG 计划里正是因为这条链路，才给几个测试加了 `importorskip`。想解耦的话，可以像 `memory_manager` 那样改成延迟导入。
-3. **`recall_context` 里 `_store()` 的构造没有保护**。`retrieve` 内部已经捕获了异常，但 `VectorStoreManager()` 这一步本身抛异常时（比如 chromadb 坏了），异常会一路抛到工具的 `try` 里，让整次生题变成「生成变式题失败」——这与「向量层只降级、不失败」的原则冲突。稳妥的做法是把 `recall_context` 的函数体整个包进 `try`。
-4. **`tool_exec_node` 里注入 `user_id` 的工具名集合是硬编码的**。以后新增需要 `user_id` 的工具，很容易漏掉，表现是工具收到 `user_id=None`。
+1. **摘要失败不能回滚原文**。原文已经落库、pending 也已经 ack，这时摘要调用失败只记日志，下一批归档会再试一次。反过来做（摘要失败就不 ack）会让同一批记录反复重写。
+2. **`covered_until_id` 要取「这次真正喂给模型的最后一条记录的 id」**，不是「当前最大 id」。摘要生成期间可能又有新记录落库，取最大 id 会让要点声称覆盖了其实没看过的内容。
+3. **删掉的三个文件是死代码**：`vector_store_manager.py`（记忆层唯一的使用者已经不在了）、`extract_memory_agent.py` 与 `agents/skills/memory_refinement/`（精炼流程被摘要取代）。留着它们会让人误以为还有第二条归档路径。
+4. **新的 skill 会出现在 ReAct 的技能清单里**。`session_digest` 只给摘要用，不该让 Agent 去加载它，但 `loader.py` 现在会列出所有 SKILL.md。等 RAG 计划 Task 6 的 `visibility: internal` 落地后，给它补上这个字段。眼下 `triggers` 留空，至少不会被字面匹配触发。
 
 **Files:**
-- Modify: `backend/agents/tools/question_set_tool.py`
-- Modify: `backend/agents/tools/common_tool.py`
-- Modify: `backend/agents/agent/react_agent.py`（`tool_exec_node` 注入 `user_id`）
-- Create: `backend/agents/memory/recall.py`
-- Create: `backend/tests/test_recall_injection.py`
+- Create: `backend/agents/skills/session_digest/SKILL.md`
+- Create: `backend/agents/agent/session_digest_agent.py`
+- Test: `backend/tests/test_session_digest_agent.py`
+- Modify: `backend/agents/memory/memory_manager.py`（整体替换）
+- Modify: `backend/tests/test_memory_manager.py`（整体替换）
+- Modify: `backend/api/user_api/agent_api.py`（接线）
+- Delete: `backend/agents/memory/vector_store_manager.py`、`backend/agents/agent/extract_memory_agent.py`、`backend/agents/skills/memory_refinement/`
 
 **Interfaces:**
-- Consumes: Task 11 的 `VectorStoreManager.retrieve`
-- Produces: `async recall_context(query: str, user_id: int | None) -> str` —— 返回可直接拼进 prompt 的一段文本，无命中时返回空字符串
+- Consumes: Task 11 的 `MemoryMapper`；`load_skill`、`get_llm`
+- Produces:
+  - `async build_session_digest(records: list[dict]) -> str`
+  - `MemoryManager(long_term_memory, short_term_memory, memory_mapper)`
+  - `MemoryManager.get_memory_for_planner` 返回值新增 `session_digest: str`
+  - 常量 `DIGEST_EVERY = 5`、`DIGEST_SOURCE_LIMIT = 40`
 
-- [ ] **Step 1: 写失败的测试**
+- [ ] **Step 1: 写摘要的提示词**
 
-创建 `backend/tests/test_recall_injection.py`：
+创建 `backend/agents/skills/session_digest/SKILL.md`：
+
+````markdown
+---
+name: session_digest
+description: 会话要点摘要协议：把一段辅导对话压成客观要点，供后续对话作为上下文使用
+triggers: []
+version: 1.0
+---
+
+# 角色
+你负责把一段师生辅导对话压缩成「会话要点」，供后续对话作为背景信息使用。
+
+# 要求
+1. 用第三人称客观陈述，不要用「你」「我」
+2. 保留这几类信息，其余一律略去：
+   - 学生问过哪些题、属于什么知识点
+   - 学生卡在哪里、犯过什么错
+   - 给出过什么关键结论或建议
+   - 学生明确表达的偏好和要求
+3. 不要复述题目原文和完整解题过程，只留结论
+4. 不要编造对话里没有的内容；信息不足时就少写
+5. 总长度控制在 300 字以内，用短句，一行一条
+6. 只输出要点本身，不要任何开场白、标题或解释
+
+# 示例
+
+输入：
+1. 用户：解方程 2x+9=5x-3
+   助手：移项得 3x=12，所以 x=4。
+2. 用户：这类题我老是把移项的符号弄错
+   助手：移项时要变号，建议每步写出中间结果。
+3. 用户：以后出题别和原题太像
+   助手：好的，后续会换情境和数字。
+
+输出：
+学生练习一元一次方程的求解，能跟上移项求解的步骤。
+学生自述容易在移项时弄错符号，已建议逐步写出中间结果。
+学生要求后续题目不要与原题过于相似。
+````
+
+- [ ] **Step 2: 写摘要生成的测试**
+
+创建 `backend/tests/test_session_digest_agent.py`（先写前 4 个测试；输入截断与限时的测试在 Task 15 补）：
 
 ```python
-import backend.agents.memory.recall as recall_mod
-from backend.agents.memory.recall import recall_context
+import backend.agents.agent.session_digest_agent as sd
+
+RECORDS = [
+    {"id": 1, "user_text": "解方程 2x+9=5x-3", "model_text": "移项得 3x=12，x=4"},
+    {"id": 2, "user_text": "我老是把移项的符号弄错", "model_text": "移项要变号，建议写出中间结果"},
+]
 
 
-async def test_returns_empty_without_user_id():
-    assert await recall_context("生成一道变式题", None) == ""
+class FakeLLM:
+    def __init__(self, content="学生练习一元一次方程，容易在移项时弄错符号。"):
+        self.content = content
+        self.messages = None
+
+    async def ainvoke(self, messages):
+        self.messages = messages
+        return type("Response", (), {"content": self.content})()
 
 
-async def test_formats_hits_as_prompt_section(monkeypatch):
-    class FakeStore:
-        async def retrieve(self, query_text, user_id=None, top_k=3, min_score=0.3):
-            return ["用户偏好带解析的题目", "用户不喜欢与原题雷同"]
-
-    monkeypatch.setattr(recall_mod, "_store", lambda: FakeStore())
-
-    got = await recall_context("生成一道变式题", 1)
-
-    assert "历史偏好" in got
-    assert "用户偏好带解析的题目" in got
-    assert "用户不喜欢与原题雷同" in got
+def _patch(monkeypatch, llm):
+    monkeypatch.setattr(sd, "build_session_digest_agent", lambda: llm)
+    monkeypatch.setattr(sd, "load_skill", lambda name: f"【{name} 剧本】")
+    return llm
 
 
-async def test_no_hits_returns_empty(monkeypatch):
-    class FakeStore:
-        async def retrieve(self, query_text, user_id=None, top_k=3, min_score=0.3):
-            return []
-
-    monkeypatch.setattr(recall_mod, "_store", lambda: FakeStore())
-    assert await recall_context("生成一道变式题", 1) == ""
+def test_records_are_formatted_in_order():
+    text = sd.format_records(RECORDS)
+    assert text.index("解方程") < text.index("移项的符号"), "必须按时序排列"
+    assert "1. 用户：" in text and "   助手：" in text
 
 
-async def test_question_set_tool_injects_recall(monkeypatch):
-    """命中历史偏好时，内容必须进入生题的 system prompt（验收标准 5）。"""
-    from backend.agents.tools.question_set_tool import QuestionSetTool
-    import backend.agents.tools.question_set_tool as qs_mod
-
-    seen = {}
-
-    async def fake_extract(text):
-        return {"difficulty": "中等", "knowledge_points": ["一元一次方程"]}
-
-    async def fake_question_set(payload):
-        seen["recall"] = payload.get("recall", "")
-        return {"result": "题目...答案：x=4"}
-
-    monkeypatch.setattr(qs_mod, "async_extract_tool", fake_extract)
-    monkeypatch.setattr(qs_mod, "async_question_set_tool", fake_question_set)
-    monkeypatch.setattr(qs_mod, "recall_context", lambda q, u: _async("【历史偏好】不要雷同"))
-
-    out = await QuestionSetTool()._arun(query="解方程 2x+9=5x-3", user_id=1)
-
-    assert "不要雷同" in seen["recall"]
-    assert "题目" in out
+async def test_digest_uses_the_skill_and_returns_text(monkeypatch):
+    llm = _patch(monkeypatch, FakeLLM())
+    result = await sd.build_session_digest(RECORDS)
+    assert result == "学生练习一元一次方程，容易在移项时弄错符号。"
+    assert llm.messages[0].content == "【session_digest 剧本】", "system 必须来自 SKILL.md，提示词不写在代码里"
+    assert "解方程 2x+9=5x-3" in llm.messages[1].content
 
 
-def _async(value):
-    async def _inner():
-        return value
-    return _inner()
+async def test_empty_records_make_no_call(monkeypatch):
+    class Exploding:
+        async def ainvoke(self, messages):
+            raise AssertionError("没有原文时不应该调用模型")
+    _patch(monkeypatch, Exploding())
+    assert await sd.build_session_digest([]) == ""
+
+
+async def test_whitespace_and_non_text_are_handled(monkeypatch):
+    _patch(monkeypatch, FakeLLM(content="  要点  \n"))
+    assert await sd.build_session_digest(RECORDS) == "要点"
+
+    _patch(monkeypatch, FakeLLM(content=[{"type": "text"}]))
+    assert await sd.build_session_digest(RECORDS) == "", "模型返回非文本时给空摘要，而不是让整条链路报错"
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **Step 3: 实现摘要生成**
 
-Run: `cd backend && python -m pytest tests/test_recall_injection.py -v`
-Expected: FAIL，`ModuleNotFoundError: backend.agents.memory.recall`
-
-- [ ] **Step 3: 实现 recall 模块**
-
-创建 `backend/agents/memory/recall.py`：
+创建 `backend/agents/agent/session_digest_agent.py`（Task 15 会在此基础上加截断与限时）：
 
 ```python
 """
-向量记忆的定点召回。
+会话摘要：把一个会话已归档的原文压成一段要点，作为后续请求的上下文。
 
-读取策略是「工具级定点注入」而不是「每轮请求统一检索」：
-ReAct 主循环不碰向量库，成本只在真要生成内容时付一次，
-也避免无关的历史记忆干扰路由决策。
+摘要永远从原文重算，不在上一版摘要的基础上继续摘要——那样每压一次信息就失真一点，
+几轮之后早期内容已经面目全非，而且原文若已被覆盖就无从回溯。原文在 memory_record 里
+只增不改，重算的代价只是一次 LLM 调用。
 """
-from backend.agents.memory.vector_store_manager import VectorStoreManager
+import os
+
+from langchain_core.messages import HumanMessage, SystemMessage
+
+from backend.agents.agent.get_llm import get_llm
+from backend.agents.skills import load_skill
+from backend.core.config import load_env
+from backend.core.single_tool import singleton_method
 from backend.middleware.logging import get_logger
 
 logger = get_logger(__name__)
 
-TOP_K = 3
-MIN_SCORE = 0.3
+load_env()
 
 
-def _store() -> VectorStoreManager:
-    """延迟取单例：便于测试替换，也避免导入期就初始化 Chroma。"""
-    return VectorStoreManager()
+@singleton_method
+def build_session_digest_agent():
+    """摘要用的模型可以比主模型便宜：DIGEST_MODEL 没配就回落到 MODEL_NAME"""
+    model = os.getenv('DIGEST_MODEL')
+    return get_llm(model=model) if model else get_llm()
 
 
-async def recall_context(query: str, user_id: int | None) -> str:
-    """
-    检索该用户的历史记忆，格式化成可直接拼进 system prompt 的一段文本。
-    无 user_id、无命中或检索失败时一律返回空字符串——调用方照常执行。
-    """
-    if user_id is None:
-        return ""
-
-    hits = await _store().retrieve(
-        query_text=query, user_id=user_id, top_k=TOP_K, min_score=MIN_SCORE
-    )
-    if not hits:
-        return ""
-
-    lines = ["【该学生的历史偏好与学情记录】"]
-    lines.extend(f"- {h}" for h in hits)
-    lines.append("请在不违反上述题目规范的前提下，尽量贴合这些历史偏好。")
+def format_records(records: list[dict]) -> str:
+    """把原文排成带序号的对话，模型按时序阅读"""
+    lines: list[str] = []
+    for index, record in enumerate(records, 1):
+        lines.append(f"{index}. 用户：{record['user_text']}")
+        lines.append(f"   助手：{record['model_text']}")
     return "\n".join(lines)
+
+
+async def build_session_digest(records: list[dict]) -> str:
+    """把一个会话的原文压成要点。没有原文时返回空字符串。"""
+    if not records:
+        return ""
+
+    system_body = load_skill("session_digest")
+    llm = build_session_digest_agent()
+    response = await llm.ainvoke([
+        SystemMessage(content=system_body),
+        HumanMessage(content=format_records(records)),
+    ])
+    content = response.content if isinstance(response.content, str) else ""
+    return content.strip()
 ```
 
-- [ ] **Step 4: 让两个工具接收 user_id 并注入召回结果**
-
-`backend/agents/tools/question_set_tool.py` 的 `_arun` 改为：
-
-```python
-    async def _arun(self, query: str, user_id: Optional[int] = None) -> str:
-        """执行题目生成工具"""
-        try:
-            extract = await async_extract_tool(query)
-            new_input = {
-                'input': query,
-                'extract': extract,
-                'recall': await recall_context(query, user_id),
-            }
-            result = await async_question_set_tool(new_input)
-            if 'error' in result:
-                return f"【题目生成】生成变式题失败：{result['error']}"
-            return f"【题目生成】已生成变式题：\n{result['result']}"
-        except Exception as e:
-            return f"【题目生成】生成变式题失败：{str(e)}"
-```
-
-顶部补上 `from typing import Optional` 与 `from backend.agents.memory.recall import recall_context`。
-
-`backend/agents/agent/question_set_agent.py` 的 `async_question_set_tool` 里，把召回内容拼进 system prompt：
-
-```python
-        system_body = load_skill("question_variant")
-        recall = text.get('recall', '')
-        if recall:
-            system_body = f"{system_body}\n\n{recall}"
-```
-
-`backend/agents/agent/common_agent.py` —— 在 system 模板末尾加一个 `{recall}` 占位符（原文里没有花括号，加这一个是安全的），并让 `async_common_tool` 接收它：
-
-```python
-COMMON_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是专业教育解题助手，负责：
-        - 提供解题步骤、思路、方法、答案
-        - 解释知识点、难度、考点、易错点
-        - 解答题目相关疑问
-        - 回答应该简练，避免使用复杂的词汇
-        - 回答清晰易懂，不生成新题目。
-{recall}"""),
-    ("user", "{input}")
-])
-
-
-async def async_common_tool(text: str, recall: str = "") -> str:
-    common_agent = build_common_agent(streaming=True)
-    common_chain = COMMON_PROMPT | common_agent
-    response = await common_chain.ainvoke({'input': text, 'recall': recall})
-    return response.content
-```
-
-`backend/agents/tools/common_tool.py` 的 `_arun`：
-
-```python
-    async def _arun(self, query: str, user_id: Optional[int] = None) -> str:
-        """执行通用工具"""
-        recall = await recall_context(query, user_id)
-        return await async_common_tool(query, recall=recall)
-```
-
-顶部补上 `from typing import Optional` 与 `from backend.agents.memory.recall import recall_context`。
-
-- [ ] **Step 5: 让 tool_exec_node 注入 user_id**
-
-在 `backend/agents/agent/react_agent.py` 的 `tool_exec_node` 中，把注入 `user_id` 的工具名集合扩充：
-
-```python
-    # user_profile_*_tool 与需要召回历史记忆的工具只需 user_id，由 state 注入
-    if func_name in (
-        "user_profile_save_tool",
-        "user_profile_query_tool",
-        "user_profile_delete_tool",
-        "question_set_tool",
-        "common_tool",
-    ):
-        args['user_id'] = state['user_id']
-```
-
-- [ ] **Step 6: 运行测试确认通过**
-
-Run: `cd backend && python -m pytest tests/test_recall_injection.py -v`
+Run: `cd backend && python -m pytest tests/test_session_digest_agent.py -v`
 Expected: 4 passed
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 4: 重写归档逻辑的测试**
+
+用下面的内容整体替换 `backend/tests/test_memory_manager.py`：
+
+```python
+import asyncio
+import json
+import logging
+
+import pytest
+
+import backend.agents.memory.memory_manager as mm
+from backend.agents.memory.memory_manager import DIGEST_EVERY, MemoryManager
+from backend.agents.memory.short_term_memory import MemoryUnit, ShortTermMemory
+from backend.dao.memory_mapper import DigestState
+
+USER, SESSION = 7, 7
+
+
+class FakeMapper:
+    """内存版的记忆表：行为与 MemoryMapper 一致，包括 fingerprint 去重"""
+
+    def __init__(self, fail: bool = False):
+        self.records: list[dict] = []
+        self.digests: dict[tuple[int, int], DigestState] = {}
+        self.fail = fail
+
+    async def add_record(self, user_id, session_id, user_text, model_text, fingerprint) -> bool:
+        if self.fail:
+            raise RuntimeError("数据库写入失败")
+        if any(r["fingerprint"] == fingerprint for r in self.records):
+            return False
+        self.records.append({
+            "id": len(self.records) + 1, "user_id": user_id, "session_id": session_id,
+            "user_text": user_text, "model_text": model_text, "fingerprint": fingerprint,
+        })
+        return True
+
+    def _of_session(self, user_id, session_id) -> list[dict]:
+        return [r for r in self.records if r["user_id"] == user_id and r["session_id"] == session_id]
+
+    async def list_records(self, user_id, session_id, limit) -> list[dict]:
+        return self._of_session(user_id, session_id)[-limit:]
+
+    async def count_since(self, user_id, session_id, after_id) -> tuple[int, int]:
+        rows = self._of_session(user_id, session_id)
+        return len([r for r in rows if r["id"] > after_id]), (rows[-1]["id"] if rows else 0)
+
+    async def get_digest(self, user_id, session_id):
+        return self.digests.get((user_id, session_id))
+
+    async def save_digest(self, user_id, session_id, summary, covered_until_id) -> None:
+        self.digests[(user_id, session_id)] = DigestState(summary, covered_until_id)
+
+
+@pytest.fixture
+def manager(redis_test_client, monkeypatch):
+    stm = ShortTermMemory(max_memory_size=2)
+    monkeypatch.setattr(stm, "_client", redis_test_client)
+
+    async def fake_digest(records):
+        return f"摘要：共{len(records)}条"
+
+    monkeypatch.setattr(mm, "build_session_digest", fake_digest)
+
+    mgr = MemoryManager.__new__(MemoryManager)
+    mgr.long_term_memory = None
+    mgr.short_term_memory = stm
+    mgr.memory_mapper = FakeMapper()
+    mgr._tasks = set()
+    return mgr
+
+
+async def _talk(manager, n: int, start: int = 0) -> None:
+    for i in range(start, start + n):
+        await manager.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+
+
+async def _fill_pending(manager, n: int) -> None:
+    """直接写短期记忆，让 pending 里积压 n 条（max=2，第 3 条起每条挤出一条），不触发后台归档"""
+    for i in range(n + 2):
+        await manager.short_term_memory.add_memory(USER, SESSION, MemoryUnit(f"问题{i}", f"回答{i}"))
+
+
+async def test_below_limit_spawns_nothing(manager):
+    await _talk(manager, 1)
+    assert manager._tasks == set()
+    assert manager.memory_mapper.records == []
+
+
+async def test_overflow_archives_original_text_in_background(manager):
+    await _talk(manager, 3)
+    await manager.shutdown(5)
+
+    [record] = manager.memory_mapper.records
+    assert (record["user_text"], record["model_text"]) == ("问题0", "回答0"), "存的是原文，不是摘要"
+    assert record["user_id"] == USER and record["session_id"] == SESSION
+    assert await manager.short_term_memory.get_pending(USER, SESSION) == []
+
+
+async def test_request_path_does_not_wait_for_archive(manager, monkeypatch):
+    async def slow_digest(records):
+        await asyncio.sleep(1.0)
+        return "慢摘要"
+    monkeypatch.setattr(mm, "build_session_digest", slow_digest)
+
+    await _talk(manager, 2)
+    start = asyncio.get_running_loop().time()
+    await manager.add_memory(USER, SESSION, MemoryUnit("问题2", "回答2"))
+    assert asyncio.get_running_loop().time() - start < 0.2, "归档必须在后台跑，不能拖慢用户请求"
+    await manager.shutdown(5)
+
+
+async def test_failed_write_keeps_item_pending(manager):
+    manager.memory_mapper.fail = True
+    await _talk(manager, 3)
+    await manager.shutdown(5)
+
+    [raw] = await manager.short_term_memory.get_pending(USER, SESSION)
+    assert json.loads(raw)["memory"]["user_memory"] == "问题0"
+
+
+async def test_drain_recovers_and_is_idempotent(manager):
+    manager.memory_mapper.fail = True
+    await _talk(manager, 3)
+    await manager.shutdown(5)
+    assert len(await manager.short_term_memory.get_pending(USER, SESSION)) == 1
+
+    manager.memory_mapper.fail = False
+    assert await manager.drain_pending() == 1
+    assert await manager.drain_pending() == 0
+    assert len(manager.memory_mapper.records) == 1
+
+
+async def test_same_item_archived_twice_writes_one_row(manager, redis_test_client):
+    """写库成功、ack 失败时会重试同一条：靠 fingerprint 去重，不能出现两行"""
+    await _fill_pending(manager, 1)
+    [raw] = await manager.short_term_memory.get_pending(USER, SESSION)
+
+    assert await manager._archive_one(USER, SESSION, raw) is True
+    await redis_test_client.rpush(ShortTermMemory.pending_key(USER, SESSION), raw)   # 模拟 ack 没成功
+    assert await manager._archive_one(USER, SESSION, raw) is True
+
+    assert len(manager.memory_mapper.records) == 1
+
+
+async def test_digest_is_rebuilt_after_enough_records(manager):
+    await _fill_pending(manager, DIGEST_EVERY)
+    assert await manager.drain_pending() == DIGEST_EVERY
+
+    digest = await manager.memory_mapper.get_digest(USER, SESSION)
+    assert digest is not None, f"攒够 {DIGEST_EVERY} 条就该重算摘要"
+    assert digest.summary == f"摘要：共{DIGEST_EVERY}条"
+    assert digest.covered_until_id == DIGEST_EVERY, "覆盖到最后一条记录"
+
+
+async def test_digest_waits_until_enough_records(manager):
+    await _fill_pending(manager, DIGEST_EVERY - 1)
+    await manager.drain_pending()
+    assert await manager.memory_mapper.get_digest(USER, SESSION) is None, "不够条数时不调用大模型"
+
+
+async def test_digest_is_rebuilt_from_raw_records(manager, monkeypatch):
+    """重算摘要时喂给模型的必须是原文，绝不是上一版摘要——否则信息会一轮轮失真"""
+    seen: list[list[dict]] = []
+
+    async def spy(records):
+        seen.append(records)
+        return f"摘要{len(seen)}"
+    monkeypatch.setattr(mm, "build_session_digest", spy)
+
+    await _fill_pending(manager, DIGEST_EVERY)
+    await manager.drain_pending()
+    await _fill_pending(manager, DIGEST_EVERY)          # 再来一批，触发第二次重算
+    await manager.drain_pending()
+
+    assert len(seen) == 2
+    assert all("user_text" in r for r in seen[1]), "第二次拿到的仍然是原文"
+    assert not any("摘要1" in str(r) for r in seen[1]), "上一版摘要不能作为输入"
+
+
+async def test_digest_failure_does_not_lose_records(manager, monkeypatch, caplog):
+    async def boom(records):
+        raise RuntimeError("摘要模型超时")
+    monkeypatch.setattr(mm, "build_session_digest", boom)
+
+    await _fill_pending(manager, DIGEST_EVERY)
+    with caplog.at_level(logging.ERROR):
+        assert await manager.drain_pending() == DIGEST_EVERY
+
+    assert len(manager.memory_mapper.records) == DIGEST_EVERY, "原文已经落库，不能因为摘要失败而回滚"
+    assert await manager.short_term_memory.get_pending(USER, SESSION) == []
+    assert "会话摘要更新失败" in caplog.text
+
+
+async def test_unparseable_item_is_dropped(manager, redis_test_client):
+    await redis_test_client.rpush(ShortTermMemory.pending_key(USER, SESSION), "{不是json")
+    assert await manager.drain_pending() == 0
+    assert await manager.short_term_memory.get_pending(USER, SESSION) == []
+
+
+async def test_finished_tasks_are_released(manager):
+    await _talk(manager, 4)
+    await manager.shutdown(5)
+    assert manager._tasks == set()
+    assert len(manager.memory_mapper.records) == 2
+
+
+async def test_background_exception_is_logged(manager, monkeypatch, caplog):
+    async def boom(*args, **kwargs):
+        raise RuntimeError("意料之外的错误")
+    monkeypatch.setattr(manager, "_archive", boom)
+
+    with caplog.at_level(logging.ERROR):
+        await _talk(manager, 3)
+        await manager.shutdown(5)
+    assert "意料之外的错误" in caplog.text
+    assert manager._tasks == set()
+
+
+async def test_shutdown_timeout_cancels_and_waits(manager, monkeypatch):
+    async def forever(records):
+        await asyncio.sleep(30)
+    monkeypatch.setattr(mm, "build_session_digest", forever)
+
+    await _fill_pending(manager, DIGEST_EVERY)
+    task = manager._spawn(manager.drain_pending())   # 后台补做：原文写完后卡在摘要那一步
+    await asyncio.sleep(0.2)
+    await manager.shutdown(timeout=0.05)
+
+    assert task.done() and task.cancelled()
+    assert manager._tasks == set()
+    assert len(manager.memory_mapper.records) == DIGEST_EVERY, "原文已经落库，只是摘要没来得及做"
+
+
+async def test_planner_gets_short_memory_and_digest(manager):
+    class FakeProfile:
+        async def get_by_user_id(self, user_id):
+            return "画像"
+    manager.long_term_memory = FakeProfile()
+
+    await _fill_pending(manager, DIGEST_EVERY)
+    await manager.drain_pending()
+    await manager.add_memory(USER, SESSION, MemoryUnit("最新问题", "最新回答"))
+
+    data = await manager.get_memory_for_planner(USER, SESSION)
+    assert data["short_memory"][0]["memory"]["user_memory"] == "最新问题"
+    assert data["session_digest"] == f"摘要：共{DIGEST_EVERY}条"
+    assert data["long_memory"] == "画像"
+
+
+async def test_planner_digest_is_empty_for_new_session(manager):
+    class FakeProfile:
+        async def get_by_user_id(self, user_id):
+            return None
+    manager.long_term_memory = FakeProfile()
+    data = await manager.get_memory_for_planner(USER, 999)
+    assert data["session_digest"] == ""
+```
+
+`FakeMapper` 是内存版的记忆表，连 fingerprint 去重都照着实现了一遍——测试替身要和真实实现同构，否则测过的行为在生产上未必成立。真实的 `MemoryMapper` 由 Task 11 的测试覆盖。
+
+- [ ] **Step 5: 重写 memory_manager**
+
+用下面的内容整体替换 `backend/agents/memory/memory_manager.py`：
+
+```python
+"""
+三层记忆的统一入口。
+
+归档流程为什么不需要锁：被挤出窗口的条目在 Lua 脚本里已经原子地搬进了 pending 队列，
+读路径看不到它，后台归档和窗口读写不会互相干扰。
+
+原文与摘要的分工：
+- memory_record 存原文，只增不改。一条几百字节，存得起；出问题能追溯，mysqldump 天然备份
+- memory_digest 存会话要点，是从原文重算出来的派生数据。摘坏了、换了提示词，重跑一遍就行，
+  不会像「在摘要上继续摘要」那样一轮轮失真
+"""
+import asyncio
+import hashlib
+import json
+from typing import Any
+
+from backend.agents.agent.session_digest_agent import build_session_digest
+from backend.agents.memory.long_term_memory import LongTermMemory
+from backend.agents.memory.short_term_memory import ShortTermMemory, MemoryUnit
+from backend.core.single_tool import singleMeta
+from backend.dao.memory_mapper import MemoryMapper
+from backend.middleware.logging import get_logger
+
+logger = get_logger(__name__)
+
+# 攒够这么多条还没进摘要的记录，就重算一次会话摘要。太小则频繁调用大模型，太大则上下文跟不上进度
+DIGEST_EVERY = 5
+# 重算摘要时最多回看多少条原文：会话再长，单次摘要的输入也有上限
+DIGEST_SOURCE_LIMIT = 40
+
+
+class MemoryManager(metaclass=singleMeta):
+    def __init__(self,
+                 long_term_memory: LongTermMemory,
+                 short_term_memory: ShortTermMemory,
+                 memory_mapper: MemoryMapper):
+        self.long_term_memory = long_term_memory
+        self.short_term_memory = short_term_memory
+        self.memory_mapper = memory_mapper
+        self._tasks: set[asyncio.Task] = set()
+
+    async def get_memory_for_planner(self, user_id: int, session_id: int) -> dict[str, Any]:
+        """规划器需要的三样：最近几轮原文、本会话要点、长期画像"""
+        short_memory = await self.short_term_memory.get_latest_memories(user_id, session_id)
+        long_memory = await self.long_term_memory.get_by_user_id(user_id)
+        digest = await self.memory_mapper.get_digest(user_id, session_id)
+        return {
+            "short_memory": short_memory,                       # list[dict]
+            "long_memory": long_memory,                         # UserProfileResponse | None
+            "session_digest": digest.summary if digest else "",  # str
+        }
+
+    async def add_memory(self, user_id: int, session_id: int, memory: MemoryUnit) -> None:
+        """写入短期记忆；窗口满了就把挤出来的条目交给后台归档，不占用请求路径"""
+        evicted = await self.short_term_memory.add_memory(user_id, session_id, memory)
+        if evicted:
+            self._spawn(self._archive(user_id, session_id, evicted))
+
+    def _spawn(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        # 事件循环对任务只持弱引用，自己不存一份的话，任务可能跑到一半被垃圾回收
+        self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+        return task
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """任务结束（成功、失败或被取消）时调用：释放引用，并把异常记进日志"""
+        self._tasks.discard(task)
+        # 被取消的任务调用 exception() 会抛 CancelledError，要先排除
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            # 回调里没有「当前异常」，exc_info=True 取不到堆栈，要把异常对象直接传进去
+            logger.error("归档任务异常退出: %s", exc, exc_info=exc)
+
+    async def _archive(self, user_id, session_id, raw_items: list[str]) -> int:
+        """逐条归档，返回成功的条数；真的写进新记录时，顺带看看要不要重算摘要"""
+        success = 0
+        for raw in raw_items:
+            if await self._archive_one(user_id, session_id, raw):
+                success += 1
+        if success:
+            await self._refresh_digest(user_id, session_id)
+        return success
+
+    async def _archive_one(self, user_id, session_id, raw: str) -> bool:
+        """把一条原文写进 memory_record，写成功才 ack；失败就留在 pending 等下次重试"""
+        try:
+            unit = json.loads(raw)
+        except json.JSONDecodeError as e:
+            # 坏数据重试多少次都不会好，直接从 pending 删掉，否则每次启动都会卡在它上面
+            logger.error("待归档记忆无法反序列化，已丢弃: %s | %s", e, raw[:100])
+            await self.short_term_memory.ack_archived(user_id, session_id, raw)
+            return False
+
+        memory = unit.get("memory", {}) if isinstance(unit, dict) else {}
+        # 用原始条目的哈希做唯一键：重试写入同一条时被数据库挡下，不会出现两行
+        fingerprint = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        try:
+            await self.memory_mapper.add_record(
+                user_id, session_id,
+                memory.get("user_memory", ""), memory.get("model_memory", ""), fingerprint,
+            )
+        except Exception as e:
+            logger.error("写入记忆表失败，留在 pending 待重试: %s", e, exc_info=True)
+            return False
+
+        await self.short_term_memory.ack_archived(user_id, session_id, raw)
+        return True
+
+    async def _refresh_digest(self, user_id: int, session_id: int) -> bool:
+        """
+        攒够 DIGEST_EVERY 条新记录就重算一次会话摘要。
+        摘要失败不影响已经落库的原文：下一批归档还会再试一次。
+        """
+        try:
+            digest = await self.memory_mapper.get_digest(user_id, session_id)
+            covered = digest.covered_until_id if digest else 0
+            pending, _ = await self.memory_mapper.count_since(user_id, session_id, covered)
+            if pending < DIGEST_EVERY:
+                return False
+
+            records = await self.memory_mapper.list_records(user_id, session_id, DIGEST_SOURCE_LIMIT)
+            if not records:
+                return False
+            summary = await build_session_digest(records)
+            if not summary:
+                logger.warning("会话摘要为空，本次不更新: user=%s session=%s", user_id, session_id)
+                return False
+
+            await self.memory_mapper.save_digest(user_id, session_id, summary, records[-1]["id"])
+            logger.info("会话摘要已更新: user=%s session=%s 覆盖到记录 %s", user_id, session_id, records[-1]["id"])
+            return True
+        except Exception as e:
+            logger.error("会话摘要更新失败: %s", e, exc_info=True)
+            return False
+
+    async def drain_pending(self) -> int:
+        """重启恢复：把已弹出但没归档成功的条目补做掉"""
+        keys = await self.short_term_memory.scan_pending_keys()
+        total = 0
+        for key in keys:
+            try:
+                user_id, session_id = self.short_term_memory.parse_pending_key(key)
+            except (IndexError, ValueError):
+                logger.error("无法解析pending key，已跳过: %s", key)
+                continue
+
+            texts = await self.short_term_memory.get_pending(user_id, session_id)
+            if not texts:
+                continue
+            logger.info("启动恢复：session %s:%s 有 %s 条待归档", user_id, session_id, len(texts))
+            total += await self._archive(user_id, session_id, texts)
+
+        if total:
+            logger.info("drain_pending 成功归档: %s 条消息", total)
+        return total
+
+    async def shutdown(self, timeout: float = 10.0) -> None:
+        tasks = list(self._tasks)
+        if not tasks:
+            return
+        logger.info("shutdown 等待 %s 个归档任务", len(tasks))
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            logger.warning("shutdown 时有 %s 个归档任务超时，已取消，下次启动由 drain_pending 补做", len(pending))
+            for task in pending:
+                task.cancel()
+            # cancel() 只是发出取消请求，要等任务真正退出，否则事件循环关闭时会报 Task was destroyed but it is pending
+            await asyncio.gather(*pending, return_exceptions=True)
+```
+
+Run: `cd backend && python -m pytest tests/test_memory_manager.py -v`
+Expected: 16 passed（需要本机 Redis 可用）
+
+- [ ] **Step 6: 接线，并删掉死代码**
+
+`backend/api/user_api/agent_api.py`：把向量库换成记忆表。
+
+```python
+from backend.agents.memory.short_term_memory import ShortTermMemory, MemoryUnit
+from backend.dao.memory_mapper import MemoryMapper
+from backend.dao.user_profile_mapper import UserProfileMapper
+...
+user_profile_mapper = UserProfileMapper(AsyncSessionLocal)
+short_term_memory = ShortTermMemory(max_memory_size=10)
+long_term_memory = LongTermMemory(user_profile_mapper, short_term_memory)
+memory_mapper = MemoryMapper(AsyncSessionLocal)
+memory_manager = MemoryManager(long_term_memory, short_term_memory, memory_mapper)
+```
+
+然后删掉三个已经没有使用者的文件：
 
 ```bash
-git add backend/agents/memory/recall.py backend/agents/tools/question_set_tool.py backend/agents/tools/common_tool.py backend/agents/agent/question_set_agent.py backend/agents/agent/common_agent.py backend/agents/agent/react_agent.py backend/tests/test_recall_injection.py
-git commit -m "feat: 生题与问答工具执行前定点注入向量记忆"
+cd backend
+rm agents/memory/vector_store_manager.py agents/agent/extract_memory_agent.py
+rm -r agents/skills/memory_refinement
+grep -rn "vector_store_manager\|extract_memory_agent\|memory_refinement" --include=*.py . | grep -v __pycache__
+```
+
+Expected: grep 没有输出。
+
+- [ ] **Step 7: 运行全部测试，并确认应用不再加载 chromadb**
+
+```bash
+cd backend
+python -m pytest -v
+python -c "import sys; sys.path.insert(0, '..'); import backend.main; print('chromadb 被导入了吗:', 'chromadb' in sys.modules)"
+```
+
+Expected: 测试全部通过；最后一行输出 `chromadb 被导入了吗: False`。记忆层不再碰向量库之后，服务启动更快，也少了一整条可能出错的依赖链。
+
+- [ ] **Step 8: 提交**
+
+```bash
+git add backend/agents backend/api backend/tests
+git commit -m "feat: 归档改写 MySQL 原文表，并按批重算会话要点"
 ```
 
 ---
@@ -3238,7 +3803,7 @@ cd backend && python -m uvicorn main:app --host 127.0.0.1 --port 8000
 
 1. 「我是七年级的，数学不太好」→ 画像应写入 grade
 2. 「以后题目不要跟原题太像」→ 日志应显示候选偏好 1/2
-3. 「以后题目不要跟原题太像，出一道 2x+9=5x-3 的变式题」→ 偏好晋升写入画像，且生题时向量层召回被注入
+3. 「以后题目不要跟原题太像，出一道 2x+9=5x-3 的变式题」→ 偏好晋升写入画像，并出现在 system prompt 里
 
 - [ ] **Step 8: 提交**
 
@@ -3262,7 +3827,7 @@ git commit -m "feat: 长期画像注入 ReAct system prompt，不再查了就丢
 - 启动方式写的 `python main.py` 在 `backend/` 下跑不通（代码用的是 `backend.*` 绝对导入）
 - 「仓库中不包含前端」已经不成立，仓库里有一个 Vue 3 + Vite 的前端
 
-**还要补什么**：本次改造引入的约定——短期记忆是 Redis LIST、写入与淘汰由 Lua 原子完成（不要再做读-改-写）、归档在后台任务里进行、偏好走候选池、画像键名定义在 SKILL.md 里、向量层只在两个工具里定点检索、阻塞操作一律投递到专属线程池。
+**还要补什么**：本次改造引入的约定——短期记忆是 Redis LIST、写入与淘汰由 Lua 原子完成（不要再做读-改-写）、归档在后台任务里进行、对话原文存 MySQL 且只增不改、会话要点永远从原文重算、偏好走候选池、画像键名定义在 SKILL.md 里、阻塞操作一律投递到专属线程池。
 
 **前后依赖**：放在最后做，这样所有约定都已经定型。
 
@@ -3294,7 +3859,9 @@ git commit -m "feat: 长期画像注入 ReAct system prompt，不再查了就丢
 - 偏好类画像字段走候选池，第二次命中才写库；事实类字段（grade / subject）与 `notes` 直写
 - **画像的可用键名定义在 `agents/skills/profile_schema/SKILL.md` 的 `skill:vocab` 片段里，不在代码里**。加一个画像维度＝编辑这个 Markdown，不用改表也不用改代码。键名受控是频次确认能成立的前提（同键即同偏好），词表外的键会被自动转存到 `notes`
 - `notes` 是自由文本数组，追加去重、上限 50 条，**只在 `user_profile_query_tool` 被主动调用时返回，不注入 system prompt**
-- 向量层只在 `question_set_tool` / `common_tool` 执行前定点检索，ReAct 主循环不碰向量库
+- 对话记忆存 MySQL：`memory_record` 存原文只增不改，`memory_digest` 存会话要点。要点**永远从原文重算**，不要在上一版摘要上继续摘要
+- 注入请求的上下文＝会话要点 + 最近 3 轮原文（`user_input`）+ 长期画像（system prompt）
+- 记忆层不使用向量库；`core/executors.py` 的线程池留给 RAG 知识库
 - 阻塞操作一律投递到 `backend/core/executors.py` 的专属线程池，不要用 `run_in_executor(None, ...)`
 
 - [ ] **Step 3: 提交**
@@ -3306,201 +3873,148 @@ git commit -m "docs: 更新 CLAUDE.md 至改造后的实际架构"
 
 ---
 
-## Task 15: 归档精炼提速：截断输入、单次限时、耗时日志
+## Task 15: 摘要调用的输入截断与限时
 
-**这个任务解决什么问题**：归档时每条记录都要调用一次 LLM，而**这个调用没有任何超时**。我在当前环境里查过：`ChatOpenAI` 的 `request_timeout` 是 None，底层 httpx 的超时是 `Timeout(timeout=None)`，服务端一旦不响应，请求就会一直挂着；`max_retries=2` 只在出错时重试，卡住不算出错。这类任务到关停时一定会超时，被取消后下次启动重做一遍。
+**这个任务解决什么问题**：会话要点是靠一次 LLM 调用生成的，而**这个调用没有任何超时**。我在当前环境里查过：`ChatOpenAI` 的 `request_timeout` 是 None，底层 httpx 的超时是 `Timeout(timeout=None)`，服务端一旦不响应，请求就会一直挂着；`max_retries=2` 只在出错时重试，卡住不算出错。这类任务到关停时一定会超时被取消，下次启动重做。
 
-另一头是输入太长：交给精炼的 `model_memory` 是 Agent 的完整回答，生成变式题时可能是整套题加解析，既拖慢调用又浪费费用，而精炼并不需要这么多内容。
+另一头是输入可能很长：一次要点最多回看 40 条原文，而 `model_text` 是 Agent 的完整回答，生成变式题时可能是整套题加解析。既拖慢调用又浪费费用，而摘要并不需要完整的解题过程。
 
 **怎么做**，三件小事：
 
-1. 截断精炼的输入：`user_memory` 最多 1000 字，`model_memory` 最多 500 字
-2. 单次精炼限时：20 秒起，每千字加 10 秒，最多 60 秒。截断之后输入最长约 1500 字，限时约 35 秒。超时的条目留在 pending，等下次重试
-3. 每次精炼都记下输入字数和耗时，用数据确认慢在哪里，再决定要不要做更大的改动
+1. 截断单条记录：`user_text` 最多 200 字，`model_text` 最多 300 字
+2. 限制整体输入：超过 6000 字就从最早的记录开始丢——最近发生的事对后续对话更有用
+3. 单次限时：20 秒起，每千字加 10 秒，最多 60 秒；超时就抛出去，由 `_refresh_digest` 记日志，下一批归档再试
 
-**做完之后**：归档不会再被一个卡死的请求拖住；关停时被取消的任务，下次启动能在可预期的时间内补做完。
+**做完之后**：摘要不会被一个卡死的请求拖住；日志里有每次摘要的输入字数和耗时，可以据此判断阈值调得合不合适。
 
-**前提：以当前代码为准**。上面 Task 6 的代码块里，`_archive` 把多条记录一起精炼再按 `zip` 顺序配对。模型输出条数和输入对不上时，会 ack 错条目，这个写法已经废弃。实际实现改成了逐条归档，由 `_archive_one` 负责单条，本任务在它的基础上修改。
-
-**前后依赖**：只依赖 Task 6，可以在 Task 6 之后的任何时候做。
+**前后依赖**：只依赖 Task 12，可以在它之后任何时候做。
 
 **不做的事：不给「超时过的任务」在关停时多留时间。** 理由有四个：
 
 - 耗时主要花在生成输出和服务端排队上，输入长度只影响读取输入那一步，而这一步很快。
 - 卡住的请求，给再多时间也不会返回。
 - 关停时间的上限由部署环境决定（`docker stop` 默认 10 秒，k8s 默认 30 秒），超过就被 SIGKILL。
-- 有 pending 队列兜底，关停时取消任务不会丢数据；剩下的一点时间，应该留给最可能做完的任务。
-
-关停继续用固定的时间预算，没做完的交给启动恢复。
+- 原文已经落库，要点晚一批更新没有任何损失。
 
 **Files:**
-- Modify: `backend/agents/agent/extract_memory_agent.py`
-- Modify: `backend/agents/memory/memory_manager.py`（`_archive_one` 单独处理超时）
-- Create: `backend/tests/test_extract_memory_agent.py`
-- Modify: `backend/tests/test_memory_manager.py`（追加一个测试）
+- Modify: `backend/agents/agent/session_digest_agent.py`
+- Modify: `backend/tests/test_session_digest_agent.py`（追加 5 个测试）
 
 **Interfaces:**
-- Consumes: Task 6 的 `MemoryManager._archive_one`，以及测试辅助函数 `_fill_pending`
-- Produces:
-  - 常量 `USER_MEMORY_MAX_CHARS = 1000`、`MODEL_MEMORY_MAX_CHARS = 500`、`REFINE_TIMEOUT_BASE = 20.0`、`REFINE_TIMEOUT_PER_1K = 10.0`、`REFINE_TIMEOUT_MAX = 60.0`
-  - `refine_timeout(input_chars: int) -> float`
-  - `get_extract_memory(memory)`：超时抛 `TimeoutError`（先记一条 WARNING），成功时记一条 INFO（输入字数、耗时）
+- Produces: 常量 `RECORD_USER_MAX_CHARS = 200`、`RECORD_MODEL_MAX_CHARS = 300`、`DIGEST_INPUT_MAX_CHARS = 6000`、`DIGEST_TIMEOUT_BASE/PER_1K/MAX`；`digest_timeout(input_chars) -> float`；`build_session_digest` 超时时抛 `TimeoutError`
 
 - [ ] **Step 1: 写失败的测试**
 
-创建 `backend/tests/test_extract_memory_agent.py`：
+追加到 `backend/tests/test_session_digest_agent.py` 末尾：
 
 ```python
-import asyncio
-import json
-import logging
-
-import pytest
-
-import backend.agents.agent.extract_memory_agent as em
-
-REFINED = '[{"text": "用户想练习一元一次方程", "tags": ["用户需求"]}]'
+def test_long_records_are_truncated():
+    text = sd.format_records([{"id": 1, "user_text": "问" * 500, "model_text": "答" * 500}])
+    assert "问" * sd.RECORD_USER_MAX_CHARS + "…" in text
+    assert "答" * sd.RECORD_MODEL_MAX_CHARS + "…" in text
 
 
-class FakeLLM:
-    """记录收到的消息；delay 模拟远程调用的耗时"""
-
-    def __init__(self, delay: float = 0.0):
-        self.delay = delay
-        self.messages = None
-
-    async def ainvoke(self, messages):
-        self.messages = messages
-        await asyncio.sleep(self.delay)
-        return type("Response", (), {"content": REFINED})()
-
-
-@pytest.fixture
-def fake_llm(monkeypatch):
-    llm = FakeLLM()
-    monkeypatch.setattr(em, "build_extract_memory_agent", lambda: llm)
-    monkeypatch.setattr(em, "load_skill", lambda name: "精炼协议")
-    return llm
-
-
-def _unit(user: str, model: str) -> dict:
-    return {"memory": {"user_memory": user, "model_memory": model}, "timestamp": 0}
-
-
-def test_short_text_is_untouched():
-    assert em._flatten_memories([_unit("问", "答")]) == [{"user_memory": "问", "model_memory": "答"}]
-
-
-def test_long_text_is_truncated():
-    [flat] = em._flatten_memories([_unit("问" * 5000, "答" * 5000)])
-    assert flat["user_memory"] == "问" * em.USER_MEMORY_MAX_CHARS + "…"
-    assert flat["model_memory"] == "答" * em.MODEL_MEMORY_MAX_CHARS + "…"
+def test_oldest_records_are_dropped_when_input_is_too_long():
+    """整体超长时丢最早的，保住最近的：最近发生的事对后续对话更有用"""
+    many = [{"id": i, "user_text": f"第{i}问" + "x" * 190, "model_text": "y" * 290} for i in range(60)]
+    text = sd.format_records(many)
+    assert len(text) <= sd.DIGEST_INPUT_MAX_CHARS
+    assert "第59问" in text and "第0问" not in text
 
 
 def test_timeout_grows_with_input_and_is_capped():
-    assert em.refine_timeout(0) == em.REFINE_TIMEOUT_BASE
-    assert em.refine_timeout(1000) == em.REFINE_TIMEOUT_BASE + em.REFINE_TIMEOUT_PER_1K
-    assert em.refine_timeout(10**6) == em.REFINE_TIMEOUT_MAX
+    assert sd.digest_timeout(0) == sd.DIGEST_TIMEOUT_BASE
+    assert sd.digest_timeout(1000) == sd.DIGEST_TIMEOUT_BASE + sd.DIGEST_TIMEOUT_PER_1K
+    assert sd.digest_timeout(10 ** 6) == sd.DIGEST_TIMEOUT_MAX
 
 
-async def test_llm_receives_truncated_input(fake_llm):
-    await em.get_extract_memory([_unit("问", "答" * 5000)])
-    [sent] = json.loads(fake_llm.messages[1].content)
-    assert len(sent["model_memory"]) == em.MODEL_MEMORY_MAX_CHARS + 1
+async def test_slow_model_times_out(monkeypatch, caplog):
+    """LLM 客户端本身没有超时，卡住的请求会一直挂着；摘要必须自己限时"""
+    import asyncio
+    import logging
+
+    class SlowLLM:
+        async def ainvoke(self, messages):
+            await asyncio.sleep(1.0)
+    _patch(monkeypatch, SlowLLM())
+    monkeypatch.setattr(sd, "digest_timeout", lambda chars: 0.05)
+
+    with caplog.at_level(logging.WARNING):
+        try:
+            await sd.build_session_digest(RECORDS)
+            raise AssertionError("应当超时")
+        except TimeoutError:
+            pass
+    assert "会话摘要超时" in caplog.text
 
 
-async def test_slow_llm_times_out(fake_llm, monkeypatch, caplog):
-    """LLM 客户端本身没有超时，卡住的请求会一直挂着；精炼必须自己限时"""
-    fake_llm.delay = 1.0
-    monkeypatch.setattr(em, "refine_timeout", lambda chars: 0.05)
-    with caplog.at_level(logging.WARNING), pytest.raises(TimeoutError):
-        await em.get_extract_memory([_unit("问", "答")])
-    assert "记忆精炼超时" in caplog.text
-
-
-async def test_success_logs_input_size_and_duration(fake_llm, caplog):
+async def test_success_logs_input_size_and_duration(monkeypatch, caplog):
+    import logging
+    _patch(monkeypatch, FakeLLM())
     with caplog.at_level(logging.INFO):
-        result = await em.get_extract_memory([_unit("问", "答")])
-    assert result == [{"text": "用户想练习一元一次方程", "tags": ["用户需求"]}]
-    assert "记忆精炼完成" in caplog.text and "耗时" in caplog.text
-```
-
-在 `backend/tests/test_memory_manager.py` 末尾追加：
-
-```python
-async def test_refine_timeout_keeps_item_pending_without_traceback(manager, monkeypatch, caplog):
-    """超时已经在精炼函数里记过一条 WARNING，这里只保留条目，不再重复打一遍错误堆栈"""
-    async def timeout(units):
-        raise TimeoutError
-    monkeypatch.setattr(mm, "get_extract_memory", timeout)
-
-    await _fill_pending(manager, 1)
-    with caplog.at_level(logging.INFO):
-        assert await manager.drain_pending() == 0
-    assert len(await manager.short_term_memory.get_pending(USER, SESSION)) == 1
-    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        await sd.build_session_digest(RECORDS)
+    assert "会话摘要完成" in caplog.text and "耗时" in caplog.text
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
-Run: `cd backend && python -m pytest tests/test_extract_memory_agent.py tests/test_memory_manager.py -v`
-Expected: 6 failed。新文件 5 个，报 `AttributeError`（找不到 `USER_MEMORY_MAX_CHARS` 等）或断言失败；追加的那 1 个会失败，因为现有代码对超时也打了一条 ERROR。`test_short_text_is_untouched` 本来就能通过。
+Run: `cd backend && python -m pytest tests/test_session_digest_agent.py -v`
+Expected: 5 failed（`AttributeError`：模块里还没有 `RECORD_USER_MAX_CHARS`、`digest_timeout` 等）
 
-- [ ] **Step 3: 实现截断、限时与耗时日志**
+- [ ] **Step 3: 加上常量与截断**
 
-修改 `backend/agents/agent/extract_memory_agent.py`：
-
-1. 在 `import json` 前后补上 `import asyncio` 与 `import time`
-2. 在 `load_env()` 之后加上常量：
+在 `backend/agents/agent/session_digest_agent.py` 顶部补上 `import asyncio`、`import time`，并在 `load_env()` 之后加入：
 
 ```python
-# 精炼只需要知道「用户问了什么、得到了什么帮助」，Agent 的完整回答（例如整套变式题加解析）截断即可。
-# 输入越短，精炼越快、越省钱
-USER_MEMORY_MAX_CHARS = 1000
-MODEL_MEMORY_MAX_CHARS = 500
+# 单条记录截断：摘要只需要知道问过什么、卡在哪，不需要完整的解题过程
+RECORD_USER_MAX_CHARS = 200
+RECORD_MODEL_MAX_CHARS = 300
+# 一次摘要的输入上限：超过就从最早的记录开始丢，保住最近的
+DIGEST_INPUT_MAX_CHARS = 6000
 
-# 单次精炼的限时：基础 20 秒，每千字加 10 秒，最多 60 秒。
+# 单次摘要的限时：基础 20 秒，每千字加 10 秒，最多 60 秒。
 # LLM 客户端本身没有超时（httpx Timeout(None)），不设的话卡住的请求会一直挂着
-REFINE_TIMEOUT_BASE = 20.0
-REFINE_TIMEOUT_PER_1K = 10.0
-REFINE_TIMEOUT_MAX = 60.0
+DIGEST_TIMEOUT_BASE = 20.0
+DIGEST_TIMEOUT_PER_1K = 10.0
+DIGEST_TIMEOUT_MAX = 60.0
 ```
 
-3. 用下面的代码替换原来的 `_flatten_memories`（新增 `_truncate` 和 `refine_timeout`）：
+用下面的内容替换原来的 `format_records`（顺带加上 `_truncate` 与 `digest_timeout`）：
 
 ```python
 def _truncate(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[:limit] + '…'
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
-def _flatten_memories(memories: list[dict]) -> list[dict[str, str]]:
+def format_records(records: list[dict]) -> str:
     """
-    把 MemoryUnit（{'memory': {...}, 'timestamp': ...}）压平成
-    SKILL.md 示例里的 {'user_memory', 'model_memory'} 形式，避免多余层级干扰模型；
-    过长的文本在这里截断。
+    把原文排成带序号的对话，模型按时序阅读。
+    每条先截断，整体仍然超长时从最早的记录开始丢——最近发生的事对后续对话更有用。
     """
-    flat: list[dict[str, str]] = []
-    for item in memories:
-        unit = item.get('memory', {}) if isinstance(item, dict) else {}
-        flat.append({
-            'user_memory': _truncate(unit.get('user_memory', ''), USER_MEMORY_MAX_CHARS),
-            'model_memory': _truncate(unit.get('model_memory', ''), MODEL_MEMORY_MAX_CHARS),
-        })
-    return flat
+    blocks = [
+        f"{index}. 用户：{_truncate(r['user_text'], RECORD_USER_MAX_CHARS)}\n"
+        f"   助手：{_truncate(r['model_text'], RECORD_MODEL_MAX_CHARS)}"
+        for index, r in enumerate(records, 1)
+    ]
+    while len(blocks) > 1 and sum(len(b) + 1 for b in blocks) > DIGEST_INPUT_MAX_CHARS:
+        blocks.pop(0)
+    return "\n".join(blocks)
 
 
-def refine_timeout(input_chars: int) -> float:
-    """按输入长度给单次精炼限时"""
-    return min(REFINE_TIMEOUT_BASE + input_chars / 1000 * REFINE_TIMEOUT_PER_1K, REFINE_TIMEOUT_MAX)
+def digest_timeout(input_chars: int) -> float:
+    """按输入长度给单次摘要限时"""
+    return min(DIGEST_TIMEOUT_BASE + input_chars / 1000 * DIGEST_TIMEOUT_PER_1K, DIGEST_TIMEOUT_MAX)
 ```
 
-4. `get_extract_memory` 里，从 `system_body = load_skill(...)` 到 `return` 的部分替换为：
+- [ ] **Step 4: 给调用加上限时**
+
+`build_session_digest` 里，从 `system_body = load_skill(...)` 到 `return` 的部分替换为：
 
 ```python
-    system_body = load_skill("memory_refinement")
-    llm = build_extract_memory_agent()
-    payload = json.dumps(_flatten_memories(memory), ensure_ascii=False)
-    timeout = refine_timeout(len(payload))
+    system_body = load_skill("session_digest")
+    llm = build_session_digest_agent()
+    payload = format_records(records)
+    timeout = digest_timeout(len(payload))
 
     started = time.perf_counter()
     try:
@@ -3509,67 +4023,171 @@ def refine_timeout(input_chars: int) -> float:
             timeout=timeout,
         )
     except TimeoutError:
-        logger.warning("记忆精炼超时：输入 %s 字，限时 %.0f 秒", len(payload), timeout)
+        logger.warning("会话摘要超时：输入 %s 字，限时 %.0f 秒", len(payload), timeout)
         raise
-    logger.info("记忆精炼完成：输入 %s 字，耗时 %.1f 秒", len(payload), time.perf_counter() - started)
-    return _parse_refined_memories(response.content)
+    logger.info("会话摘要完成：输入 %s 字，耗时 %.1f 秒", len(payload), time.perf_counter() - started)
+
+    content = response.content if isinstance(response.content, str) else ""
+    return content.strip()
 ```
 
-用 `asyncio.wait_for` 包住整个 `ainvoke`，客户端自己的重试也算在这次限时里。超时后，`wait_for` 会取消底层的 httpx 请求。
-
-- [ ] **Step 4: `_archive_one` 单独处理超时**
-
-在 `backend/agents/memory/memory_manager.py` 的 `_archive_one` 里，捕获精炼异常的地方加一个分支，放在 `except Exception` 之前：
-
-```python
-        try:
-            refined = await get_extract_memory([unit])
-        except TimeoutError:
-            # 精炼函数已经记过一条带输入长度的 WARNING，这里不再重复打错误堆栈
-            return False
-        except Exception as e:
-            logger.error("记忆精炼失败，留在 pending 待重试: %s", e, exc_info=True)
-            return False
-```
+用 `asyncio.wait_for` 包住整个 `ainvoke`，客户端自己的重试也算在这次限时里；超时后 `wait_for` 会取消底层的 httpx 请求。
 
 - [ ] **Step 5: 运行测试确认通过**
 
-Run: `cd backend && python -m pytest tests/test_extract_memory_agent.py tests/test_memory_manager.py -v`
-Expected: 18 passed
-
-Run: `cd backend && python -m pytest tests/ -v`
-Expected: 全部 passed
+Run: `cd backend && python -m pytest tests/test_session_digest_agent.py -v`
+Expected: 9 passed
 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add backend/agents/agent/extract_memory_agent.py backend/agents/memory/memory_manager.py backend/tests/test_extract_memory_agent.py backend/tests/test_memory_manager.py
-git commit -m "feat: 记忆精炼截断输入并按长度限时，记录耗时"
+git add backend/agents/agent/session_digest_agent.py backend/tests/test_session_digest_agent.py
+git commit -m "feat: 会话要点生成加入输入截断与按长度限时"
 ```
 
-- [ ] **Step 7: 上线后看数据，再决定下一步**
+- [ ] **Step 7: 上线后看数据**
 
-服务跑一段时间后统计日志：
+服务跑一段时间后：
 
 ```bash
-grep -c "记忆精炼完成" logs/*.log
-grep "记忆精炼超时" logs/*.log
+grep "会话摘要完成" logs/*.log | tail -20
+grep "会话摘要超时" logs/*.log
 ```
 
-按结果决定：
+几乎不超时、耗时稳定，就不用再动；超时集中在输入长的会话，把 `DIGEST_INPUT_MAX_CHARS` 调小；耗时普遍偏长，考虑把 `DIGEST_MODEL` 配成更便宜更快的模型。
 
-| 观察到的情况 | 说明 | 下一步 |
-|---|---|---|
-| 几乎没有超时，耗时稳定 | 截断加限时已经够用 | 不做别的 |
-| 超时集中在输入长的条目 | 长度确实是主因 | 调小 `MODEL_MEMORY_MAX_CHARS` |
-| 超时与长度无关、零星出现 | 服务端偶发卡顿 | 保持现状，靠 pending 重试即可 |
-| 耗时普遍偏长，pending 积压 | 串行调用太多 | 考虑后续可选的改动（见下） |
+---
 
-**后续可选的改动**（先不做，数据支持时再做）：
-- **按会话合并调度**：同一个会话同一时刻只跑一个归档协程；启动恢复只做登记、立即返回，不再阻塞启动（Task 7 目前是 `await drain_pending()`）。它还能消除启动恢复与新产生的溢出同时处理同一条记录的问题
-- **批量精炼、按来源编号对齐**：每条输出注明来自哪几条输入（`"sources": [0, 2]`），把 N 次调用降为 1 次；对齐失败就退回逐条处理
-- **全局并发上限**：多个会话同时溢出时，限制同时进行的 LLM 调用数
-- **失败次数上限**：同一条记录失败 3 次后移到 dead 列表，不再每次启动都重试
+## Task 16: 会话要点注入请求上下文
+
+**这个任务解决什么问题**：`memory_digest` 里已经有要点了，但没有人读它。现在每次请求只把最近 3 轮原文拼进 `user_input`，超出窗口的内容对模型来说等于没发生过。
+
+**怎么做**：`_format_memory_context` 多接一个参数，把要点放在最近对话之前；两个端点（`analyse` 与 `_stream_generator`）都从 `get_memory_for_planner` 的返回值里取。
+
+**为什么要点在前、原文在后**：要点是压缩过的早期内容，原文是刚刚发生的对话。按时间顺序读，模型更容易把「以前怎么样」和「现在问什么」区分开。
+
+**做完之后**：一个持续很久的会话，早期的关键信息不会因为窗口滚动而丢失。
+
+**前后依赖**：用到 Task 12 的 `session_digest`。与 Task 13 的画像注入互不影响：画像进 system prompt（稳定背景），会话要点进 `user_input`（本次会话的经过）。
+
+**实现时注意**：注入的内容会进入**每一轮** ReAct 的输入，长度直接换算成 token 成本。所以要点在 SKILL.md 里限定了 300 字以内，原文固定只取 3 轮。
+
+**Files:**
+- Modify: `backend/api/user_api/agent_api.py`
+- Test: `backend/tests/test_memory_context.py`
+
+**Interfaces:**
+- Consumes: Task 12 的 `get_memory_for_planner()['session_digest']`
+- Produces: `_format_memory_context(short_memories, session_digest="") -> str`
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `backend/tests/test_memory_context.py`：
+
+```python
+"""注入 prompt 的上下文怎么拼：会话要点在前，最近几轮原文在后。"""
+from backend.api.user_api.agent_api import _format_memory_context
+
+
+def _unit(user_text: str, model_text: str) -> dict:
+    return {"memory": {"user_memory": user_text, "model_memory": model_text}}
+
+
+RECENT = [_unit("第三问", "第三答"), _unit("第二问", "第二答"), _unit("第一问", "第一答")]  # 新的在前
+
+
+def test_nothing_to_inject():
+    assert _format_memory_context([], "") == ""
+
+
+def test_only_recent_dialogue():
+    out = _format_memory_context(RECENT)
+    assert "【本次会话要点】" not in out
+    assert out.index("第一问") < out.index("第二问") < out.index("第三问"), "原文按从旧到新展示"
+
+
+def test_digest_comes_before_recent_dialogue():
+    out = _format_memory_context(RECENT, "学生在一元一次方程上容易弄错符号。")
+    assert out.index("【本次会话要点】") < out.index("【近期对话记录】")
+    assert "学生在一元一次方程上容易弄错符号。" in out
+
+
+def test_only_digest():
+    out = _format_memory_context([], "学生偏好不要与原题雷同。")
+    assert out == "【本次会话要点】\n学生偏好不要与原题雷同。"
+
+
+def test_at_most_three_rounds():
+    many = [_unit(f"问{i}", f"答{i}") for i in range(10)]
+    out = _format_memory_context(many)
+    assert "问3" not in out and "问2" in out, "只取最近 3 轮，避免每次请求都把整段历史塞进去"
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `cd backend && python -m pytest tests/test_memory_context.py -v`
+Expected: 3 failed（`_format_memory_context() takes 1 positional argument but 2 were given`）
+
+- [ ] **Step 3: 实现**
+
+用下面的内容替换 `backend/api/user_api/agent_api.py` 里的 `_format_memory_context`：
+
+```python
+def _format_memory_context(short_memories: list, session_digest: str = "") -> str:
+    """
+    拼出注入 user_input 的上下文：先放本次会话的要点，再放最近 3 轮原文。
+    要点是早期对话压缩来的，原文是刚刚发生的，两者都不经过 LLM，直接拼接。
+    """
+    lines: list[str] = []
+    if session_digest:
+        lines.append("【本次会话要点】")
+        lines.append(session_digest)
+
+    recent = short_memories[:3]
+    if recent:
+        if lines:
+            lines.append("")
+        lines.append("【近期对话记录】")
+        for mem in reversed(recent):  # 从旧到新展示，保持时序
+            user_mem = mem.get('memory', {}).get('user_memory', '')
+            model_mem = mem.get('memory', {}).get('model_memory', '')
+            if user_mem:
+                lines.append(f"用户：{user_mem}")
+            if model_mem:
+                lines.append(f"助手：{model_mem}")
+    return "\n".join(lines)
+```
+
+两个端点里的调用都改成把要点传进去：
+
+```python
+        memory_context = _format_memory_context(short_memories, memory_data.get('session_digest', ''))
+```
+
+`analyse` 里这一段有 8 个空格缩进，`_stream_generator` 里是 4 个，改的时候注意别把缩进带错。
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `cd backend && python -m pytest tests/ -v`
+Expected: 全部通过
+
+- [ ] **Step 5: 端到端人工验证**
+
+启动服务，用同一个 `user_id` 和 `session_id` 连续对话 12 轮以上（窗口是 10 条，第 11 轮起开始归档），然后查数据库：
+
+```bash
+SELECT COUNT(*) FROM memory_record WHERE user_id = ? AND session_id = ?;
+SELECT summary, covered_until_id FROM memory_digest WHERE user_id = ? AND session_id = ?;
+```
+
+Expected: `memory_record` 里有归档的原文；攒够 5 条后 `memory_digest` 里出现要点。再发一次请求，日志里 `user_input` 的开头应当能看到「【本次会话要点】」。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add backend/api/user_api/agent_api.py backend/tests/test_memory_context.py
+git commit -m "feat: 请求上下文注入会话要点"
+```
 
 ---
 
@@ -3583,14 +4201,16 @@ grep "记忆精炼超时" logs/*.log
 | 2 | 触发溢出的请求不被摘要拖慢 | `test_memory_manager.py::test_request_path_does_not_wait_for_archive` |
 | 3 | 归档中的记忆读不到 | `test_short_term_memory.py::test_evicted_item_is_invisible_to_readers` |
 | 4 | 崩溃后重启补做且不重复 | `test_memory_manager.py::test_drain_pending_recovers_orphans` |
-| 5 | 生题时注入向量召回 | `test_recall_injection.py::test_question_set_tool_injects_recall` |
+| 5 | 会话要点进入请求上下文 | `test_memory_context.py::test_digest_comes_before_recent_dialogue` |
+| 5b | 原文只增不改，要点从原文重算 | `test_memory_manager.py::test_digest_is_rebuilt_from_raw_records` |
+| 5c | 归档重试不产生重复记录 | `test_memory_manager.py::test_same_item_archived_twice_writes_one_row` |
 | 6 | 偏好二次命中才写画像 | `test_profile_candidates.py::test_second_offer_promotes` |
 | 7 | 新知识点不冲掉已有 | `test_profile_merge.py::test_old_keys_are_never_dropped` |
 | 7b | notes 追加而非覆盖，且限长 | `test_profile_merge.py::test_notes_are_appended_not_replaced`、`::test_notes_are_capped_dropping_oldest` |
 | 7c | 词表外的键转存 notes，不静默失效 | `test_profile_schema_skill.py::test_unknown_key_is_routed_to_notes` |
 | 7d | notes 不进 system prompt | `test_react_agent_async.py::test_format_profile_excludes_notes` |
 | 8 | 事件循环无同步 LLM 调用 | `test_react_agent_async.py::test_react_think_node_is_coroutine_function` |
-| 9 | 精炼调用不会无限挂起，超时的条目留在 pending | `test_extract_memory_agent.py::test_slow_llm_times_out`、`test_memory_manager.py::test_refine_timeout_keeps_item_pending_without_traceback` |
+| 9 | 摘要调用不会无限挂起，失败也不影响已落库的原文 | `test_session_digest_agent.py::test_slow_model_times_out`、`test_memory_manager.py::test_digest_failure_does_not_lose_records` |
 
 全量跑一遍：
 

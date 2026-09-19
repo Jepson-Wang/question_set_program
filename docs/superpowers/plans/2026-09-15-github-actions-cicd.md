@@ -1297,7 +1297,7 @@ CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port
 - **分层缓存**：Dockerfile 的每条指令是一层，某一层的输入没变，就直接复用上次的结果。先 `COPY requirements.txt` 再 `pip install`，最后才 `COPY backend/`：只改业务代码时，最慢的「安装依赖」这一层能命中缓存。顺序反过来的话，改一行代码都要重装全部依赖
 - **`ENV`**：`PYTHONUNBUFFERED=1` 让日志立即输出，不在缓冲区里攒着，否则 `docker logs` 看不到最新的日志；`PIP_NO_CACHE_DIR=1` 不在镜像里留 pip 缓存，镜像更小；`ANONYMIZED_TELEMETRY=False` 关掉 chromadb 的遥测
 - **非 root 用户**：容器默认以 root 运行，应用一旦被攻破，攻击者在容器里就是 root。`USER 10001` 用数字 UID，而不是用户名：有些环境（比如 k8s 的 `runAsNonRoot`）只认数字，hadolint 也会对用户名给出提示（DL3066）
-- **只把需要写入的目录交给应用用户**：向量库目录 `/app/vector_memory` 和日志目录 `/app/backend/logs`，其余代码对应用用户只读。编写计划时核对过：LlamaIndex 需要的 NLTK 数据随 wheel 发布，运行时不会去写包目录
+- **只把需要写入的目录交给应用用户**：向量库目录 `/app/vector_memory`（留给 RAG，记忆层已改存 MySQL）和日志目录 `/app/backend/logs`，其余代码对应用用户只读。编写计划时核对过：LlamaIndex 需要的 NLTK 数据随 wheel 发布，运行时不会去写包目录
 - **`HEALTHCHECK`**：Docker 每 30 秒访问一次 `/health`，连续 3 次失败就把容器标记为 unhealthy。slim 镜像里没有 curl，所以用 Python 自带的 urllib。`start-period=60s` 给应用留出启动时间，这期间的失败不计数
 
 - [ ] **Step 2: 写 .dockerignore**
@@ -1869,12 +1869,11 @@ REDIS_PORT=6379
 REDIS_PASSWORD=
 REDIS_USERNAME=
 
-# ---------- 向量记忆（Chroma）----------
+# ---------- 向量库目录（留给 RAG）----------
+# 记忆计划改版后，对话记忆存 MySQL，这个目录当前没有使用者；
+# 留着是因为它是镜像里唯一 chown 给 uid 10001 的可写数据目录，RAG 上线时把 RAG_DB_DIR 指到它下面即可。
 # 相对路径以进程的工作目录为准；容器里工作目录是 /app，对应 docker-compose.yml 挂载的卷
 VECTOR_MEMORY_DIR=./vector_memory
-# CHROMA_COLLECTION=vector_store_collection
-# CHROMA_CHUNK_SIZE=512
-# CHROMA_CHUNK_OVERLAP=48
 ```
 
 `.env.example` 要提交，`.env` 永远不提交。前者告诉别人「需要配置哪些项」，后者保存真实的值。之所以取名 `.env.example`，而不是 `example.env`，是因为 `.gitignore` 里有一条 `*.env`，后者会被它忽略掉。
