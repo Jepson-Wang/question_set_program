@@ -10,7 +10,7 @@
 
 为什么必须开子进程见 backend/tests/isolation.py 的模块注释。
 """
-import os
+import subprocess
 
 from backend.core.config import BACKEND_ROOT, ENV_PATH
 from backend.tests.isolation import run_isolated, write_env_file
@@ -116,7 +116,25 @@ def test_redis_url_carries_credentials_without_prior_load(tmp_path):
         "redis://user-from-dotenv:pw-from-dotenv@dotenv.invalid:6380/0"
 
 
-def test_dotenv_is_not_committed():
-    """回归：.env 里是真密钥，一旦进了版本库就等于公开"""
-    assert os.system(f'git -C "{BACKEND_ROOT.parent}" check-ignore -q backend/.env') == 0, \
-        "backend/.env 没有被 .gitignore 忽略"
+def test_no_dotenv_is_tracked_by_git():
+    """
+    回归：.env 里是真密钥，一旦提交进这个公开仓库就等于公开，
+    而且事后删掉也没用——它永远留在 git 历史里，只能换密钥。
+
+    查的是索引（有没有被跟踪），不是忽略规则：被忽略只是手段，
+    没进版本库才是要保住的那个性质。
+    """
+    tracked = subprocess.run(
+        ["git", "-C", str(BACKEND_ROOT.parent), "ls-files", "--", "*.env"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert tracked.returncode == 0, tracked.stderr
+    assert not tracked.stdout.strip(), f"这些 .env 已被 git 跟踪：{tracked.stdout}"
+
+
+def test_gitignore_still_covers_dotenv():
+    """忽略规则本身别被谁顺手删了——删掉之后下一个 git add . 就会把密钥带进去"""
+    text = (BACKEND_ROOT.parent / ".gitignore").read_text(encoding="utf-8")
+    rules = [ln.strip() for ln in text.splitlines()
+             if ln.strip() and not ln.lstrip().startswith("#")]
+    assert {"*.env", "backend/.env"} & set(rules), f".gitignore 里没有 .env 的规则：{rules}"
