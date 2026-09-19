@@ -1,10 +1,9 @@
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # 补充导入
 from sqlalchemy.future import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from backend.model import AsyncSessionLocal  # 导入会话工厂
 from backend.model.user_profile import UserProfile
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
 from backend.schemas.request.user_profile_update_request import UserProfileUpdateRequest
 from backend.schemas.response.user_profile_response import UserProfileResponse

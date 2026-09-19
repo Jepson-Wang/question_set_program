@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **学生学情分析系统** — An AI-powered tutoring backend. Users submit questions or requests; a ReAct agent routes to the appropriate skill (knowledge extraction, variant question generation, general Q&A, or memory retrieval), while a three-tier memory system maintains conversational continuity.
 
-All code lives under `backend/`. There is no frontend in this repository.
+Backend code lives under `backend/`. A Vue 3 + Vite frontend lives under `frontend/`; it is not covered by these notes.
 
 ## Running the Server
 
@@ -71,30 +71,34 @@ POST /agent/analyse
 
 `SKILL_MAP` (keyed by `skill.name`) is the single dispatch table; add new skills here.
 
-**`agents/agent/graph_build.py`** — Old linear planner architecture, fully commented out. Superseded by `react_agent.py`.
-
 ### Memory System (`backend/agents/memory/`)
 
 Three-tier architecture:
 
 | Tier | Storage | Contents | Lifecycle |
 |---|---|---|---|
-| Short-term | Redis hash `user:{id}:session:{id}` | Raw `{user_memory, model_memory}` pairs | 24h TTL, max 10 entries |
+| Short-term | Redis LIST `stm:{user_id}:{session_id}` | Raw `{user_memory, model_memory}` pairs | 24h TTL, max 10 entries |
+| Archive | MySQL `memory_record` / `memory_digest` | Full dialogue text (append-only) + a per-session summary | Permanent |
 | Long-term | MySQL `user_profile` | Grade, subject, weak_points, preferences | Persistent per user |
-| Vector | Chroma (local `chroma_db/`) | LLM-refined memory summaries with tags | Written when short-term overflows |
 
-**Overflow flow**: when short-term hits `max_memory_size`, the oldest N records are passed through `extract_memory_agent` (converts to 3rd-person summaries with tags), stored in Chroma, then deleted from Redis.
+**Overflow flow**: `add_memory` pushes to the Redis LIST; when the window exceeds `max_memory_size`, a single Lua `EVAL` atomically moves the oldest entries into a pending queue. A background `asyncio.Task` writes each one into `memory_record` (deduplicated by a sha1 of the raw entry, so an archive retry cannot produce a second row), then acks it out of pending. Anything left in pending is redone by `drain_pending()` on the next startup.
 
-`MemoryManager.get_memory_for_planner()` returns both short + long-term memory. The API uses only `short_memory` (last 3 entries) for prompt injection; `query_memory_skill` uses `get_latest_memories()` directly.
+**Session digest**: every `DIGEST_EVERY` (5) newly archived records, `_refresh_digest` rebuilds the session summary by calling `session_digest_agent` — **always over the raw records, never over the previous summary**, so the text cannot drift across successive compressions. A digest failure is logged and retried on the next batch; the raw records are already durable.
+
+`MemoryManager.get_memory_for_planner()` returns `short_memory`, `long_memory` and `session_digest`. The API injects the digest plus the last 3 raw turns into `user_input`; `query_memory_skill` uses `get_latest_memories()` directly.
+
+There is **no vector store in the memory layer**. It used to refine memories with an LLM and write them to Chroma; that was replaced because durable facts belong in `user_profile`, per-session volume is small, and Chroma's data was outside `mysqldump`. Chroma remains a dependency for the RAG knowledge base only.
 
 ### LLM Configuration (`agents/agent/get_llm.py`)
 
-`get_llm(model, streaming)` returns a `ChatOpenAI` instance pointed at the DashScope OpenAI-compatible endpoint. Results are cached by argument via `@singleton_method`. Per-agent model overrides: `PLANNER_MODEL`, `EXTRACT_MODEL` env vars.
+`get_llm(model, streaming)` returns a `ChatOpenAI` instance pointed at the DashScope OpenAI-compatible endpoint. Results are cached by argument via `@singleton_method`. Per-agent model overrides: `PLANNER_MODEL`, `EXTRACT_MODEL`, `DIGEST_MODEL` env vars.
+
+`get_embedding_model()` lives in `agents/agent/embedding.py`, deliberately **not** in `get_llm.py`: importing llama-index costs ~1.5s and 1400+ modules, and nothing on the request path needs embeddings. Only the RAG knowledge base imports it.
 
 ### Singleton Patterns (`core/single_tool.py`)
 
 - `singleMeta` — metaclass for class-level singletons (used by `MemoryManager`, Redis client)
-- `@singleton_method` — function-level cache keyed by arguments (used by `get_llm`, `build_extract_memory_agent`)
+- `@singleton_method` — function-level cache keyed by arguments (used by `get_llm`, `build_session_digest_agent`)
 
 ### API Endpoints
 
@@ -128,4 +132,4 @@ JWT is validated via `api/dependencies.py`; all agent endpoints require a valid 
 - All I/O (DB, Redis, LLM calls) is **async throughout**. Keep new code async.
 - **Adding a new Skill**: create a `BaseTool` subclass in `agents/skills/`, add an instance to `SKILLS` list in `agents/skills/__init__.py`. It will be auto-registered in `SKILL_MAP` and bound to the LLM.
 - **Memory writes always use the original user text**, not the memory-augmented `user_input`, to prevent context pollution across sessions.
-- `graph_build.py` is dead code — do not reference or restore it.
+- The old linear planner architecture (`graph_build.py`, `planner_agent.py`, `analyse_agent.py`, `image_gene_agent.py`, `prompt.py`) was deleted in favour of `react_agent.py`. Do not restore it; check git history if you need to see what it did.

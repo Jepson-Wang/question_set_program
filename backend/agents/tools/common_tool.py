@@ -1,4 +1,4 @@
-from typing import Type, Any
+from typing import Type
 
 from backend.agents.agent.common_agent import async_common_tool
 from langchain_core.tools import BaseTool

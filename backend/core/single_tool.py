@@ -12,7 +12,7 @@ class singleMeta(type):
     """
     类级别单例元类。
     每个使用此元类的类拥有独立的锁，避免不同类的实例化操作互相阻塞。
-    适用于基础设施类（MemoryManager、VectorStoreManager 等），实例永久驻留。
+    适用于基础设施类（MemoryManager 等），实例永久驻留。
     """
     _instances: dict = {}
     _locks: dict = {}

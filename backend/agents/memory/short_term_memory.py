@@ -1,28 +1,18 @@
 """
-在这里面进行短期记忆的开发
-主要包括如下功能：
-1. 短期记忆的增加和删除
-2. 直接获取前n个短期记忆，或者通过元数据进行索引
-3. 将短期记忆存储到Redis中，按用户ID和会话ID进行索引
+短期会话记忆：Redis LIST 实现。
 
-主要技术分析：
-1. 使用Redis哈希结构存储记忆，键格式为：user:{user_id}:session:{session_id}
-2. 每个会话的记忆使用列表存储，保持最新的记忆在列表头部
-3. 使用 redis.asyncio 进行异步Redis操作
-4. 支持设置最大记忆长度，超过后自动删除最早的记忆
+为什么是 LIST 而不是「hash 字段里的 JSON 字符串」：
+旧实现每次写入都要「读出整个列表 -> Python 里 insert -> 整个写回」，
+是一次没有任何保护的 read-modify-write，两个并发请求会丢消息（读-读-写-写）。
+改成 LIST 后，写入是 Redis 服务端的原子操作。
 
-存储结构设计：
-- Redis键：user:{user_id}:session:{session_id}
-- 字段：
-  - memory_list: 存储记忆列表的JSON字符串
-  - last_updated: 最后更新时间戳
+淘汰同样在服务端完成：LPUSH 与「超限时 RPOPLPUSH 到 pending 队列」
+打包进一次 Lua EVAL 原子执行。被淘汰的条目在这一刻就已经物理移出窗口，
+后续的归档读不到它、也不会被新消息插入干扰，所以整条链路不需要任何锁。
 
-生产环境考虑：
-1. Redis连接池管理
-2. 错误处理和重试机制
-3. 内存使用监控
-4. 数据过期策略
-5. 备份和恢复机制
+存储结构：
+- stm:{user_id}:{session_id}          LIST，index 0 为最新，长度上限 max_memory_size
+- stm:pending:{user_id}:{session_id}  LIST，待归档队列，归档成功后 LREM 移除
 """
 import json
 from typing import Dict, List, Any, Optional
@@ -30,7 +20,7 @@ from datetime import datetime
 
 from backend.middleware.logging import get_logger
 from backend.utils.redis_client import get_redis_client
-from redis.exceptions import AuthenticationError, RedisError
+from redis.exceptions import RedisError
 
 logger = get_logger(__name__)
 
@@ -72,7 +62,7 @@ class ShortTermMemory:
             self,
             max_memory_size: int = 10,
             ttl: int = DEFAULT_TTL,
-            pending_tll = DEFAULT_PENDING_TTL
+            pending_ttl = DEFAULT_PENDING_TTL
     ):
         """
         初始化短期记忆模块
@@ -84,7 +74,7 @@ class ShortTermMemory:
         self.max_memory_size = max_memory_size
         self._client = get_redis_client().client
         self.ttl = ttl
-        self.pending_ttl = pending_tll
+        self.pending_ttl = pending_ttl
         self._push_script = None
 
     @staticmethod

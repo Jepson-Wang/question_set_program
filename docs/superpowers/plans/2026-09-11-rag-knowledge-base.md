@@ -100,7 +100,7 @@ python -c "import chromadb, llama_index.vector_stores.chroma, jieba, rank_bm25, 
 - 所有 I/O 保持 async；同步阻塞或 CPU 密集的调用（PDF 解析、BM25 检索与重建、LlamaIndex 向量库操作、写上传文件）投递到 `backend.core.executors.get_vector_executor()`，不要用 `run_in_executor(None, ...)`。
 - 所有目录相对 `backend/` 解析，不依赖当前工作目录：`RAG_DB_DIR` 默认 `rag_db`，`RAG_UPLOAD_DIR` 默认 `rag_uploads`，`RAG_EVAL_DIR` 默认 `rag_eval`。
 - 向量操作统一经 LlamaIndex：向量化用 `BaseEmbedding`，读写向量库用 `TextNode` 与 `VectorStoreQuery`。只有 `from_chroma` 创建 client 与 collection 时直接用 chromadb（要指定 cosine 空间）。
-- 向量一律归一化为单位长度；Chroma collection 使用 cosine 空间。LlamaIndex 返回的分数是 exp(-距离)，由适配层换算回余弦相似度，业务代码拿到的一律是余弦。
+- 向量一律归一化为单位长度；Chroma collection 使用 cosine 空间。LlamaIndex 返回的分数是 exp(-距离)，由适配层换算回余弦相似度，业务代码拿到的一律是余弦。（**记忆层已经不用向量库了**：对话记忆改存 MySQL 原文 + 会话要点，见记忆计划开头的设计变更。现在全项目只有 RAG 这一处用 Chroma，不存在两套阈值口径。）
 - 题目 id = `q_` + 规范化题干 sha1 的前 16 位；教材段 id = `k_` + 规范化文本 sha1 的前 16 位。
 - 检索参数：每路召回 20，融合后 30，最终 3，教材 2；RRF k = 60；重排分数阈值 0.3；教材相似度阈值 0.5。
 - 近似去重与防泄漏阈值：余弦相似度 0.95。
@@ -120,7 +120,7 @@ python -c "import chromadb, llama_index.vector_stores.chroma, jieba, rank_bm25, 
 |---|---|---|
 | Task 3 | `backend.core.executors.get_vector_executor()` | Task 2 |
 | Task 7 | 带记忆归档恢复与关停等待的 `core/hooks.py` | Task 16 |
-| Task 12 | `question_set_tool._arun` 接收 `user_id`，并注入记忆召回 `recall` | Task 16 |
+| Task 13 | ReAct system prompt 里的长期画像段（用户偏好由它提供，不再走工具层） | Task 16 |
 
 ## 任务顺序与阶段
 
@@ -228,6 +228,8 @@ python -c "import chromadb, llama_index.vector_stores.chroma, jieba, rank_bm25, 
 
 - [ ] **Step 1: 修复 chromadb 的导入**
 
+> **这一步已经做完了**（2026-09-15）：三个缺失的 `.pyd` 已经通过 `pip install --force-reinstall --no-deps --no-cache-dir grpcio==1.78.0 chromadb==1.5.5 onnxruntime==1.24.4` 补回，`import chromadb` 正常。下面保留排查过程，供以后再遇到时参考。**因此本计划里所有「chromadb 不可用时 X skipped」的分支都不会出现，实际看到的是「可用」那一档的数字。**
+
 ```bash
 cd backend
 python -c "import chromadb, llama_index.vector_stores.chroma; print('OK')"
@@ -258,6 +260,8 @@ python -c "import chromadb, llama_index.vector_stores.chroma; print('OK')"
 **这一步没解决之前**：依赖 chromadb 的测试会被明确跳过（全部任务做完时共 10 个），其余 RAG 任务都可以照常推进。
 
 - [ ] **Step 2: 安装依赖并回填版本**
+
+> **这一步也已经做完了**（2026-09-15）：jieba 0.42.1、rank-bm25 0.2.2、pypdf 6.18.0、python-docx 1.2.0、lxml 6.1.3 都已安装并写进 `requirements.txt`（提交 `f9d1cff`）。那次提交同时把 `asyncmy` 升到 0.2.12，并清掉了 25 个没用到的包，其中包括 `llama-index` 元包和它的几个子包——RAG 用到的 `llama-index-core` 与 `llama-index-vector-stores-chroma` 都保留着。
 
 ```bash
 pip install jieba rank_bm25 pypdf python-docx
@@ -499,7 +503,7 @@ async def probe_rerank(settings: RagSettings) -> None:
 
 
 async def probe_embedding(settings: RagSettings) -> None:
-    from backend.agents.agent.get_llm import get_embedding_model
+    from backend.agents.agent.embedding import get_embedding_model
 
     vectors = await get_embedding_model().aget_text_embedding_batch(["解方程 2x+3=7", "计算三角形的面积"])
     print(f"[embedding] 返回 {len(vectors)} 条，维度 {len(vectors[0])}")
@@ -967,7 +971,7 @@ git commit -m "feat: RAG 领域模型与内容哈希 id"
 - Test: `backend/tests/rag/test_vector_store.py`
 
 **Interfaces:**
-- Consumes: `get_vector_executor()`（记忆计划 Task 3）、`get_embedding_model()`（已有的 `get_llm.py`，返回 LlamaIndex 的 `BaseEmbedding`）、llama-index-core、llama-index-vector-stores-chroma
+- Consumes: `get_vector_executor()`（记忆计划 Task 3）、`get_embedding_model()`（已有的 `agents/agent/embedding.py`，返回 LlamaIndex 的 `BaseEmbedding`；它从 `get_llm.py` 拆出来单独放一个模块，是为了让 llama-index 那 1.5 秒的导入不落在服务启动路径上——记忆层改存 MySQL 后，只有 RAG 会用 embedding）、llama-index-core、llama-index-vector-stores-chroma
 - Produces:
   - `Embedder` 协议：`async embed(texts) -> list[list[float]]`
   - `l2_normalize(vec)`、`dot(a, b)`
@@ -1226,7 +1230,7 @@ class LlamaIndexEmbedder:
 
     def __init__(self, model=None, batch_size: int = 10):
         if model is None:
-            from backend.agents.agent.get_llm import get_embedding_model
+            from backend.agents.agent.embedding import get_embedding_model
             model = get_embedding_model()
         self._model = model
         self._batch_size = batch_size
@@ -5073,13 +5077,17 @@ git commit -m "feat: RAG 检索编排（并行召回、防泄漏、逐级降级�
 
 > **这个任务做什么**：让线上的「生成变式题」真正用上 RAG。`question_set_tool` 在抽取知识点之后调用检索，把结果整理成「参考真题」「相关知识点」两段文字（总长不超过 1200 字），拼进生题模型的 system prompt，并附上使用规则（参考题型和难度，不许照抄）。生成之后做防照抄检查：和参考题太像（相似度不低于 0.9）就带上提示重试一次。服务启动时加载词法索引。RAG 任何环节失败，生题都照常进行。
 >
-> **前置**：依赖记忆计划的 Task 7 和 Task 12，开工前先确认它们已经完成。
+> **前置**：依赖记忆计划的 Task 7 和 Task 13，开工前先确认它们已经完成。
 >
 > **做完之后**：用户调用生题接口时，背后会自动检索参考材料。这是 RAG 第一次对线上用户产生效果。
 
 生题前先检索，把结果整理成「参考真题」与「相关知识点」两段拼进 system prompt，交给模型自己决定怎么用。
 
-**前置：记忆计划 Task 7 与 Task 12 已完成。** Task 12 为 `question_set_tool` 注入了 `user_id` 并加入记忆召回 `recall`，这里在它的基础上扩展。system prompt 中各段的顺序是：生题剧本 → 参考材料 → 用户偏好。偏好放最后，作为最终的风格约束。
+**前置：记忆计划 Task 7 与 Task 13 已完成。**
+
+**用户偏好不在这一层拼。** 早先的记忆设计会在生题工具里做一次向量召回，把偏好塞进生题的 system prompt；记忆计划改版后偏好统一走 `user_profile`，由记忆计划 Task 13 注入 **ReAct 主循环**的 system prompt，生题工具只管「参考材料」这一段。这样每轮推理都带着偏好，而不是只有生题那一步带。
+
+**但 `user_id` 还是要传进工具**：`user_grade()` 要按年级过滤检索结果。`react_agent.tool_exec_node` 已经在给 `query_memory_tool` 和 `user_profile_*_tool` 注入 `user_id`，本任务 Step 5 把 `question_set_tool` 也加进去。
 
 **防照抄的阈值是 0.9，是实测定下来的**：
 
@@ -5100,11 +5108,12 @@ git commit -m "feat: RAG 检索编排（并行召回、防泄漏、逐级降级�
 - Create: `backend/agents/rag/lifecycle.py`
 - Modify: `backend/agents/agent/question_set_agent.py`
 - Modify: `backend/agents/tools/question_set_tool.py`
+- Modify: `backend/agents/agent/react_agent.py`（`tool_exec_node` 注入 `user_id`）
 - Modify: `backend/core/hooks.py`
 - Test: `backend/tests/rag/test_integration.py`
 
 **Interfaces:**
-- Consumes: Task 11 的 `get_rag_runtime`；Task 15 的 `retriever`；记忆计划 Task 12 的 `recall_context`
+- Consumes: Task 11 的 `get_rag_runtime`；Task 15 的 `retriever`
 - Produces:
   - `format_rag_context(ctx, max_chars=1200) -> str`、`copy_ratio(generated, reference) -> float`、`too_similar(generated, references, threshold=0.9) -> bool`
   - 常量 `QUESTIONS_HEADER`、`KNOWLEDGE_HEADER`、`USAGE_RULE`、`COPY_THRESHOLD`
@@ -5242,14 +5251,14 @@ VARIANT = "应用题\n停车场有汽车和摩托车共20辆，轮子共56个，
 TEXT = {"input": "鸡兔同笼，头20个，脚54只", "extract": {"difficulty": "中等", "knowledge_points": ["鸡兔同笼问题"]}}
 
 
-async def test_prompt_order_is_skill_then_references_then_preferences(monkeypatch):
+async def test_references_come_after_the_skill_body(monkeypatch):
     llm = ScriptedLLM(VARIANT)
     monkeypatch.setattr(qs_agent, "build_question_set_agent", lambda **kw: llm)
-    result = await qs_agent.async_question_set_tool({**TEXT, "references": _ctx(), "recall": "【该学生的历史偏好】不要雷同"})
+    result = await qs_agent.async_question_set_tool({**TEXT, "references": _ctx()})
 
     assert result["result"] == VARIANT
     system = llm.calls[0][0].content
-    assert system.index("变式") < system.index(QUESTIONS_HEADER) < system.index("【该学生的历史偏好】")
+    assert system.index("变式") < system.index(QUESTIONS_HEADER), "参考材料接在生题剧本之后"
 
 
 async def test_no_references_means_no_rag_section(monkeypatch):
@@ -5271,7 +5280,7 @@ async def test_copying_a_reference_triggers_one_retry(monkeypatch):
 
 
 async def test_tool_passes_references_and_user_id(monkeypatch):
-    # 工具模块会连带导入记忆计划 Task 12 的召回模块，它在导入时就要连 chromadb；
+    # 工具模块会连带导入 rag.integration，它在导入时就要连 chromadb；
     # 所以只在这一条测试里、先确认 chromadb 可用再导入，不拖累其余测试
     pytest.importorskip("chromadb", exc_type=ImportError)
     import backend.agents.tools.question_set_tool as qs_tool
@@ -5526,16 +5535,13 @@ async def async_question_set_tool(text: dict) -> dict:
             f"难度要求：{difficulty}"
         )
 
-        # system prompt 的顺序：生题剧本 → 参考材料（RAG）→ 用户偏好（记忆召回）
-        # 偏好放最后，作为最终的风格约束
+        # system prompt 的顺序：生题剧本 → 参考材料（RAG）
+        # 用户偏好不在这里拼，它由记忆计划 Task 13 注入 ReAct 主循环的 system prompt
         system_body = load_skill("question_variant")
         references = text.get('references')
         rag_section = format_rag_context(references)
         if rag_section:
             system_body = f"{system_body}\n\n{rag_section}"
-        recall = text.get('recall', '')
-        if recall:
-            system_body = f"{system_body}\n\n{recall}"
 
         llm = build_question_set_agent(streaming=False)
         messages = [SystemMessage(content=system_body), HumanMessage(content=enhanced_input)]
@@ -5567,7 +5573,7 @@ async def async_question_set_tool(text: dict) -> dict:
 
 - [ ] **Step 6: 工具调用检索**
 
-`backend/agents/tools/question_set_tool.py` 的最终内容如下。与记忆计划 Task 12 完成后的版本相比，只多了两处：导入 `rag_references`，以及 `new_input` 里的 `references` 一行。
+`backend/agents/tools/question_set_tool.py` 的最终内容如下。与记忆计划 Task 4 禁用同步入口之后的版本相比，只多了三处：`_arun` 多接一个 `user_id`、导入 `rag_references`、`new_input` 里的 `references` 一行。
 
 ```python
 from typing import Optional, Type
@@ -5577,7 +5583,6 @@ from pydantic import BaseModel, Field
 
 from backend.agents.agent.extract_agent import async_extract_tool
 from backend.agents.agent.question_set_agent import async_question_set_tool
-from backend.agents.memory.recall import recall_context
 from backend.agents.rag.integration import rag_references
 
 
@@ -5604,7 +5609,6 @@ class QuestionSetTool(BaseTool):
                 'input': query,
                 'extract': extract,
                 'references': await rag_references(query, extract, user_id),  # RAG 参考材料
-                'recall': await recall_context(query, user_id),                # 记忆计划 Task 12
             }
             result = await async_question_set_tool(new_input)
             if 'error' in result:
@@ -5614,7 +5618,23 @@ class QuestionSetTool(BaseTool):
             return f"【题目生成】生成变式题失败：{str(e)}"
 ```
 
-- [ ] **Step 7: 启动时加载词法索引**
+- [ ] **Step 7: 从 GraphState 注入 user_id**
+
+`_arun` 多了一个 `user_id` 形参，但 LLM 不知道这个值——它只会按 `args_schema` 填 `query`。
+和 `query_memory_tool`、`user_profile_*_tool` 一样，要由图节点从 `GraphState` 里注入。
+
+`backend/agents/agent/react_agent.py` 的 `tool_exec_node`，在已有的两段注入之后加上：
+
+```python
+    # question_set_tool 的 RAG 检索要按年级过滤，需要 user_id；同样由 state 注入
+    if func_name == "question_set_tool":
+        args['user_id'] = state['user_id']
+```
+
+注意 `user_id` **不要**写进 `QuestionSetInput`：`args_schema` 是给 LLM 看的，
+多一个字段就是多一个它可能乱填的槽位。`_arun` 的形参默认 `None`，不注入时按「不过滤年级」走。
+
+- [ ] **Step 8: 启动时加载词法索引**
 
 在 `backend/core/hooks.py` 的 import 区加入：
 
@@ -5628,16 +5648,16 @@ from backend.agents.rag.lifecycle import rag_startup
     await rag_startup()  # 内部吞掉异常：RAG 出问题不能阻止服务启动
 ```
 
-- [ ] **Step 8: 运行测试确认通过**
+- [ ] **Step 9: 运行测试确认通过**
 
 Run: `cd backend && python -m pytest tests/rag/test_integration.py -v -rs`
-Expected: chromadb 可用时 19 passed；不可用时 18 passed、1 skipped——被跳过的是测工具层的那一条，它导入的工具模块会连带导入记忆计划 Task 12 的召回模块
+Expected: chromadb 可用时 19 passed；不可用时 18 passed、1 skipped——被跳过的是测工具层的那一条，它导入的工具模块会连带导入 `rag.integration`
 
-- [ ] **Step 9: 端到端试一次（需要 chromadb、裁判配置与已入库的资料）**
+- [ ] **Step 10: 端到端试一次（需要 chromadb、裁判配置与已入库的资料）**
 
 启动服务后，用普通账号调用 `/agent/analyse`，请它生成一道变式题。日志里应该能看到一行 `RAG 检索：参考题 N 道……`，里面有每个阶段的耗时，降级一项应为「无」。
 
-- [ ] **Step 10: 提交**
+- [ ] **Step 11: 提交**
 
 ```bash
 git add backend/agents/rag/retrieval/context.py backend/agents/rag/integration.py backend/agents/rag/lifecycle.py backend/agents/agent/question_set_agent.py backend/agents/tools/question_set_tool.py backend/core/hooks.py backend/tests/rag/test_integration.py
@@ -7547,7 +7567,8 @@ git commit -m "feat: RAG 生题 A/B 评测与评测命令行"
 - 入库必须经过第三方复核，裁判与生成模型不同家族，失败即拒；只有隔离区的人工通过可以跳过复核
 - 题目 id 是规范化题干的哈希：入库幂等，精确去重只比较 id
 - 词法索引整体重建、替换快照；不要原地修改快照
-- 向量操作统一经 LlamaIndex（`store/llama_store.py`），业务代码拿到的相似度一律是余弦；LlamaIndex 的 Chroma 集成返回 exp(-距离)，换算只在适配层做。不要改用 `VectorStoreIndex`（向量由 `Embedder` 事先算好）
+- RAG 的向量操作统一经 `store/llama_store.py`，这一层的业务代码拿到的相似度一律是余弦；LlamaIndex 的 Chroma 集成返回 exp(-距离)，换算只在适配层做。不要改用 `VectorStoreIndex`（向量由 `Embedder` 事先算好）
+- **本项目只有 RAG 用向量库**。记忆层原本也有一套（`agents/memory/vector_store_manager.py`，chromadb 默认 l2 空间），已在记忆计划 Task 12 删除，对话记忆改存 MySQL。看到旧代码或旧文档提到「记忆向量库」时，那是已经下线的设计
 - BM25 分词用 jieba 的 `cut_for_search`，不要改回普通 `cut`（同一知识点的不同说法会互相召回不到）
 - RAG 的 prompt 放在 `agents/skills/` 下，frontmatter 必须带 `visibility: internal`
 - 命令行入库前要停服务（Chroma 本地库不支持多进程写入）；入库后重启服务才会加载新题
