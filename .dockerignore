@@ -1,0 +1,19 @@
+# 构建上下文里只需要 backend/ 的代码；其余一律不发给 Docker，既加快构建，也防止密钥被打进镜像
+**/__pycache__
+**/*.pyc
+.git
+.github
+.idea
+docs
+deploy
+frontend
+**/.env
+backend/.venv
+backend/tests
+backend/logs
+backend/vector_memory
+backend/chroma_db
+backend/rag_db
+backend/rag_uploads
+backend/rag_eval
+backend/test_stream.py

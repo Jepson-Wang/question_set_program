@@ -45,6 +45,9 @@ jobs:
         working-directory: backend
         run: ruff check --output-format=github .
 
+      - name: hadolint（Dockerfile）
+        run: hadolint Dockerfile
+
       - name: actionlint（workflow 文件本身）
         env:
           ACTIONLINT_VERSION: 1.7.12
@@ -140,3 +143,33 @@ jobs:
       - run: npm ci
       # build 脚本是 tsc -b && vite build，类型错误会让这一步失败
       - run: npm run build
+
+  image:
+    name: 镜像构建检查
+    # 只在 PR 上检查 Dockerfile 能不能构建、镜像能不能启动；合并到 main 后由 release.yml 构建并推送
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: 构建镜像（不推送）
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true                      # 把镜像加载进本机 Docker，下一步才能 docker run
+          tags: question-set-program:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 镜像冒烟测试：能导入应用
+        run: >-
+          docker run --rm
+          -e SQL_DATABASE_URL=mysql+asyncmy://ci:ci@127.0.0.1:3306/ci
+          -e API_KEY=ci-placeholder -e API_URL=http://127.0.0.1:9/v1
+          -e JWT_SECRET_KEY=ci-placeholder-secret
+          question-set-program:ci
+          python -c "import backend.main; print('镜像内应用导入成功')"
