@@ -15,3 +15,4 @@ class UserProfile(Base):
     preferences = Column(JSON, nullable=False, comment='长期偏好（JSON）')
     update_time = Column(DateTime, default=func.current_timestamp(), onupdate=func.current_timestamp(), comment='更新时间')
     create_time = Column(DateTime, default=func.current_timestamp(), comment='创建时间')
+    notes = Column(JSON, nullable=False, default=list, comment='自由观察记录（数组），放不进结构化键的内容')

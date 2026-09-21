@@ -8,6 +8,28 @@ from typing import Optional
 from backend.schemas.request.user_profile_update_request import UserProfileUpdateRequest
 from backend.schemas.response.user_profile_response import UserProfileResponse
 
+# 这两个字段需要合并而不是替换
+_MERGE_FIELDS = ("weak_points", "preferences")
+
+# notes是自由文本数组， 语义是追加而不是合并
+_APPEND_FIELDS = ("notes",)
+
+NOTES_MAX_SIZE = 50
+
+def merge_json_fields(old: dict | None,new: dict | None) -> dict:
+    merged = dict(old or {})
+    merged.update(new or {})
+    return merged
+
+def append_notes(old: list | None, new: list | None, max_size: int = NOTES_MAX_SIZE) -> list:
+    result = list(old or [])
+    for item in new or []:
+        if item not in result:
+            result.append(item)
+    if len(result) > max_size:
+        result = result[-max_size:]
+    return result
+
 class UserProfileMapper:
     def __init__(self, session_factory: AsyncSessionLocal):
         self.session_factory = session_factory  # 接收工厂，而非实例
@@ -22,7 +44,8 @@ class UserProfileMapper:
                     grade=user_profile.grade,
                     subject=user_profile.subject,
                     weak_points=user_profile.weak_points,
-                    preferences=user_profile.preferences
+                    preferences=user_profile.preferences,
+                    notes=user_profile.notes or [],
                 )
                 session.add(new_profile)
                 await session.commit()
@@ -55,7 +78,17 @@ class UserProfileMapper:
 
                 dto_data = profile_dto.model_dump(exclude_none=True)
                 for key, value in dto_data.items():
-                    if hasattr(user_profile, key):
+                    if not hasattr(user_profile, key):
+                        continue
+                    if key in _MERGE_FIELDS:
+                        setattr(user_profile, key, merge_json_fields(
+                            getattr(user_profile, key), value
+                        ))
+                    elif key in _APPEND_FIELDS:
+                        setattr(user_profile, key, append_notes(
+                            getattr(user_profile, key), value
+                        ))
+                    else:
                         setattr(user_profile, key, value)
 
                 await session.commit()

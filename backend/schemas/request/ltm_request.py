@@ -9,3 +9,4 @@ class LTMRequest(BaseModel):
     subject: Optional[str] = Field(None, description='主修学科')
     preferences: Optional[dict] = Field(None, description='长期偏好（JSON）')
     weak_points: Optional[dict] = Field(None, description='薄弱知识点（JSON）')
+    notes: Optional[list] = Field(None,description="自由观察记录（数组），放不进结构化键的内容")

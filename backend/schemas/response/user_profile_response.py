@@ -9,3 +9,5 @@ class UserProfileResponse(BaseModel):
     subject: str = Field(description='主修学科', examples=['数学'])
     weak_points: dict = Field(description='薄弱知识点', examples=[{'数学': '导数'}])
     preferences: dict = Field(description='长期偏好', examples=[{'学习方式': '视频'}])
+    notes: list = Field(default_factory=list, description='自由观察记录',
+                        examples=[['做题时喜欢先看思路']])
