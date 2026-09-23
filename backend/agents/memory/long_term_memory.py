@@ -48,6 +48,7 @@ class LongTermMemory:
                 subject=request.subject or "数学",
                 preferences=request.preferences or {},
                 weak_points=request.weak_points or {},
+                notes=request.notes or [],
                 create_time=datetime.now(),
                 update_time=datetime.now(),
             )
@@ -61,6 +62,7 @@ class LongTermMemory:
             subject=request.subject,
             preferences=request.preferences,
             weak_points=request.weak_points,
+            notes=request.notes,
             update_time=datetime.now(),
         )
         await self.user_profile_mapper.update_user_profile(update_dto)

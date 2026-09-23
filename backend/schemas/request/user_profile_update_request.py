@@ -15,3 +15,4 @@ class UserProfileUpdateRequest(BaseModel):
     preferences: Optional[dict] = Field(None, description='长期偏好', examples=[{'学习方式': '视频'}])
     update_time: Optional[datetime] = Field(None, description='更新时间')
     create_time: Optional[datetime] = Field(None, description='创建时间')
+    notes: Optional[list] = Field(None,description="自由观察记录（数组），放不进结构化键的内容")

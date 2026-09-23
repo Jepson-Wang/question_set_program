@@ -46,7 +46,8 @@ class UserProfileQueryTool(BaseTool):
                 f"年级：{data.get('grade', '未知')}\n"
                 f"学科：{data.get('subject', '未知')}\n"
                 f"薄弱知识点：{data.get('weak_points', {})}\n"
-                f"长期偏好：{data.get('preferences', {})}"
+                f"长期偏好：{data.get('preferences', {})}\n"
+                f"自由观察：{data.get('notes', [])}"
             )
         except Exception as e:
             return f"【用户画像】查询失败：{str(e)}"
