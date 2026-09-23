@@ -16,3 +16,8 @@ backend/chroma_db/
 
 # Vite 的依赖缓存，构建时自动重建
 frontend/.vite/
+
+# RAG 运行时数据：知识库、上传文件、评测报告（运行时生成，不入库）
+backend/rag_db/
+backend/rag_uploads/
+backend/rag_eval/
