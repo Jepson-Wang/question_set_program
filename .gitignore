@@ -14,8 +14,11 @@ vector_memory/
 backend/vector_memory/
 backend/chroma_db/
 
-# Vite 的依赖缓存，构建时自动重建
-frontend/.vite/
+
+# 覆盖率与测试报告产物（跑一次测试生成一次）
+.coverage
+coverage.xml
+junit.xml
 
 # RAG 运行时数据：知识库、上传文件、评测报告（运行时生成，不入库）
 backend/rag_db/

@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches-ignore: [main]      # main 的推送由 release.yml 负责，它会先调用本 workflow 跑一遍检查
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "deploy/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/**"
+  workflow_call:                 # 允许 release.yml 以 uses: ./.github/workflows/ci.yml 调用
+
+permissions:
+  contents: read                 # 默认最小权限：只读代码；需要更多权限的 job 单独声明
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: 静态检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-tools.txt
+
+      - name: 安装检查工具
+        run: pip install -r backend/requirements-tools.txt
+
+      - name: ruff（Python 代码）
+        working-directory: backend
+        run: ruff check --output-format=github .
+
+      - name: hadolint（Dockerfile）
+        run: hadolint Dockerfile
+
+      - name: actionlint（workflow 文件本身）
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -sSfL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
+  test:
+    name: 后端测试
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REQUIRE_REDIS: "1"                  # Redis 连不上就失败，不许静默跳过
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      # 下面都是占位值：测试不连 MySQL、不调大模型，只为满足模块导入时的配置检查
+      SQL_DATABASE_URL: mysql+asyncmy://ci:ci@127.0.0.1:3306/ci
+      API_KEY: ci-placeholder
+      API_URL: http://127.0.0.1:9/v1
+      MODEL_NAME: ci-model
+      EMBEDDING_MODEL: ci-embedding
+      JWT_SECRET_KEY: ci-placeholder-secret
+      ANONYMIZED_TELEMETRY: "False"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 安装依赖
+        run: pip install -r backend/requirements.txt
+
+      - name: 运行测试
+        working-directory: backend
+        run: >-
+          python -m pytest -v -rs
+          --cov --cov-report=term-missing:skip-covered --cov-report=xml:coverage.xml
+          --junitxml=junit.xml
+
+      - name: 覆盖率写入运行摘要
+        if: always()
+        working-directory: backend
+        run: |
+          if [ -f .coverage ]; then
+            echo "## 后端覆盖率" >> "$GITHUB_STEP_SUMMARY"
+            python -m coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-test-reports
+          path: |
+            backend/junit.xml
+            backend/coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  frontend:
+    name: 前端构建
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      # build 脚本是 tsc -b && vite build，类型错误会让这一步失败
+      - run: npm run build
+
+  image:
+    name: 镜像构建检查
+    # 只在 PR 上检查 Dockerfile 能不能构建、镜像能不能启动；合并到 main 后由 release.yml 构建并推送
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: 构建镜像（不推送）
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true                      # 把镜像加载进本机 Docker，下一步才能 docker run
+          tags: question-set-program:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 镜像冒烟测试：能导入应用
+        run: >-
+          docker run --rm
+          -e SQL_DATABASE_URL=mysql+asyncmy://ci:ci@127.0.0.1:3306/ci
+          -e API_KEY=ci-placeholder -e API_URL=http://127.0.0.1:9/v1
+          -e JWT_SECRET_KEY=ci-placeholder-secret
+          question-set-program:ci
+          python -c "import backend.main; print('镜像内应用导入成功')"

@@ -1,0 +1,5 @@
+# CI 与本地开发用的检查工具，不进生产镜像。本地安装：pip install -r backend/requirements-tools.txt
+ruff==0.16.7
+shellcheck-py==0.11.0.1
+hadolint-py==2.15.1.2
+pip-audit==2.10.1

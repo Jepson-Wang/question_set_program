@@ -45,9 +45,14 @@ async def redis_test_client():
         await client.ping()
     except Exception as e:
         await client.aclose()
-        pytest.skip(f"测试需要可用的 Redis（db {TEST_DB}）：{e}")
+        redis_unavailable(f"测试需要可用的 Redis（db {TEST_DB}）：{e}")
 
     await client.flushdb()
     yield client
     await client.flushdb()
     await client.aclose()
+
+def redis_unavailable(reason: str) -> None:
+    if os.getenv("REQUIRE_REDIS") == "1":
+        pytest.fail(f"REQUIRE_REDIS=1，但 {reason}",pytrace=False)
+    pytest.skip(reason)

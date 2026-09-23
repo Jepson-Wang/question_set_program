@@ -1,0 +1,5 @@
+# 覆盖率配置，统计 backend 包，排除测试代码本身
+[run]
+source = backend
+omit =
+    */tests/*
