@@ -41,33 +41,11 @@ Install dependencies: `pip install -r backend/requirements.txt`
 
 ## Architecture
 
-### Request Flow
-
-```
-POST /agent/analyse
-  → JWT auth (api/dependencies.py)
-  → Fetch last 3 short-term memories from Redis → format as context string
-  → Build GraphState, invoke ReAct graph (agents/agent/react_agent.py)
-      react_think_node  ←──────────────────────┐
-           ↓ (LLM picks a skill or outputs final_result)
-      should_continue                           │
-           ↓ action != null && round <= 5       │
-      skill_exec_node  ──────────────────────────┘
-           ↓ action == null
-          END
-  → Write MemoryUnit(original_text, final_result) to Redis
-  → Return result['final_result']
-```
-
 ### Agent / Skill Layer (`backend/agents/`)
 
 **`agents/agent/react_agent.py`** — The active graph. `react_think_node` calls the LLM with all 4 bound skills and receives JSON `{thought, action, action_args, final_result}`. `skill_exec_node` dispatches via `SKILL_MAP[action]._run(**args)`. Max 5 ReAct rounds.
 
-**`agents/skills/`** — All skills extend LangChain `BaseTool`. The registry is in `__init__.py`:
-- `common_skill` — General Q&A, explanation, problem solving
-- `extract_skill` — Extracts difficulty + knowledge points from a problem
-- `question_set_skill` — Generates variant problems (internally calls extract first)
-- `query_memory_skill` — Fetches short-term memory; `user_id`/`session_id` are injected from GraphState by `skill_exec_node`, not passed by the LLM
+**`agents/skills/`** — All skills extend LangChain `BaseTool`; the registry is in `__init__.py`. Gotcha: `query_memory_skill` receives `user_id`/`session_id` injected from GraphState by `skill_exec_node`, not passed by the LLM.
 
 `SKILL_MAP` (keyed by `skill.name`) is the single dispatch table; add new skills here.
 
@@ -94,38 +72,6 @@ There is **no vector store in the memory layer**. It used to refine memories wit
 `get_llm(model, streaming)` returns a `ChatOpenAI` instance pointed at the DashScope OpenAI-compatible endpoint. Results are cached by argument via `@singleton_method`. Per-agent model overrides: `PLANNER_MODEL`, `EXTRACT_MODEL`, `DIGEST_MODEL` env vars.
 
 `get_embedding_model()` lives in `agents/agent/embedding.py`, deliberately **not** in `get_llm.py`: importing llama-index costs ~1.5s and 1400+ modules, and nothing on the request path needs embeddings. Only the RAG knowledge base imports it.
-
-### Singleton Patterns (`core/single_tool.py`)
-
-- `singleMeta` — metaclass for class-level singletons (used by `MemoryManager`, Redis client)
-- `@singleton_method` — function-level cache keyed by arguments (used by `get_llm`, `build_session_digest_agent`)
-
-### API Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| POST | `/agent/analyse` | Invoke ReAct agent, returns full state |
-| POST | `/agent/analyse/stream` | SSE stream: emits `thinking`/`observation`/`result` events |
-| POST | `/login/login` | Returns JWT token |
-| POST | `/login/register` | Creates user |
-
-JWT is validated via `api/dependencies.py`; all agent endpoints require a valid token.
-
-### GraphState Fields
-
-```python
-{
-    'user_input': str,      # user text + prepended memory context
-    'user_id': int,
-    'session_id': int,
-    'thought': str,         # LLM's latest reasoning
-    'action': str,          # skill name or null
-    'action_args': dict,    # args for chosen skill
-    'messages': list[ToolMessage],  # accumulated observations
-    'round': int,           # current iteration (max 5)
-    'final_result': str     # populated when action is null
-}
-```
 
 ## Key Conventions
 
