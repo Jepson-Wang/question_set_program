@@ -65,7 +65,7 @@ jobs:
     timeout-minutes: 20
     services:
       redis:
-        image: redis:7-alpine
+        image: redis:8.0-alpine            # HSETEX（写入并设 field 级 TTL）是 8.0 才有的命令
         ports:
           - 6379:6379
         options: >-

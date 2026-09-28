@@ -5,7 +5,7 @@
 不认识 user_profile 表，所以**不测落库**：写库是 user_profile_save_tool 的活，
 那部分归 tests/agents/tools/ 下的测试管。
 
-TTL 一律用 field 级（HEXPIRE，Redis 7.4+）。两条写路径语义不同，都要守住：
+TTL 一律用 field 级（HSETEX，Redis 8.0+）。两条写路径语义不同，都要守住：
 - 创建：ex=field_ttl，窗口从这一刻起算
 - 更新：keepttl=True，保住原有到期时刻，不续命
 """
