@@ -37,6 +37,17 @@ REDIS_PASSWORD=
 REDIS_USERNAME=
 ```
 
+Optional tuning knobs (all have in-code defaults; a malformed value falls back and logs an error rather than blocking startup):
+
+```
+APP_DEBUG=                   # FastAPI debug mode. Default off — leave unset in production
+CORS_ALLOW_ORIGINS=          # Comma-separated origins. Default *
+PROFILE_PROMOTE_THRESHOLD=   # Times a preference must recur before it enters the profile. Default 2;
+                             # below 2 disables frequency confirmation and logs an error at startup
+```
+
+Every new environment variable must also be added to `CONFIG_KEYS` in `backend/tests/isolation.py`, or the subprocess tests will silently read the host machine's value instead of the one under test.
+
 Install dependencies: `pip install -r backend/requirements.txt`
 
 ## Architecture
