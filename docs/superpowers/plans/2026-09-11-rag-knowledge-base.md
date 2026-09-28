@@ -485,6 +485,9 @@ import tempfile
 import httpx
 
 from backend.agents.rag.config import RagSettings
+from backend.middleware.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 async def probe_rerank(settings: RagSettings) -> None:
@@ -497,17 +500,18 @@ async def probe_rerank(settings: RagSettings) -> None:
         response = await client.post(
             settings.rerank_url, json=payload, headers={"Authorization": f"Bearer {settings.rerank_api_key}"}
         )
-    print(f"[rerank] {settings.rerank_model} -> HTTP {response.status_code}")
-    print(json.dumps(response.json(), ensure_ascii=False, indent=2)[:1500])
-    print("[rerank] 预期：结果在 output.results 里，每项含 index 与 relevance_score，且方程那条分数更高")
+    logger.info("[rerank] %s -> HTTP %s", settings.rerank_model, response.status_code)
+    logger.info("[rerank] 响应体:
+%s", json.dumps(response.json(), ensure_ascii=False, indent=2)[:1500])
+    logger.info("[rerank] 预期：结果在 output.results 里，每项含 index 与 relevance_score，且方程那条分数更高")
 
 
 async def probe_embedding(settings: RagSettings) -> None:
     from backend.agents.agent.embedding import get_embedding_model
 
     vectors = await get_embedding_model().aget_text_embedding_batch(["解方程 2x+3=7", "计算三角形的面积"])
-    print(f"[embedding] 返回 {len(vectors)} 条，维度 {len(vectors[0])}")
-    print("[embedding] 预期：2 条，维度与 EMBEDDING_MODEL 的说明一致")
+    logger.info("[embedding] 返回 %s 条，维度 %s", len(vectors), len(vectors[0]))
+    logger.info("[embedding] 预期：2 条，维度与 EMBEDDING_MODEL 的说明一致")
 
 
 def probe_llamaindex_chroma() -> None:
@@ -525,12 +529,13 @@ def probe_llamaindex_chroma() -> None:
     ])
     result = store.query(VectorStoreQuery(query_embedding=[1.0, 0.0], similarity_top_k=2))
     cosines = [round(1 + math.log(score), 4) for score in result.similarities]
-    print(f"[chroma] ids={result.ids} 分数={[round(s, 4) for s in result.similarities]} 按 1+ln(分数) 换算={cosines}")
-    print("[chroma] 预期：换算后 same 约 1.0、mid 约 0.6（LlamaIndex 返回的分数 = exp(-cosine 距离)）")
+    logger.info("[chroma] ids=%s 分数=%s 按 1+ln(分数) 换算=%s",
+                result.ids, [round(s, 4) for s in result.similarities], cosines)
+    logger.info("[chroma] 预期：换算后 same 约 1.0、mid 约 0.6（LlamaIndex 返回的分数 = exp(-cosine 距离)）")
 
     store.add([TextNode(id_="same", text="changed", embedding=[1.0, 0.0])])
-    print(f"[chroma] 对已有 id 再 add 一次后，原文={collection.get(ids=['same'])['documents']}")
-    print("[chroma] 预期：仍是 ['a']（add 不覆盖已有记录，所以适配层的 upsert 要先删后加）")
+    logger.info("[chroma] 对已有 id 再 add 一次后，原文=%s", collection.get(ids=["same"])["documents"])
+    logger.info("[chroma] 预期：仍是 ['a']（add 不覆盖已有记录，所以适配层的 upsert 要先删后加）")
 
 
 async def probe_judge(settings: RagSettings) -> None:
@@ -538,12 +543,12 @@ async def probe_judge(settings: RagSettings) -> None:
     from langchain_openai import ChatOpenAI
 
     if not (settings.judge_model and settings.judge_api_url and settings.judge_api_key):
-        print("[judge] 未配置 JUDGE_MODEL / JUDGE_API_URL / JUDGE_API_KEY，跳过")
+        logger.warning("[judge] 未配置 JUDGE_MODEL / JUDGE_API_URL / JUDGE_API_KEY，跳过")
         return
     llm = ChatOpenAI(model=settings.judge_model, api_key=settings.judge_api_key,
                      base_url=settings.judge_api_url, temperature=0)
     response = await llm.ainvoke("只回答一个数字：方程 2x+3=7 中 x 等于几？")
-    print(f"[judge] {settings.judge_model} -> {response.content!r}")
+    logger.info("[judge] %s -> %r", settings.judge_model, response.content)
 
 
 async def main() -> None:
@@ -552,11 +557,11 @@ async def main() -> None:
         try:
             await probe(settings)
         except Exception as e:
-            print(f"[{name}] 失败：{type(e).__name__}: {e}")
+            logger.error("[%s] 失败：%s: %s", name, type(e).__name__, e, exc_info=True)
     try:
         probe_llamaindex_chroma()
     except Exception as e:
-        print(f"[chroma] 失败：{type(e).__name__}: {e}")
+        logger.error("[chroma] 失败：%s: %s", type(e).__name__, e, exc_info=True)
 
 
 if __name__ == "__main__":

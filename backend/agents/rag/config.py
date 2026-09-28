@@ -6,8 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from backend.core.config import BACKEND_ROOT, load_env
+from backend.middleware.logging import get_logger
 
 load_env()
+
+logger = get_logger(__name__)
 
 # 以 Task 0 探针的实际请求结果为准
 DEFAULT_RERANK_URL = "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
@@ -24,6 +27,24 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    """
+    配错时回落到默认值并记 error，而不是抛异常。
+
+    这些都是调参阈值，不是 JWT_SECRET_KEY 那种缺了就必须 fail fast 的密钥——
+    为一个小数点写错拒绝启动，代价大于收益。但必须记 error：静默回落和
+    「配置生效了」在运行时长得一模一样，没有日志就没人会发现配置没起作用。
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.error("%s=%r 不是合法的小数，已回落到默认值 %s", name, raw, default)
+        return default
 
 
 @dataclass(frozen=True)
@@ -69,5 +90,5 @@ class RagSettings:
             judge_api_key=os.getenv("JUDGE_API_KEY"),
             judge_model=os.getenv("JUDGE_MODEL"),
             generator_model=os.getenv("MODEL_NAME", "glm-5"),
-            judge_pass_score=float(os.getenv("RAG_JUDGE_PASS_SCORE", "0.8")),
+            judge_pass_score=_env_float("RAG_JUDGE_PASS_SCORE", 0.8),
         )
