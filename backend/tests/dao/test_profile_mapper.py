@@ -8,9 +8,11 @@ append_notes 这两个纯函数。函数写对了，但 mapper 里按字段名�
 
 所以这里测的是「分派有没有接上」，不是「合并算得对不对」。
 """
+import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from backend.dao.exceptions import ProfileAlreadyExistsError, ProfileNotFoundError
 from backend.dao.user_profile_mapper import UserProfileMapper
 from backend.model import Base
 from backend.model.user_profile import UserProfile  # noqa: F401  建表需要先导入模型
@@ -80,7 +82,27 @@ async def test_create_persists_notes(mapper):
     assert got.notes == ["第一条观察"]
 
 
-async def test_update_on_missing_profile_returns_none(mapper):
-    assert await mapper.update_user_profile(
-        UserProfileUpdateRequest(user_id=999, grade="八年级")
-    ) is None
+async def test_update_on_missing_profile_raises(mapper):
+    """以前这里返回 None，调用方没检查返回值，「没写进去」就被当成了「写成功」"""
+    with pytest.raises(ProfileNotFoundError):
+        await mapper.update_user_profile(
+            UserProfileUpdateRequest(user_id=999, grade="八年级")
+        )
+
+
+async def test_update_with_negative_user_id_raises_value_error(mapper):
+    """非法 id 是调用方的 bug，不能和「画像不存在」混成一个异常"""
+    with pytest.raises(ValueError):
+        await mapper.update_user_profile(
+            UserProfileUpdateRequest(user_id=-1, grade="八年级")
+        )
+
+
+async def test_create_twice_raises_already_exists(mapper):
+    """
+    唯一键冲突要翻译成业务异常，上层才能据此转去更新。
+    注意这里只覆盖了 SQLite 的分支（按报错文本识别），MySQL 的 1062 分支没有被测到。
+    """
+    await _seed(mapper)
+    with pytest.raises(ProfileAlreadyExistsError):
+        await _seed(mapper)
