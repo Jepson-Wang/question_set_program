@@ -24,6 +24,17 @@ from backend.utils.redis_client import get_redis_client
 为什么偏好类需要延迟落库：因为一次性落库，就会导致后续的每一次请求都向这个profile来落
 """
 
+# 把 submit_one_candidate 改写成 Lua 脚本时（Task 9.5 Step 2）要防的几类失败：
+# 1. Lua 运行期错误：nil 参与运算、函数名拼错（cjson.decod）、索引 nil，最常见
+# 2. redis.call 返回错误：WRONGTYPE（key 不是 hash）、参数个数不对。redis.call 遇错
+#    会中断整个脚本并把错误抛回客户端，要兜住得用 redis.pcall
+# 3. OOM：生产 Redis 的 maxmemory-policy 是 noeviction，内存满了写命令直接报错
+# 4. 脚本超时：超过 busy-reply-threshold（Redis 7 之前叫 lua-time-limit，默认 5000ms）
+#    后，Redis 不会中断脚本，只是对其他客户端回 BUSY。脚本还没写过数据时可以 SCRIPT KILL；
+#    写过之后会被拒绝（杀掉会留下无法回滚的半截状态），只剩 SHUTDOWN NOSAVE，
+#    丢掉上次持久化之后的全部数据
+# 所以脚本必须短，而且写操作放在最后：写之前的那段时间里，脚本都还能被杀掉
+
 load_env()
 
 logger = get_logger(__name__)
@@ -104,7 +115,7 @@ class ProfileCandidate:
                     "times": 1,
                 }
                 await self._client.hsetex(query_key,query_field,json.dumps(final_res),ex=self.field_ttl)
-                return (1,False)
+                return int(final_res["times"]),False
             else:
                 try:
                     final_res = json.loads(query)
@@ -118,13 +129,17 @@ class ProfileCandidate:
                 # 该写进画像的是后者。只加计数不换值的话，用户的修正会被静默吞掉
                 final_res["value"] = value
                 final_res["times"] += 1
-                # TODO 改为并发安全的，否则就会导致落库了之后，又出现这个field-value映射
-                # 并发安全可选的技术方案比如乐观锁，或者LUA，pipeline
-                if final_res["times"] >= self.times_to_submit:
-                    await self._client.hdel(query_key,query_field)
-                    return final_res["times"], True
+
+                # 先将当前结果缓存到Redis中，防止落库失败 times 没更新
                 await self._client.hsetex(query_key, query_field, json.dumps(final_res), keepttl=True)
-                return final_res["times"],False
+
+                if final_res["times"] >= self.times_to_submit:
+                    # HDEL 操作更改为一个独立的方法，在落库成功后调用
+                    # 当前如果 times 达到标准了，就直接通知上层
+                    return int(final_res["times"]), True
+
+                return int(final_res["times"]), False
+
         except RedisError as e:
             # 只降级 Redis 故障：候选池写不进去不该拖垮整个请求。
             # 编程错误不在这里捕获，让它抛出去，否则 bug 会被伪装成「Redis 挂了」
@@ -164,6 +179,38 @@ class ProfileCandidate:
             logger.warning("clear_candidates_by_user 删除 id = %s 的候选人池失败",user_id)
             return
         logger.info("clear_candidates_by_user 删除user_id = %s 的候选人池成功", user_id)
+
+    async def delete_field_by_given(self,user_id: int, to_delete: list[tuple[str,str]]):
+        """
+        晋升的偏好落库成功之后，清掉对应的候选。所有候选都在同一个 hash 里，
+        一条 HDEL 带多个 field 一次删完。
+
+        删除失败只记日志不抛出：后果是这些偏好下次再晋升一次，重复写入由落库的
+        幂等合并消化掉。抛出去的话，调用方会把「已经落库成功」误报成「保存失败」。
+
+        已知的洞：从晋升到这里删除之间，别的请求可能已经把同一个子键改成了新值、
+        计数重置为 1，这里会连新值的计数一起删掉。彻底的解法是条件删除——带上晋升时的值，
+        只有存着的值仍然相同才删（一个很短的 CAS 脚本），留到 Step 2 写 Lua 时一起做。
+        """
+        # HDEL 至少要一个 field，空调用 Redis 会报参数个数错误
+        if not to_delete:
+            return
+
+        delete_key = ProfileCandidate.key(user_id)
+        fields = [ProfileCandidate.generate_field_key(field, sub_key)
+                  for field, sub_key in to_delete]
+        try:
+            deleted = await self._client.hdel(delete_key, *fields)
+        except RedisError as e:
+            logger.error("delete_field_by_given 删除用户 %s 的候选失败：%s", user_id, e)
+            return
+
+        if deleted < len(fields):
+            # 少删了说明有候选在晋升之后、删除之前就没了：TTL 到期，或者被别的请求删掉
+            logger.warning(
+                "delete_field_by_given 用户 %s 应删 %s 个候选，实际删了 %s 个：%s",
+                user_id, len(fields), deleted, fields,
+            )
 
     @staticmethod
     def key(user_id: int):

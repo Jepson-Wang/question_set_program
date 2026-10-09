@@ -18,11 +18,13 @@ _APPEND_FIELDS = ("notes",)
 NOTES_MAX_SIZE = 50
 
 def merge_json_fields(old: dict | None,new: dict | None) -> dict:
+    """服务于 weak_points 和 preferences：新键加入，同名键以新值覆盖，没提到的老键保留"""
     merged = dict(old or {})
     merged.update(new or {})
     return merged
 
 def append_notes(old: list | None, new: list | None, max_size: int = NOTES_MAX_SIZE) -> list:
+    """服务于notes, 用于加入，更新和删除多余元素"""
     result = list(old or [])
     for item in new or []:
         if item not in result:

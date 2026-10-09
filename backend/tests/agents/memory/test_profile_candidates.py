@@ -69,21 +69,65 @@ async def test_candidates_are_isolated_per_user(store):
     assert b[FIELD_PATH] == {"value": "简单点b", "times": 1}
 
 
-async def test_promoted_field_is_removed_from_candidates(store):
+async def test_promotion_keeps_candidate_until_confirmed(store):
     """
-    晋升即清除，避免同一个偏好被反复晋升、反复写库。
+    晋升不删候选：要等调用方落库成功、再调 delete_field_by_given 才删。
+    先删后落库的话，落库一失败，这条已经确认过的偏好就永久丢了。
+    """
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    _, promoted = await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    assert promoted is True
+    assert await store.query_candidates_by_user(USER_A) == {
+        FIELD_PATH: {"value": "简单点a", "times": 2}
+    }
 
-    清除之后再提交是全新的一轮计数——候选池不记「谁晋升过」，
+
+async def test_confirmed_field_is_removed_and_restarts_from_one(store):
+    """
+    确认删除之后再提交是全新的一轮计数——候选池不记「谁晋升过」，
     因为用户改主意时那个键必须还能再晋升一次来覆盖旧值。
     """
     await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
     await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY)])
     assert await store.query_candidates_by_user(USER_A) == {}
 
     await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "难一点")
     assert await store.query_candidates_by_user(USER_A) == {
         FIELD_PATH: {"value": "难一点", "times": 1}
     }
+
+
+async def test_unconfirmed_promotion_promotes_again_next_time(store):
+    """
+    落库失败时调用方不会确认删除，候选的计数停在阈值上。
+    用户下次再提到时必须还能晋升，这是落库失败后唯一的重试通道。
+    """
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    times, promoted = await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    assert times == 3
+    assert promoted is True
+
+
+async def test_delete_only_removes_given_fields(store):
+    """只删这次晋升的子键，同一用户还在计数的候选不能被连带删掉"""
+    other = "讲解详细度"
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    await store.submit_one_candidate(USER_A, FIELD, other, "详细")
+
+    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY)])
+
+    assert await store.query_candidates_by_user(USER_A) == {
+        ProfileCandidate.generate_field_key(FIELD, other): {"value": "详细", "times": 1}
+    }
+
+
+async def test_delete_with_empty_list_is_a_no_op(store):
+    """空列表直接返回；真发一条不带 field 的 HDEL，Redis 会报参数个数错误"""
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    await store.delete_field_by_given(USER_A, [])
+    assert len(await store.query_candidates_by_user(USER_A)) == 1
 
 
 async def test_ttl_is_not_refreshed_on_update(make_store, redis_test_client):
@@ -93,7 +137,7 @@ async def test_ttl_is_not_refreshed_on_update(make_store, redis_test_client):
     刷新的话，「7 天」就不再是「两次提及的时间窗口」——用户第 1 天提一次、
     第 400 天再提一次照样晋升，隔了一年多的两次被当成稳定偏好。
 
-    阈值调到 3，否则第二次提交就晋升、字段被删，没有 TTL 可查。
+    阈值调到 3，让两次提交都停在晋升之前，只测「更新」这一条写路径本身。
     """
     store = make_store(field_ttl=100, times_to_submit=3)
     key = ProfileCandidate.key(USER_A)
