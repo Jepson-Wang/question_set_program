@@ -10,7 +10,8 @@ append_notes 这两个纯函数。函数写对了，但 mapper 里按字段名�
 """
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.dialects import mysql
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from backend.dao.exceptions import ProfileAlreadyExistsError, ProfileNotFoundError
 from backend.dao.user_profile_mapper import UserProfileMapper
@@ -96,6 +97,45 @@ async def test_update_with_negative_user_id_raises_value_error(mapper):
         await mapper.update_user_profile(
             UserProfileUpdateRequest(user_id=-1, grade="八年级")
         )
+
+
+class _RecordingSession(AsyncSession):
+    """记下经过 session.execute 的每条语句，供测试检查 mapper 实际发出的查询"""
+    statements: list = []
+
+    async def execute(self, statement, *args, **kwargs):
+        _RecordingSession.statements.append(statement)
+        return await super().execute(statement, *args, **kwargs)
+
+
+async def test_update_reads_with_row_lock(tmp_path):
+    """
+    更新路径的那次读必须是 SELECT … FOR UPDATE，否则并发的两次合并会互相覆盖（lost update）。
+
+    为什么不直接看 SQLite 跑出来的 SQL：SQLite 不支持行锁，SQLAlchemy 在 SQLite 方言下
+    会把 FOR UPDATE 静默丢掉，测试照样全绿。所以这里截下 mapper 真正交给 session 的语句对象，
+    再按生产用的 MySQL 方言编译一遍。
+
+    这条测试只能证明「锁加上了」，证明不了「锁住了」——那需要连真实 MySQL 做阻塞测试。
+    """
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    recording_mapper = UserProfileMapper(
+        async_sessionmaker(engine, class_=_RecordingSession, expire_on_commit=False)
+    )
+    try:
+        await _seed(recording_mapper)
+        _RecordingSession.statements = []
+        await recording_mapper.update_user_profile(
+            UserProfileUpdateRequest(user_id=USER, grade="八年级")
+        )
+    finally:
+        await engine.dispose()
+
+    assert len(_RecordingSession.statements) == 1, "更新路径应该只发出一次查询"
+    sql = str(_RecordingSession.statements[0].compile(dialect=mysql.dialect()))
+    assert sql.rstrip().endswith("FOR UPDATE"), sql
 
 
 async def test_create_twice_raises_already_exists(mapper):

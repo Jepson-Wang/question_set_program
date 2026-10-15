@@ -101,7 +101,18 @@ class UserProfileMapper:
 
         async with self.session_factory() as session:
             try:
-                stmt = select(UserProfile).where(UserProfile.user_id == profile_dto.user_id)
+                # 当前读并加 X 锁：合并是在 Python 里基于读出的旧值做的，普通 SELECT 是快照读，
+                # 两个请求并发时后提交的会整列覆盖先提交的（lost update），而且两边都不报错。
+                # 锁从这里一直持有到下面的 commit，粒度是这个用户的画像这一行。
+                # ⚠️ 这段临界区里只能有内存计算，不要加 Redis、LLM 之类的外部调用，
+                #    否则持锁时间会从毫秒级拉长到秒级，同一用户的其他写入都得等着。
+                # 行不存在时 RR 下会加间隙锁，但这里只会抛 ProfileNotFoundError 后回滚，
+                # 同一事务里没有 INSERT，不会和建档路径形成间隙锁死锁
+                stmt = (
+                    select(UserProfile)
+                    .where(UserProfile.user_id == profile_dto.user_id)
+                    .with_for_update()
+                )
                 result = await session.execute(stmt)
                 user_profile = result.scalar_one_or_none()
 
