@@ -130,6 +130,54 @@ async def test_delete_with_empty_list_is_a_no_op(store):
     assert len(await store.query_candidates_by_user(USER_A)) == 1
 
 
+class _BarrierClient:
+    """
+    包一层真实客户端：每次 hget 拿到结果后，要等所有调用方都读完才返回。
+
+    把「两个请求都先读、再各自写」这个最坏的交错固定下来，竞态就从「碰巧」变成「必然」。
+    其他命令原样转发。
+    """
+    def __init__(self, client, parties: int = 2):
+        self._client = client
+        self._barrier = asyncio.Barrier(parties)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    async def hget(self, *args, **kwargs):
+        value = await self._client.hget(*args, **kwargs)
+        async with asyncio.timeout(5):  # 只有一方到达时别永远卡住
+            await self._barrier.wait()
+        return value
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="Task 9.5 Steps 2/3 未做：submit_one_candidate 的 HGET → 计算 → HSETEX 不是原子的。"
+           "改成 Lua 之后这条会通过，strict 会让它报 XPASS，届时删掉这个标记",
+)
+async def test_concurrent_submits_do_not_lose_count(make_store, redis_test_client):
+    """
+    已经提交过 1 次，又有两个请求同时提交同一个子键：计数必须是 3。
+
+    现在的实现里两个请求都读到 1、都写回 2，少计一次。阈值是 2 时，后果是两个请求都晋升、
+    重复落库（由幂等合并消化）；阈值更高时，后果是偏好晚一轮才能晋升。
+    raises=AssertionError：屏障超时之类的其他异常算真失败，不能被当成「预期中的失败」放过。
+    """
+    await make_store().submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+
+    # 阈值调高，只看计数本身，不让晋升逻辑掺进来
+    racing = ProfileCandidate(client=_BarrierClient(redis_test_client), times_to_submit=10)
+    await asyncio.gather(
+        racing.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点"),
+        racing.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点"),
+    )
+
+    stored = await make_store().query_candidates_by_user(USER_A)
+    assert stored[FIELD_PATH]["times"] == 3
+
+
 async def test_ttl_is_not_refreshed_on_update(make_store, redis_test_client):
     """
     更新只改值和计数，不重置到期时刻。
