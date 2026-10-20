@@ -89,6 +89,27 @@ def get_redis_client(redis_url: Optional[str] = None) -> RedisClient:
     return _redis_client
 
 
+# 画像候选池用的 HSETEX 是 8.0 才有的命令
+MIN_REDIS_VERSION = (8, 0)
+
+
+async def ensure_redis_version(client, minimum: tuple = MIN_REDIS_VERSION) -> str:
+    """
+    版本低于 minimum 时抛 RuntimeError，否则返回版本号字符串。
+
+    低版本不会在连接时报错，而是在第一次调用新命令时报 unknown command，
+    又被业务层吞掉，变成静默失败——所以要在启动时主动查。
+    """
+    info = await client.info("server")
+    version = info["redis_version"]
+    # 按整数元组比较；按字符串比较会得出 "10.0" < "8.0"
+    current = tuple(int(part) for part in version.split(".")[:len(minimum)])
+    if current < minimum:
+        required = ".".join(map(str, minimum))
+        raise RuntimeError(f"Redis 版本 {version} 过低，至少需要 {required}")
+    return version
+
+
 async def close_redis():
     """
     关闭全局Redis客户端
