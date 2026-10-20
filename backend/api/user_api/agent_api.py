@@ -1,8 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
-from typing import Optional
 
 from backend.agents.memory.long_term_memory import LongTermMemory
 from backend.agents.memory.memory_manager import MemoryManager
@@ -12,15 +11,15 @@ from backend.dao.user_profile_mapper import UserProfileMapper
 from backend.model import AsyncSessionLocal
 
 from backend.api.dependencies import get_current_user
+from backend.api.user_api.session_api import require_own_session
+from backend.dao.chat_mapper import get_chat_mapper
 from backend.model.user import User
 from backend.agents.agent.tools import GraphState
 from backend.agents.agent.react_agent import get_app
 
 
 class TextRequest(BaseModel):
-    # 前端/历史代码可能传 `id` 或 `user_id`，这里都接收以避免 422
-    id: Optional[int] = None
-    user_id: Optional[int] = None
+    # 用户身份只认 token，不再从请求体读 user_id：否则登录 A 就能传 B 的 id 读写 B 的记忆
     session_id: int
     text: str
 
@@ -61,13 +60,15 @@ def _format_memory_context(short_memories: list, session_digest: str = "") -> st
 
 
 @agent_router.post('/analyse')
-async def analyse(request: TextRequest, token: str = None, user: User = Depends(get_current_user)) -> dict:
+async def analyse(request: TextRequest, user: User = Depends(get_current_user)) -> dict:
     if user:
-        user_id = request.id if request.id is not None else request.user_id
-        if user_id is None:
-            raise HTTPException(status_code=422, detail="Missing field: id or user_id")
+        user_id = user.id
         session_id = request.session_id
         text = request.text
+
+        chat_mapper = get_chat_mapper()
+        await require_own_session(session_id, user_id, chat_mapper)
+        await chat_mapper.add_message(session_id, "user", text)
 
         # 获取近3轮短期记忆，格式化后拼接到 user_input 头部
         memory_data = await memory_manager.get_memory_for_planner(user_id, session_id)
@@ -93,6 +94,9 @@ async def analyse(request: TextRequest, token: str = None, user: User = Depends(
 
         app = get_app()
         result = await app.ainvoke(state)
+
+        # 先写展示用的消息，再写记忆：消息丢了用户看得见，记忆缺一轮只影响后续上下文
+        await chat_mapper.add_message(session_id, "assistant", result.get('final_result', ''))
 
         # 写入记忆：保存原始用户文本（不含历史上下文），避免记忆污染
         memory_unit = MemoryUnit(text, result.get('final_result', ''))
@@ -178,8 +182,9 @@ async def _stream_generator(text: str, user_id: int, session_id: int):
                     payload = json.dumps({'type': 'observation', 'content': obs}, ensure_ascii=False)
                 yield f"data: {payload}\n\n"
 
-    # 流结束后写入记忆
+    # 流结束后先存助手消息、再写入记忆，顺序理由同 analyse
     if final_result:
+        await get_chat_mapper().add_message(session_id, "assistant", final_result)
         memory_unit = MemoryUnit(text, final_result)
         await memory_manager.add_memory(user_id, session_id, memory_unit)
 
@@ -191,12 +196,13 @@ async def analyse_stream(
     request: TextRequest,
     user: User = Depends(get_current_user)
 ):
-    user_id = request.id if request.id is not None else request.user_id
-    if user_id is None:
-        raise HTTPException(status_code=422, detail="Missing field: id or user_id")
+    # 归属校验和用户消息落库都放在开流之前：响应头一旦发出去就没法再返回 404 了
+    chat_mapper = get_chat_mapper()
+    await require_own_session(request.session_id, user.id, chat_mapper)
+    await chat_mapper.add_message(request.session_id, "user", request.text)
 
     return StreamingResponse(
-        _stream_generator(request.text, user_id, request.session_id),
+        _stream_generator(request.text, user.id, request.session_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -1,7 +1,7 @@
 from backend.core.executors import shutdown_executors
 from backend.middleware.logging import get_logger
 from backend.model import engine, Base
-from backend.utils.redis_client import close_redis
+from backend.utils.redis_client import close_redis, ensure_redis_version, get_redis_client
 
 logger = get_logger(__name__)
 
@@ -13,7 +13,11 @@ def _get_memory_manager():
 
 
 async def startup_event():
-    """应用启动：建表 + 补做上次未完成的记忆归档"""
+    """应用启动：检查 Redis 版本 + 建表 + 补做上次未完成的记忆归档"""
+    # 不捕获异常：版本不够是配置错误，重启也好不了，必须让启动失败
+    version = await ensure_redis_version(get_redis_client().client)
+    logger.info("Redis 版本 %s", version)
+
     logger.info("应用启动中，正在创建数据库表...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

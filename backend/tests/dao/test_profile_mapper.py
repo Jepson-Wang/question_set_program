@@ -8,9 +8,12 @@ append_notes 这两个纯函数。函数写对了，但 mapper 里按字段名�
 
 所以这里测的是「分派有没有接上」，不是「合并算得对不对」。
 """
+import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.dialects import mysql
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.dao.exceptions import ProfileAlreadyExistsError, ProfileNotFoundError
 from backend.dao.user_profile_mapper import UserProfileMapper
 from backend.model import Base
 from backend.model.user_profile import UserProfile  # noqa: F401  建表需要先导入模型
@@ -80,7 +83,66 @@ async def test_create_persists_notes(mapper):
     assert got.notes == ["第一条观察"]
 
 
-async def test_update_on_missing_profile_returns_none(mapper):
-    assert await mapper.update_user_profile(
-        UserProfileUpdateRequest(user_id=999, grade="八年级")
-    ) is None
+async def test_update_on_missing_profile_raises(mapper):
+    """以前这里返回 None，调用方没检查返回值，「没写进去」就被当成了「写成功」"""
+    with pytest.raises(ProfileNotFoundError):
+        await mapper.update_user_profile(
+            UserProfileUpdateRequest(user_id=999, grade="八年级")
+        )
+
+
+async def test_update_with_negative_user_id_raises_value_error(mapper):
+    """非法 id 是调用方的 bug，不能和「画像不存在」混成一个异常"""
+    with pytest.raises(ValueError):
+        await mapper.update_user_profile(
+            UserProfileUpdateRequest(user_id=-1, grade="八年级")
+        )
+
+
+class _RecordingSession(AsyncSession):
+    """记下经过 session.execute 的每条语句，供测试检查 mapper 实际发出的查询"""
+    statements: list = []
+
+    async def execute(self, statement, *args, **kwargs):
+        _RecordingSession.statements.append(statement)
+        return await super().execute(statement, *args, **kwargs)
+
+
+async def test_update_reads_with_row_lock(tmp_path):
+    """
+    更新路径的那次读必须是 SELECT … FOR UPDATE，否则并发的两次合并会互相覆盖（lost update）。
+
+    为什么不直接看 SQLite 跑出来的 SQL：SQLite 不支持行锁，SQLAlchemy 在 SQLite 方言下
+    会把 FOR UPDATE 静默丢掉，测试照样全绿。所以这里截下 mapper 真正交给 session 的语句对象，
+    再按生产用的 MySQL 方言编译一遍。
+
+    这条测试只能证明「锁加上了」，证明不了「锁住了」——那需要连真实 MySQL 做阻塞测试。
+    """
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    recording_mapper = UserProfileMapper(
+        async_sessionmaker(engine, class_=_RecordingSession, expire_on_commit=False)
+    )
+    try:
+        await _seed(recording_mapper)
+        _RecordingSession.statements = []
+        await recording_mapper.update_user_profile(
+            UserProfileUpdateRequest(user_id=USER, grade="八年级")
+        )
+    finally:
+        await engine.dispose()
+
+    assert len(_RecordingSession.statements) == 1, "更新路径应该只发出一次查询"
+    sql = str(_RecordingSession.statements[0].compile(dialect=mysql.dialect()))
+    assert sql.rstrip().endswith("FOR UPDATE"), sql
+
+
+async def test_create_twice_raises_already_exists(mapper):
+    """
+    唯一键冲突要翻译成业务异常，上层才能据此转去更新。
+    注意这里只覆盖了 SQLite 的分支（按报错文本识别），MySQL 的 1062 分支没有被测到。
+    """
+    await _seed(mapper)
+    with pytest.raises(ProfileAlreadyExistsError):
+        await _seed(mapper)

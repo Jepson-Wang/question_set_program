@@ -1,11 +1,13 @@
 from typing import Type, Optional
 
 from langchain_core.tools import BaseTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+from sqlalchemy import exc as sa_exc
 
 from backend.agents.memory.long_term_memory import LongTermMemory
 from backend.agents.memory.profile_candidates import ProfileCandidate
 from backend.agents.memory.short_term_memory import get_short_term_memory
+from backend.dao.exceptions import ProfileNotFoundError
 from backend.dao.user_profile_mapper import get_user_profile_mapper
 from backend.middleware.logging import get_logger
 from backend.schemas.request.ltm_request import LTMRequest
@@ -21,10 +23,20 @@ _PREFERENCE_FIELDS = ("weak_points", "preferences")
 
 _candidate_store = ProfileCandidate()
 
+# 与 user_profile.grade / subject 的 String(32) 一致
+_SHORT_TEXT_MAX = 32
+
+# 落库失败时，换了数据库连接或等锁释放后重试有可能成功的错误
+_TRANSIENT_DB_ERRORS = (sa_exc.OperationalError, sa_exc.TimeoutError, ProfileNotFoundError)
+
 
 class UserProfileSaveInput(BaseModel):
-    grade: Optional[str] = Field(default=None, description="用户年级，例如 '七年级'")
-    subject: Optional[str] = Field(default=None, description="主修学科，例如 '数学'")
+    grade: Optional[str] = Field(
+        default=None, max_length=_SHORT_TEXT_MAX, description="用户年级，例如 '七年级'"
+    )
+    subject: Optional[str] = Field(
+        default=None, max_length=_SHORT_TEXT_MAX, description="主修学科，例如 '数学'"
+    )
     weak_points: Optional[dict] = Field(
         default=None,
         description="薄弱知识点，JSON 对象。键必须取自 profile_schema Skill 的词表",
@@ -74,6 +86,18 @@ class UserProfileSaveTool(BaseTool):
             "grade": grade, "subject": subject, "notes": notes,
             "weak_points": weak_points, "preferences": preferences,
         }
+
+        # 必须在进候选池之前校验：tool_exec_node 直接调 _arun，绕过了 LangChain 对
+        # args_schema 的校验。放到落库时让数据库报 DataError 就晚了——偏好已经计过一次数，
+        # 模型修正后重新调用会再计一次，用户只说了一次的偏好就这样被凑够了阈值
+        try:
+            UserProfileSaveInput(**incoming)
+        except ValidationError as e:
+            # 逐个字段给出 pydantic 的原因，不能一律提示「超长」：
+            # 模型把 weak_points 传成字符串时，那样的提示会让它去改错地方
+            problems = "；".join(f"{err['loc'][0]}：{err['msg']}" for err in e.errors())
+            return f"【用户画像】保存失败，参数不合法（{problems}），本次什么都没有记录，修正后重新调用即可"
+
         try:
             mapper = await get_user_profile_mapper()
             stm = await get_short_term_memory()
@@ -115,7 +139,31 @@ class UserProfileSaveTool(BaseTool):
                     to_write[field] = promoted
 
             if to_write:
-                await ltm.add_or_update(LTMRequest(user_id=user_id, **to_write))
+                # 先落库、后清候选：落库抛了异常就保留候选，交给用户下次提到时再晋升一次。
+                # 拿不准有没有写进去也按失败算——多晋升一次由 merge_json_fields 的幂等消化，
+                # 而先清候选再落库失败，偏好就永久丢了
+                try:
+                    await ltm.add_or_update(LTMRequest(user_id=user_id, **to_write))
+                except sa_exc.DataError:
+                    # 入口已经校验过长度，走到这里说明有校验没覆盖到的约束，重试也会一直失败
+                    logger.error("user_profile_save_tool 用户 %s 的画像数据不符合数据库约束",
+                                 user_id, exc_info=True)
+                    return _write_failed_report(
+                        to_write, "数据不符合数据库约束，重试也会失败，请不要原样重新调用"
+                    )
+                except _TRANSIENT_DB_ERRORS:
+                    logger.error("user_profile_save_tool 用户 %s 的画像落库失败（瞬时错误）",
+                                 user_id, exc_info=True)
+                    return _write_failed_report(to_write, "数据库暂时不可用")
+                else:
+                    # 只清理这次真正晋升的子键。还在计数的候选不在 to_write 里，必须留着
+                    to_delete = [
+                        (field, sub_key)
+                        for field in _PREFERENCE_FIELDS
+                        for sub_key in (to_write.get(field) or {})
+                    ]
+                    if to_delete:
+                        await _candidate_store.delete_field_by_given(user_id, to_delete)
 
             # 如实汇报三种状态。含糊其辞的话，Agent 会以为候选偏好已经生效，
             # 转头就告诉用户「已经记住了」——下次用户发现没生效，会认为系统在撒谎
@@ -137,4 +185,20 @@ class UserProfileSaveTool(BaseTool):
             # 但必须落日志：只返回字符串的话，开发者在日志里什么都看不到
             logger.error("user_profile_save_tool 保存用户 %s 的画像失败: %s",
                          user_id, e, exc_info=True)
-            return f"【用户画像】保存失败：{str(e)}"
+            # 不回显 str(e)：SQLAlchemy 的异常文本带着整条 SQL 和参数，会进模型上下文
+            return "【用户画像】保存失败：系统内部错误，本次没有保存"
+
+
+def _write_failed_report(to_write: dict, reason: str) -> str:
+    """
+    落库失败时的汇报。两类字段的后果不一样，必须分开说：
+    偏好的候选还在，下次提到时会再试；直写字段没有候选池兜底，这次就是丢了。
+    """
+    parts = [f"【用户画像】写入长期画像失败（{reason}）"]
+    kept = [field for field in _PREFERENCE_FIELDS if field in to_write]
+    lost = [field for field in _DIRECT_FIELDS if field in to_write]
+    if kept:
+        parts.append(f"{'、'.join(kept)} 的候选已保留，用户下次提到时会再次尝试写入")
+    if lost:
+        parts.append(f"{'、'.join(lost)} 本次没有保存，请提醒用户稍后再说一次")
+    return "；".join(parts)
