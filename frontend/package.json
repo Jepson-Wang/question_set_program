@@ -11,11 +11,18 @@
   },
   "dependencies": {
     "@microsoft/fetch-event-source": "^2.0.1",
-    "antd": "^6.6.4",
+    "@tailwindcss/vite": "^4.3.3",
     "axios": "^1.20.0",
+    "katex": "^0.16.47",
+    "lxgw-wenkai-webfont": "^1.7.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.18.4",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "tailwindcss": "^4.3.3",
     "zustand": "^5.0.15"
   },
   "devDependencies": {

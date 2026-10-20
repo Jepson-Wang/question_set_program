@@ -24,3 +24,6 @@ junit.xml
 backend/rag_db/
 backend/rag_uploads/
 backend/rag_eval/
+
+# superpowers 头脑风暴的效果图
+.superpowers/

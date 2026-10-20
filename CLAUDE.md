@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **学生学情分析系统** — An AI-powered tutoring backend. Users submit questions or requests; a ReAct agent routes to the appropriate skill (knowledge extraction, variant question generation, general Q&A, or memory retrieval), while a three-tier memory system maintains conversational continuity.
 
-Backend code lives under `backend/`. A React 19 + Vite + TypeScript frontend lives under `frontend/`; it is a fresh scaffold (Ant Design, React Router, Zustand, axios) and is not covered by these notes. It replaced a Vue 3 client that was deleted in `3bd21d6` — check git history if you need to see what that did.
+Backend code lives under `backend/`. A React 19 + Vite + TypeScript + Tailwind v4 frontend lives under `frontend/` (see "Frontend" below). It replaced a Vue 3 client that was deleted in `3bd21d6` — check git history if you need to see what that did.
 
 ## Running the Server
 
@@ -83,6 +83,16 @@ There is **no vector store in the memory layer**. It used to refine memories wit
 `get_llm(model, streaming)` returns a `ChatOpenAI` instance pointed at the DashScope OpenAI-compatible endpoint. Results are cached by argument via `@singleton_method`. Per-agent model overrides: `PLANNER_MODEL`, `EXTRACT_MODEL`, `DIGEST_MODEL` env vars.
 
 `get_embedding_model()` lives in `agents/agent/embedding.py`, deliberately **not** in `get_llm.py`: importing llama-index costs ~1.5s and 1400+ modules, and nothing on the request path needs embeddings. Only the RAG knowledge base imports it.
+
+## Frontend (`frontend/`)
+
+`npm run dev` (Vite on 5173, proxies `/login`, `/agent`, `/sessions`, `/health` to uvicorn on 8000). Two pages: `/auth` and the chat page at `/` (new conversation) or `/c/:sessionId`.
+
+- **Route prefixes**: SPA routes must not start with a proxied prefix, or a page refresh hits the backend.
+- **State**: `store/auth.ts` (token in localStorage), `store/chat.ts` (session list + messages cached per session; a streaming answer always writes back to the session it was sent from).
+- **Streaming**: `api/stream.ts` wraps `fetch-event-source` with `openWhenHidden: true` and no retry — both defaults would re-POST the question. Only `thinking` events become margin-note steps.
+- **KaTeX**: the top-level `katex` must match the version `rehype-katex` bundles, or the CSS class names differ and sub/superscripts render full size. Font/KaTeX CSS is imported from `main.tsx`, not `@import`ed in `index.css` (Tailwind inlines it and breaks the relative font URLs).
+- Visual direction: graph-paper notebook, blue-black ink, red-pen margin notes (`font-hand`, LXGW WenKai). Theme tokens live in `@theme` in `src/index.css`.
 
 ## Key Conventions
 

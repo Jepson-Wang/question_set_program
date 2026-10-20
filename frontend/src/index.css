@@ -1,111 +1,144 @@
-:root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+@import 'tailwindcss';
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+/*
+ * 方向 A「纸本 · 朱批」：方格练习本 + 蓝黑墨水 + 红笔批注。
+ * 大胆只用在一处——页边批注（文楷 + 红笔色），其余保持安静。
+ */
+@theme {
+  --color-paper: #f7f6f1;      /* 纸面，偏冷一点，不走奶油色 */
+  --color-paper-deep: #eeede6; /* 侧边栏、品牌区 */
+  --color-grid: #e4e6e0;       /* 方格线 */
+  --color-rule: #d8dbd2;       /* 分隔线、输入框边 */
+  --color-ink: #1c2433;        /* 蓝黑墨水：正文、主按钮 */
+  --color-pencil: #737a86;     /* 铅笔灰：次要文字 */
+  --color-redpen: #d3342b;     /* 红笔：批注、强调、当前项 */
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  --font-sans: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-serif: 'Songti SC', 'STSong', 'Source Han Serif SC', 'Noto Serif SC', serif;
+  --font-hand: 'LXGW WenKai', 'Kaiti SC', 'STKaiti', 'KaiTi', serif;
+}
 
-  @media (max-width: 1024px) {
-    font-size: 16px;
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-paper font-sans text-ink antialiased;
+  }
+
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-redpen;
   }
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+/* 5mm 方格纸纹，只铺在品牌区和空状态上，正文区保持干净 */
+@utility grid-paper {
+  background-image:
+    linear-gradient(var(--color-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-grid) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* 回答正文：练习册排版。标题用宋体，引用块像老师在旁边画的红线 */
+@layer components {
+  .answer {
+    @apply leading-8;
   }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
+  .answer > * + * {
+    @apply mt-4;
+  }
+  .answer h1,
+  .answer h2,
+  .answer h3 {
+    @apply font-serif font-bold text-ink;
+  }
+  .answer h1 {
+    @apply text-xl;
+  }
+  .answer h2 {
+    @apply text-lg;
+  }
+  .answer h3 {
+    @apply text-base;
+  }
+  .answer ul {
+    @apply list-disc pl-6;
+  }
+  .answer ol {
+    @apply list-decimal pl-6;
+  }
+  .answer li + li {
+    @apply mt-1;
+  }
+  .answer strong {
+    @apply font-semibold;
+  }
+  .answer blockquote {
+    @apply border-l-2 border-redpen/60 pl-4 text-ink/80;
+  }
+  .answer code {
+    @apply rounded bg-paper-deep px-1 py-0.5 text-[0.9em];
+  }
+  .answer pre {
+    @apply overflow-x-auto rounded-lg bg-paper-deep p-4;
+  }
+  .answer pre code {
+    @apply bg-transparent p-0;
+  }
+  .answer table {
+    @apply block overflow-x-auto border-collapse;
+  }
+  .answer th,
+  .answer td {
+    @apply border border-rule px-3 py-1.5;
+  }
+  .answer .katex-display {
+    @apply overflow-x-auto overflow-y-hidden py-1;
   }
 }
 
-#root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
+/*
+ * 全页唯一的动效：批注一条条「写」上去，答案整段淡入。
+ * 都是对用户提问的回应，不是装饰；系统开启「减少动态效果」时由下面的规则关掉
+ */
+@keyframes write-in {
+  from {
+    opacity: 0;
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    opacity: 1;
+    clip-path: inset(0 0 0 0);
   }
 }
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
+@keyframes fade-in {
+  from {
+    opacity: 0;
   }
 }
-p {
-  margin: 0;
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+.note-in {
+  animation: write-in 0.5s ease-out both;
+}
+.answer-in {
+  animation: fade-in 0.4s ease-out both;
+}
+.caret {
+  animation: blink 1s steps(1) infinite;
 }
 
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }
