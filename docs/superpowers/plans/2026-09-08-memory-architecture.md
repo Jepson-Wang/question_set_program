@@ -2493,7 +2493,7 @@ B 语义和原子化合成一步做，**不要先用 Python 写一遍 B 再搬�
 
 **这一步新开的一个洞，要知道它在哪**：确认和提交之间，候选的值可能已经被改了（A 提交「简单」达到阈值 → B 提交「困难」把计数重置为 1 → A 的确认把整个 field 删掉 → B 的计数丢了）。彻底的解法是让确认也变成条件删除——带上晋升时那个值，只有存着的值仍然相同才删，同样是一个很短的 CAS 脚本。可以先不做，但要在注释里记下来，别让它变成一个没人知道的洞。
 
-- [ ] **Step 5: MySQL 侧补行锁，修 JSON 列的 lost update**
+- [x] **Step 5: MySQL 侧补行锁，修 JSON 列的 lost update**（`f8bf34b`）
 
 `update_user_profile` 是 `SELECT → 改 → COMMIT`，中间没有任何行锁：
 
@@ -2634,7 +2634,7 @@ Step 4 之后这个失败是可恢复的（候选还在，用户下次提到还�
 
 ---
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `backend/tests/test_profile_schema_skill.py`：
 
@@ -2667,12 +2667,12 @@ def test_vocab_missing_returns_empty():
     assert load_vocab("question_variant") == {}
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd backend && python -m pytest tests/test_profile_schema_skill.py -v`
 Expected: FAIL，`ImportError: cannot import name 'load_vocab'`
 
-- [ ] **Step 3: 写 SKILL.md**
+- [x] **Step 3: 写 SKILL.md**（实际按值域版落地：`VOCAB` 为「字段 → {键: [允许的值]}」，下方草稿只有键；测试在 `tests/agents/skills/`）
 
 创建 `backend/agents/skills/profile_schema/SKILL.md`：
 
@@ -2736,7 +2736,7 @@ VOCAB = {
 ```
 ````
 
-- [ ] **Step 4: 实现 load_vocab**
+- [x] **Step 4: 实现 load_vocab**
 
 在 `backend/agents/skills/skill_runner.py` 末尾追加：
 
@@ -2755,7 +2755,7 @@ def load_vocab(name: str, tag: str = "vocab") -> dict:
     return ns.get("VOCAB", {})
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 Run: `cd backend && python -m pytest tests/test_profile_schema_skill.py -v`
 Expected: 4 passed
