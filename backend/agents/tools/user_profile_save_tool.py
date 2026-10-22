@@ -7,6 +7,7 @@ from sqlalchemy import exc as sa_exc
 from backend.agents.memory.long_term_memory import LongTermMemory
 from backend.agents.memory.profile_candidates import ProfileCandidate
 from backend.agents.memory.short_term_memory import get_short_term_memory
+from backend.agents.skills.skill_runner import load_vocab
 from backend.dao.exceptions import ProfileNotFoundError
 from backend.dao.user_profile_mapper import get_user_profile_mapper
 from backend.middleware.logging import get_logger
@@ -39,11 +40,11 @@ class UserProfileSaveInput(BaseModel):
     )
     weak_points: Optional[dict] = Field(
         default=None,
-        description="薄弱知识点，JSON 对象。键必须取自 profile_schema Skill 的词表",
+        description="薄弱知识点，JSON 对象。键和值都必须取自 profile_schema Skill 的词表",
     )
     preferences: Optional[dict] = Field(
         default=None,
-        description="长期偏好，JSON 对象。键必须取自 profile_schema Skill 的词表",
+        description="长期偏好，JSON 对象。键和值都必须取自 profile_schema Skill 的词表",
     )
     notes: Optional[list] = Field(
         default=None,
@@ -60,9 +61,9 @@ class UserProfileSaveTool(BaseTool):
         "保存当前用户的长期画像。年级、学科和 notes 立即生效；"
         "薄弱知识点和长期偏好需要在不同轮次中出现两次才会写入长期画像，"
         "以区分一次性诉求和稳定偏好。"
-        "weak_points 和 preferences 的键必须取自 profile_schema Skill 的词表——"
-        "自造键名会导致频次永远累积不到阈值，偏好静默失效；"
-        "确实没有合适的键时，请写进 notes 而不是新造一个键。"
+        "weak_points 和 preferences 的键和值都必须取自 profile_schema Skill 的词表——"
+        "词表外的键或值不参与频次确认，会被原样转存 notes；"
+        "确实没有合适的键或值时，直接写进 notes，不要自己造词。"
         "用户明确提到个人学情信息时调用"
     )
     args_schema: Type[BaseModel] = UserProfileSaveInput
@@ -110,14 +111,26 @@ class UserProfileSaveTool(BaseTool):
             }
 
             # 偏好类逐个子键过候选池，只有晋升的才进写库集合
+            vocab = load_vocab("profile_schema")
             pending: list[str] = []   # 已记录、还没到阈值
             unrecorded: list[str] = []  # 候选池不可用，这次压根没记上
+            overflow: list[str] = []  # 键或值不在词表里，转存 notes
             for field in _PREFERENCE_FIELDS:
                 payload = incoming[field]
                 if not payload:
                     continue
+                # 某个字段取不到词表时不做限制：词表写坏了不该让画像写入整个失效，
+                # load_vocab 那边会留 warning
+                domain = vocab.get(field) or {}
                 promoted: dict = {}
                 for sub_key, value in payload.items():
+                    # 键不在词表里时 get 拿到空元组，任何值都不在其中，两种情况一个判断
+                    if domain and value not in domain.get(sub_key, ()):
+                        # 不进候选池：键名不受控会永远累积不到阈值，值不受控会让
+                        # 「简单点」和「偏纯计算」被当成两个主张、计数互相重置。
+                        # 也不丢弃：原话转存 notes，立即生效
+                        overflow.append(f"{sub_key}：{value}")
+                        continue
                     times, is_promoted = await _candidate_store.submit_one_candidate(
                         user_id, field, sub_key, value
                     )
@@ -137,6 +150,10 @@ class UserProfileSaveTool(BaseTool):
                         )
                 if promoted:
                     to_write[field] = promoted
+
+            if overflow:
+                # 接在模型自己写的 notes 后面；append_notes 按原文去重，同一句反复转存不会堆积
+                to_write["notes"] = list(to_write.get("notes") or []) + overflow
 
             if to_write:
                 # 先落库、后清候选：落库抛了异常就保留候选，交给用户下次提到时再晋升一次。
@@ -170,6 +187,9 @@ class UserProfileSaveTool(BaseTool):
             parts = []
             if to_write:
                 parts.append(f"已写入长期画像：{'、'.join(to_write)}")
+            if overflow:
+                # 单独点名：只说「写入了 notes」的话，模型会以为这些偏好进了候选池
+                parts.append(f"以下内容不在词表里，已转存 notes：{'、'.join(overflow)}")
             if pending:
                 parts.append(f"已记录候选偏好，再次提到时写入：{'、'.join(pending)}")
             if unrecorded:

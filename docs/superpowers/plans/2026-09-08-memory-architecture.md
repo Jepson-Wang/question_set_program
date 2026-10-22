@@ -2760,7 +2760,7 @@ def load_vocab(name: str, tag: str = "vocab") -> dict:
 Run: `cd backend && python -m pytest tests/test_profile_schema_skill.py -v`
 Expected: 4 passed
 
-- [ ] **Step 6: 让 UserProfileSaveTool 按词表分流**
+- [x] **Step 6: 让 UserProfileSaveTool 按词表分流**（实际同时检查值域：键不在词表或值不在值域，都转存 notes）
 
 在 `backend/agents/tools/user_profile_save_tool.py` 顶部加入导入：
 
@@ -2809,7 +2809,7 @@ from backend.agents.skills.skill_runner import load_vocab
                 parts.append(f"词表外的内容已转存 notes：{'、'.join(overflow)}")
 ```
 
-- [ ] **Step 7: 写分流的测试**
+- [x] **Step 7: 写分流的测试**（放在 `tests/agents/tools/test_user_profile_save_tool.py`）
 
 追加到 `backend/tests/test_profile_schema_skill.py`：
 
@@ -2855,7 +2855,7 @@ def _coro(value):
 Run: `cd backend && python -m pytest tests/ -v`
 Expected: 全部 passed
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 git add backend/agents/skills/profile_schema/ backend/agents/skills/skill_runner.py backend/agents/tools/user_profile_save_tool.py backend/tests/test_profile_schema_skill.py

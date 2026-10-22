@@ -60,7 +60,22 @@ def patched(monkeypatch):
     monkeypatch.setattr(tool_module, "LongTermMemory", FakeLongTermMemory)
     monkeypatch.setattr(tool_module, "get_user_profile_mapper", fake_factory)
     monkeypatch.setattr(tool_module, "get_short_term_memory", fake_factory)
+    # 空词表 = 不做限制。这个文件里的编排测试和词表内容无关，不能跟着 SKILL.md 的改动变红
+    monkeypatch.setattr(tool_module, "load_vocab", lambda name: {})
     return store
+
+
+# 分流测试用固定词表，不读真实 SKILL.md
+TEST_VOCAB = {
+    "weak_points": {"因式分解": ["薄弱", "一般", "已掌握"]},
+    "preferences": {"题目风格": ["偏纯计算", "不要与原题雷同"]},
+}
+
+
+@pytest.fixture
+def with_vocab(patched, monkeypatch):
+    monkeypatch.setattr(tool_module, "load_vocab", lambda name: TEST_VOCAB)
+    return patched
 
 
 async def _save(**kwargs) -> str:
@@ -139,3 +154,56 @@ async def test_unexpected_error_does_not_echo_exception_text(patched):
     assert patched.deleted == []
     assert "secret_column" not in result
     assert "保存失败" in result
+
+
+# ---------- 按词表分流 ----------
+
+async def test_in_vocab_pair_goes_through_candidate_pool(with_vocab):
+    """键和值都在词表里，照常进候选池计数"""
+    await _save(preferences={"题目风格": "偏纯计算"})
+
+    assert with_vocab.submitted == ["题目风格"]
+    assert FakeLongTermMemory.written == [], "只说了一次，不该落库"
+
+
+async def test_unknown_key_goes_to_notes_without_counting(with_vocab):
+    """
+    词表外的键不能进候选池：进去也永远累积不到阈值，偏好静默失效。
+    也不能丢掉，所以原话转存 notes
+    """
+    result = await _save(preferences={"做题时段": "晚上"})
+
+    assert with_vocab.submitted == []
+    [request] = FakeLongTermMemory.written
+    assert request.notes == ["做题时段：晚上"]
+    assert "做题时段：晚上" in result, "要告诉模型这条去了 notes，否则它会以为进了候选池"
+
+
+async def test_value_outside_domain_goes_to_notes_without_counting(with_vocab):
+    """
+    键对、值不在值域里，同样转存 notes。放进候选池的话，「简单点」和「偏纯计算」
+    会被当成两个主张，计数互相重置（Task 9.5 的 B 语义）
+    """
+    await _save(weak_points={"因式分解": "很差"})
+
+    assert with_vocab.submitted == []
+    [request] = FakeLongTermMemory.written
+    assert request.notes == ["因式分解：很差"]
+
+
+async def test_overflow_is_appended_after_model_notes(with_vocab):
+    """模型自己写的 notes 和转存的内容都要保留，不能互相覆盖"""
+    await _save(notes=["喜欢用画图理解题意"], preferences={"做题时段": "晚上"})
+
+    [request] = FakeLongTermMemory.written
+    assert request.notes == ["喜欢用画图理解题意", "做题时段：晚上"]
+
+
+async def test_mixed_payload_routes_each_sub_key_independently(with_vocab):
+    """同一个字段里合规的照常计数，不合规的转存，互不影响"""
+    await _save(preferences={"题目风格": "偏纯计算", "做题时段": "晚上"})
+
+    assert with_vocab.submitted == ["题目风格"]
+    [request] = FakeLongTermMemory.written
+    assert request.notes == ["做题时段：晚上"]
+    assert request.preferences is None, "题目风格只计了一次数，不该写进 preferences"
