@@ -1,6 +1,7 @@
 from sqlalchemy.future import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from backend.dao.exceptions import ProfileAlreadyExistsError, ProfileNotFoundError
 from backend.model import AsyncSessionLocal  # 导入会话工厂
 from backend.model.user_profile import UserProfile
 from typing import Optional
@@ -17,11 +18,13 @@ _APPEND_FIELDS = ("notes",)
 NOTES_MAX_SIZE = 50
 
 def merge_json_fields(old: dict | None,new: dict | None) -> dict:
+    """服务于 weak_points 和 preferences：新键加入，同名键以新值覆盖，没提到的老键保留"""
     merged = dict(old or {})
     merged.update(new or {})
     return merged
 
 def append_notes(old: list | None, new: list | None, max_size: int = NOTES_MAX_SIZE) -> list:
+    """服务于notes, 用于加入，更新和删除多余元素"""
     result = list(old or [])
     for item in new or []:
         if item not in result:
@@ -29,6 +32,21 @@ def append_notes(old: list | None, new: list | None, max_size: int = NOTES_MAX_S
     if len(result) > max_size:
         result = result[-max_size:]
     return result
+
+_MYSQL_DUP_ENTRY = 1062
+
+
+def _is_duplicate_key(e: IntegrityError) -> bool:
+    """
+    IntegrityError 还包括 NOT NULL（1048）、外键（1452）等，只有唯一键冲突才意味着
+    「画像已存在」。这张表除了自增主键只有 user_id 一个唯一约束，认出唯一键冲突就够了。
+    生产是 MySQL，测试跑在 SQLite 上，两边的报错形态不同，都要认。
+    """
+    args = getattr(e.orig, "args", ())
+    if args and args[0] == _MYSQL_DUP_ENTRY:
+        return True
+    return "UNIQUE constraint failed" in str(e.orig)
+
 
 class UserProfileMapper:
     def __init__(self, session_factory: AsyncSessionLocal):
@@ -51,9 +69,15 @@ class UserProfileMapper:
                 await session.commit()
                 await session.refresh(new_profile)
                 return new_profile
-            except SQLAlchemyError as e:
+            # IntegrityError 是 SQLAlchemyError 的子类，必须写在前面，否则永远匹配不到
+            except IntegrityError as e:
                 await session.rollback()
-                raise e
+                if _is_duplicate_key(e):
+                    raise ProfileAlreadyExistsError(user_profile.user_id) from e
+                raise
+            except SQLAlchemyError:
+                await session.rollback()
+                raise
 
     async def get_by_user_id(self, user_id: int) -> Optional[UserProfileResponse]:
         """根据用户ID获取画像"""
@@ -65,16 +89,35 @@ class UserProfileMapper:
                 return None
             return UserProfileResponse.model_validate(user_profile)
 
-    async def update_user_profile(self, profile_dto: UserProfileUpdateRequest) -> Optional[UserProfileResponse]:
-        """更新用户画像"""
+    async def update_user_profile(self, profile_dto: UserProfileUpdateRequest) -> UserProfileResponse:
+        """
+        更新用户画像。画像不存在时抛 ProfileNotFoundError 而不是返回 None：
+        调用方只要漏查一次返回值，「没写进去」就会被当成「写成功了」，
+        而候选池会据此删掉候选，这条偏好就丢了。
+        """
+        # 非法 id 是调用方的 bug，和「画像不存在」不是一回事，不混成同一个异常
+        if profile_dto.user_id < 0:
+            raise ValueError(f"非法的 user_id：{profile_dto.user_id}")
+
         async with self.session_factory() as session:
             try:
-                stmt = select(UserProfile).where(UserProfile.user_id == profile_dto.user_id)
+                # 当前读并加 X 锁：合并是在 Python 里基于读出的旧值做的，普通 SELECT 是快照读，
+                # 两个请求并发时后提交的会整列覆盖先提交的（lost update），而且两边都不报错。
+                # 锁从这里一直持有到下面的 commit，粒度是这个用户的画像这一行。
+                # ⚠️ 这段临界区里只能有内存计算，不要加 Redis、LLM 之类的外部调用，
+                #    否则持锁时间会从毫秒级拉长到秒级，同一用户的其他写入都得等着。
+                # 行不存在时 RR 下会加间隙锁，但这里只会抛 ProfileNotFoundError 后回滚，
+                # 同一事务里没有 INSERT，不会和建档路径形成间隙锁死锁
+                stmt = (
+                    select(UserProfile)
+                    .where(UserProfile.user_id == profile_dto.user_id)
+                    .with_for_update()
+                )
                 result = await session.execute(stmt)
                 user_profile = result.scalar_one_or_none()
 
-                if not user_profile or profile_dto.user_id<0:
-                    return None
+                if user_profile is None:
+                    raise ProfileNotFoundError(profile_dto.user_id)
 
                 dto_data = profile_dto.model_dump(exclude_none=True)
                 for key, value in dto_data.items():
@@ -94,9 +137,9 @@ class UserProfileMapper:
                 await session.commit()
                 await session.refresh(user_profile)
                 return UserProfileResponse.model_validate(user_profile)
-            except SQLAlchemyError as e:
+            except SQLAlchemyError:
                 await session.rollback()
-                raise e
+                raise
 
     async def delete_memory(self, user_id: int) -> bool:
         """
@@ -113,9 +156,9 @@ class UserProfileMapper:
                 await session.delete(user_profile)
                 await session.commit()
                 return True
-            except SQLAlchemyError as e:
+            except SQLAlchemyError:
                 await session.rollback()
-                raise e
+                raise
 
 
     # 其他方法（delete_memory/get_all/update_weak_points 等）按相同逻辑改造：

@@ -56,3 +56,10 @@ def redis_unavailable(reason: str) -> None:
     if os.getenv("REQUIRE_REDIS") == "1":
         pytest.fail(f"REQUIRE_REDIS=1，但 {reason}",pytrace=False)
     pytest.skip(reason)
+
+
+def mysql_unavailable(reason: str) -> None:
+    """和 redis_unavailable 同一个约定：本地默认跳过，设置 REQUIRE_MYSQL=1 时直接失败"""
+    if os.getenv("REQUIRE_MYSQL") == "1":
+        pytest.fail(f"REQUIRE_MYSQL=1，但 {reason}", pytrace=False)
+    pytest.skip(reason)

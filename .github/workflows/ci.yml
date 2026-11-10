@@ -73,11 +73,29 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      mysql:
+        image: mysql:8.4                   # 与生产同一 major.minor：行锁、默认认证插件的行为要和线上一致
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-only
+          MYSQL_DATABASE: question_set_test   # 专用测试库，和下面占位的应用库不是同一个
+          MYSQL_USER: ci_test
+          MYSQL_PASSWORD: ci_test_pw
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uci_test -pci_test_pw --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 15
+          --health-start-period 30s
     env:
       REQUIRE_REDIS: "1"                  # Redis 连不上就失败，不许静默跳过
+      REQUIRE_MYSQL: "1"                  # MySQL 连不上就失败，否则行锁测试会被静默跳过、CI 白跑
+      TEST_SQL_DATABASE_URL: mysql+asyncmy://ci_test:ci_test_pw@127.0.0.1:3306/question_set_test
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
-      # 下面都是占位值：测试不连 MySQL、不调大模型，只为满足模块导入时的配置检查
+      # 下面都是占位值：应用侧不连 MySQL（ci 用户、ci 库在服务里都不存在，连也连不上）、不调大模型，
+      # 只为满足模块导入时的配置检查；真正连库的只有上面的 TEST_SQL_DATABASE_URL
       SQL_DATABASE_URL: mysql+asyncmy://ci:ci@127.0.0.1:3306/ci
       API_KEY: ci-placeholder
       API_URL: http://127.0.0.1:9/v1

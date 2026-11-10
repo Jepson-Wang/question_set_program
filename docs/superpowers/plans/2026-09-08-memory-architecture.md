@@ -2433,7 +2433,7 @@ git commit -m "feat: 画像写入引入候选池频次确认，区分一次性�
 
 ---
 
-- [ ] **Step 1: 确认值域真的在起作用**
+- [x] **Step 1: 确认值域真的在起作用**（用真实 LLM 对话人工验证：模型会按词表取值，词表外的转存 notes；没有统计比例）
 
 跑几轮真实对话，统计模型写进 `weak_points` / `preferences` 的值有多大比例落在枚举内、多大比例被转存进了 `notes`。
 
@@ -2441,7 +2441,7 @@ Task 10 保证了**存进去的值一定合法**，但保证不了**模型愿意
 
 这一步不写代码，但它决定后面几步值不值得做。
 
-- [ ] **Step 2: 把读-改-写换成 Lua 脚本，并在脚本里直接实现 B 语义**
+- [x] **Step 2: 把读-改-写换成 Lua 脚本，并在脚本里直接实现 B 语义**（`2eb1aec`；CAS 条件删除 `ab543bf`；TTL 改为初始 1 天、同值再提续 12 小时 `bc31adb`）
 
 B 语义和原子化合成一步做，**不要先用 Python 写一遍 B 再搬进 Lua**——那是把同一段逻辑写两次，而且第一版注定要删。
 
@@ -2462,7 +2462,7 @@ B 语义和原子化合成一步做，**不要先用 Python 写一遍 B 再搬�
 
 把三件事写进 `profile_candidates.py` 的模块注释：**为什么是 B、为什么 B 依赖 Task 10 的值域、为什么是 Lua 而不是 `WATCH`**。半年后没人记得这些选择背后各有一个前提，而其中两个前提是会变的。
 
-- [ ] **Step 3: 按脚本之后的形态重新收拢 `submit_one_candidate`**
+- [x] **Step 3: 按脚本之后的形态重新收拢 `submit_one_candidate`**（随 `2eb1aec` 一起：一层 `try`，TODO 已删）
 
 拆分仍然要做，但**切法和原计划不同**。原来的切法是把「由旧记录和新值算出新记录」拆成一个不碰 Redis 的纯函数，理由是它好测——可是 Step 2 之后这段逻辑搬进了 Lua，那个边界已经不存在了。**不要按一个即将消失的边界去切。**
 
@@ -2472,7 +2472,7 @@ B 语义和原子化合成一步做，**不要先用 Python 写一遍 B 再搬�
 
 顺带把 Task 9 留下的那条 TODO 删掉——它已经被这个任务回答了，留着会让人以为还有债没还。
 
-- [ ] **Step 4: 改写入顺序 —— 先落库，后清候选**
+- [x] **Step 4: 改写入顺序 —— 先落库，后清候选**（`f97847f`）
 
 **现状是错的**：`submit_one_candidate` 自己 `HDEL` 掉候选并返回「已晋升」，调用方拿到之后才去写 MySQL。中间这一步失败（DB 挂了、进程被 kill、连接超时），结果是候选没了、库里也没有，**用户说了两次的偏好一次都没留下**，而且工具层的 `except` 只会返回一个字符串，没人会发现。
 
@@ -2493,7 +2493,7 @@ B 语义和原子化合成一步做，**不要先用 Python 写一遍 B 再搬�
 
 **这一步新开的一个洞，要知道它在哪**：确认和提交之间，候选的值可能已经被改了（A 提交「简单」达到阈值 → B 提交「困难」把计数重置为 1 → A 的确认把整个 field 删掉 → B 的计数丢了）。彻底的解法是让确认也变成条件删除——带上晋升时那个值，只有存着的值仍然相同才删，同样是一个很短的 CAS 脚本。可以先不做，但要在注释里记下来，别让它变成一个没人知道的洞。
 
-- [ ] **Step 5: MySQL 侧补行锁，修 JSON 列的 lost update**
+- [x] **Step 5: MySQL 侧补行锁，修 JSON 列的 lost update**（`f8bf34b`）
 
 `update_user_profile` 是 `SELECT → 改 → COMMIT`，中间没有任何行锁：
 
@@ -2520,7 +2520,7 @@ InnoDB 默认 REPEATABLE READ，B 的非锁定读走自己的快照，**即使 A
 
 **这里用悲观锁和前面排除分布式锁不矛盾，理由要写进注释**：同是悲观锁，**数据库行锁由 DB 管生命周期**——事务结束自动释放、死锁自动检测、没有 TTL 问题；而 Redis 的分布式锁要你自己实现这三件事。「悲观锁是不是过度设计」取决于谁管锁。
 
-- [ ] **Step 6: 修首次建档的 check-then-insert 竞态**
+- [x] **Step 6: 修首次建档的 check-then-insert 竞态**（`b900907`）
 
 `add_or_update` 先查后建：查不到就 `create_memory`，查得到就走更新。而 `user_profile.user_id` 上有唯一约束。
 
@@ -2530,7 +2530,27 @@ Step 4 之后这个失败是可恢复的（候选还在，用户下次提到还�
 
 改法二选一：用数据库的 upsert 语义一条语句搞定；或者保留现在的分支，但把唯一键冲突单独接住、退化成一次更新。**不要用「先查一次再查一次」这类重试来绕**，那只是把窗口变窄，没有消掉它。
 
-- [ ] **Step 7: 并发验证**
+**决策记录：选了第二种（保留分支，接住唯一键冲突后退化成更新）**
+
+上面说第一种能「一条语句搞定」，这个说法过于乐观，写的时候还没想过合并逻辑能不能放进 SQL。`ON DUPLICATE KEY UPDATE` 的 UPDATE 子句本质上就是一次单语句更新，所以 Step 5 排除单语句更新的理由，在这里同样成立：
+
+| 数据库 upsert 的问题 | 说明 |
+|---|---|
+| 合并逻辑写不进去 | `notes` 的去重加「只保留最后 50 条」写不进 UPDATE 子句，这是根本原因 |
+| 方言分叉 | MySQL 和 SQLite 的 upsert 语法不同，测试跑在 SQLite 上，测试和生产会走两份代码 |
+| 消耗自增 id | 即使最终走了更新分支，也会消耗一个自增值，而绝大多数调用走的正是更新 |
+| 并发下的锁 | 冲突时会加 X 型临键锁，有公开的死锁案例，并不比第二种更省事 |
+
+第二种的实现要点：
+
+- **upsert 语义仍然在**，只是放在应用层实现：预查询是快速路径，不负责正确性；判定谁先建档的是 `user_id` 的唯一约束。
+- 唯一键冲突由 DAO 层翻译成业务异常 `ProfileAlreadyExistsError`，同时识别 MySQL 的 1062 和 SQLite 的报错文本。上层只认这个业务异常，不接触驱动的错误码。
+- 「画像不存在」也改为抛 `ProfileNotFoundError`，不再静默返回 `None`。否则调用方漏查一次返回值，就会把没写进去当成写成功了，而 Step 4 会据此删掉候选。
+- `add_or_update` 的失败只有一种信号，就是抛异常。正常返回就代表已经落库。
+
+⚠️ **不要在同一个事务里先 `SELECT … FOR UPDATE`、查不到再 INSERT**。行不存在时，RR 隔离级别下只能加间隙锁；间隙锁之间互相兼容，但会挡住对方的插入意向锁，两个并发建档的请求会形成死锁。而且间隙锁锁的是区间，`user_id` 不同、只要落在同一个间隙里也会死锁。「这一行只能由一个人创建」要交给唯一约束保证，不要靠加锁读来判断这一行是否存在。
+
+- [x] **Step 7: 并发验证**（候选池、首次建档、行锁三条并发测试在 CI 里真实运行；行锁测试靠 `523f020` 给 CI 加的 MySQL 服务，去掉 `with_for_update()` 后稳定失败）
 
 前面六步的成立与否，只有这一步能证明。
 
@@ -2614,7 +2634,7 @@ Step 4 之后这个失败是可恢复的（候选还在，用户下次提到还�
 
 ---
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `backend/tests/test_profile_schema_skill.py`：
 
@@ -2647,12 +2667,12 @@ def test_vocab_missing_returns_empty():
     assert load_vocab("question_variant") == {}
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd backend && python -m pytest tests/test_profile_schema_skill.py -v`
 Expected: FAIL，`ImportError: cannot import name 'load_vocab'`
 
-- [ ] **Step 3: 写 SKILL.md**
+- [x] **Step 3: 写 SKILL.md**（实际按值域版落地：`VOCAB` 为「字段 → {键: [允许的值]}」，下方草稿只有键；测试在 `tests/agents/skills/`）
 
 创建 `backend/agents/skills/profile_schema/SKILL.md`：
 
@@ -2716,7 +2736,7 @@ VOCAB = {
 ```
 ````
 
-- [ ] **Step 4: 实现 load_vocab**
+- [x] **Step 4: 实现 load_vocab**
 
 在 `backend/agents/skills/skill_runner.py` 末尾追加：
 
@@ -2735,12 +2755,12 @@ def load_vocab(name: str, tag: str = "vocab") -> dict:
     return ns.get("VOCAB", {})
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 Run: `cd backend && python -m pytest tests/test_profile_schema_skill.py -v`
 Expected: 4 passed
 
-- [ ] **Step 6: 让 UserProfileSaveTool 按词表分流**
+- [x] **Step 6: 让 UserProfileSaveTool 按词表分流**（实际同时检查值域：键不在词表或值不在值域，都转存 notes）
 
 在 `backend/agents/tools/user_profile_save_tool.py` 顶部加入导入：
 
@@ -2789,7 +2809,7 @@ from backend.agents.skills.skill_runner import load_vocab
                 parts.append(f"词表外的内容已转存 notes：{'、'.join(overflow)}")
 ```
 
-- [ ] **Step 7: 写分流的测试**
+- [x] **Step 7: 写分流的测试**（放在 `tests/agents/tools/test_user_profile_save_tool.py`）
 
 追加到 `backend/tests/test_profile_schema_skill.py`：
 
@@ -2830,12 +2850,12 @@ def _coro(value):
     return _inner
 ```
 
-- [ ] **Step 8: 运行全部测试**
+- [x] **Step 8: 运行全部测试**（PR #30 的 CI：208 passed，0 skipped）
 
 Run: `cd backend && python -m pytest tests/ -v`
 Expected: 全部 passed
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 git add backend/agents/skills/profile_schema/ backend/agents/skills/skill_runner.py backend/agents/tools/user_profile_save_tool.py backend/tests/test_profile_schema_skill.py

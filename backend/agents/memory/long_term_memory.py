@@ -20,6 +20,7 @@ from datetime import datetime
 from fastapi import Depends
 
 from backend.agents.memory.short_term_memory import ShortTermMemory, get_short_term_memory
+from backend.dao.exceptions import ProfileAlreadyExistsError
 from backend.dao.user_profile_mapper import UserProfileMapper, get_user_profile_mapper
 from backend.model.user_profile import UserProfile
 from backend.schemas.request.ltm_request import LTMRequest
@@ -37,7 +38,13 @@ class LongTermMemory:
     async def add_or_update(self, request: LTMRequest) -> None:
         """
         若用户画像不存在则创建，存在则部分更新（只覆盖 request 中非 None 的字段）。
+
+        失败只有一种信号：抛异常。正常返回就代表已经落库，调用方据此清理候选池，
+        所以这里不能有「没写进去却正常返回」的路径。
         """
+        # 预查询是快速路径，不负责正确性：绝大多数调用走更新，总是先 INSERT 的话
+        # 每次都白失败一次，还会白白消耗自增 id。并发首次建档的窗口由下面的
+        # ProfileAlreadyExistsError 兜住，判定谁先建档的是 user_id 的唯一约束
         existing = await self.user_profile_mapper.get_by_user_id(request.user_id)
 
         if existing is None:
@@ -52,8 +59,13 @@ class LongTermMemory:
                 create_time=datetime.now(),
                 update_time=datetime.now(),
             )
-            await self.user_profile_mapper.create_memory(new_profile)
-            return
+            try:
+                await self.user_profile_mapper.create_memory(new_profile)
+                return
+            except ProfileAlreadyExistsError:
+                # 预查询之后、INSERT 之前别人抢先建了档：不算失败，往下走更新，
+                # 把这次的内容合并进去
+                pass
 
         # 部分更新：只传入非 None 字段，mapper 内部通过 exclude_none 过滤
         update_dto = UserProfileUpdateRequest(
@@ -65,6 +77,8 @@ class LongTermMemory:
             notes=request.notes,
             update_time=datetime.now(),
         )
+        # 画像在预查询之后被删掉时抛 ProfileNotFoundError，不在这里接：
+        # 让它冒到工具层判失败，候选得以保留
         await self.user_profile_mapper.update_user_profile(update_dto)
 
     async def get_by_user_id(self, user_id: int) -> UserProfileResponse | None:

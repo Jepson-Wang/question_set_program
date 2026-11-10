@@ -1,5 +1,23 @@
 """
 用于记录某个用户画像的偏好被统计几次，如果超过阈值，那么就加入到库中
+
+值语义（B）：同一个子键下值变了，计数归 1、存新值，而不是继续累加。
+「简单点」和「难一点」是两个主张，不能凑成一次确认。B 依赖 Task 10 的值域枚举：
+进得了候选池的值必然在枚举内，字符串相等就是语义相等；如果值是自由文本，
+「简单点」「简单一些」会被判成不同的值，计数一路重置，稳定偏好永远晋升不了，而且不报错。
+
+并发：读-改-写放进一个 Lua 脚本，由 Redis 串行执行。没选 WATCH，因为它的监视粒度是整个 key，
+同一用户下两个无关子键的并发提交会互相触发重试，重试耗尽后返回什么还得另定语义，
+而且「EXEC 真的失败并重试」这条路径很难确定性复现。也没选分布式锁：TTL 给不出正确值，
+安全解锁本身又要一个 Lua CAS，等于绕不开 Lua。
+
+Lua 的原子只是隔离性，不是回滚：脚本跑到一半出错，前面已执行的命令撤不回来。
+所以脚本一律「先读、中间算、最后只写一条」，任何一步出错都不会留下半成品。
+
+TTL 的规则只有一句：计数（重新）从 1 起，窗口就从初始长度（field_ttl，默认 1 天）重开；
+计数 +1，窗口在剩余时间上加 ttl_extend（默认 12 小时）。所以新建、值变了、脏数据都是
+重开窗口——新主张不该继承旧主张的剩余时间，脏数据也借这次写入补上 TTL，不会永远留在池里；
+同值再提则续命，反复被提起的偏好活得更久。续命没有上限：窗口只随真实的再次提及增长。
 """
 import json
 import os
@@ -29,8 +47,66 @@ load_env()
 logger = get_logger(__name__)
 
 PRE_KEY = "profile:candidates:"
-DEFAULT_FIELD_TTL = 604800
+DEFAULT_FIELD_TTL = 86400
+DEFAULT_TTL_EXTEND = 43200
 DEFAULT_TIMES_TO_SUBMIT = 2
+
+# 注意：脚本里用了 HSETEX，这把候选池锁死在 Redis 8.0+（启动时由 ensure_redis_version 检查）。
+# 脚本要短：超过 busy-reply-threshold（默认 5s）后 Redis 对其他客户端回 BUSY 却不会中断脚本，
+# 而写过数据的脚本 SCRIPT KILL 会被拒绝，只剩 SHUTDOWN NOSAVE。写放在最后，
+# 写之前的那段时间脚本都还能被杀掉。
+#
+# KEYS[1] = 候选池 key
+# ARGV    = field 路径, 新值, 阈值, 初始 TTL 秒数, 每次再提及的续命秒数
+#           （ARGV 全是字符串，运算前要 tonumber）
+# 返回    = {计数, 是否晋升(1/0)}。不能返回 Lua 的 false/nil：false 到客户端是 nil，
+#           table 里的 nil 还会把后面的元素一起截断
+_SUBMIT_LUA = """
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+local times = 1
+local remaining = 0
+if raw then
+  -- 缺失的 field 在 Lua 里是 false 不是 nil，所以用真值判断。
+  -- 解码必须 pcall：一条脏数据抛出来会让这个用户的候选池永久写不进去
+  local ok, rec = pcall(cjson.decode, raw)
+  if ok and type(rec) == 'table' and type(rec.value) == 'string'
+     and type(rec.times) == 'number' and rec.value == ARGV[2] then
+    times = rec.times + 1
+    -- 只在续命路径上读剩余时间（毫秒；-1 = field 没有 TTL）。脚本执行期间 Redis 的时间是冻结的，
+    -- 所以 HGET/HPTTL 到 HSETEX 之间 field 不会过期，读到的剩余时间在写入时依然有效
+    remaining = redis.call('HPTTL', KEYS[1], 'FIELDS', 1, ARGV[1])[1]
+  end
+end
+local promoted = 0
+if times >= tonumber(ARGV[3]) then promoted = 1 end
+local record = cjson.encode({value = ARGV[2], times = times})
+if times == 1 then
+  redis.call('HSETEX', KEYS[1], 'EX', tonumber(ARGV[4]), 'FIELDS', 1, ARGV[1], record)
+else
+  -- 手写的、没有 TTL 的 field（-1）按剩余 0 算，只给一段续命时长：不凭空发初始窗口，也不让它永不过期
+  if remaining < 0 then remaining = 0 end
+  redis.call('HSETEX', KEYS[1], 'PX', remaining + tonumber(ARGV[5]) * 1000, 'FIELDS', 1, ARGV[1], record)
+end
+return {times, promoted}
+"""
+
+# 条件删除：只删存着的值仍等于晋升时的值的 field。
+# ARGV = field1, 晋升值1, field2, 晋升值2, ...
+# 同样先读完、最后只有一条 HDEL；HDEL 不带 field 会报参数个数错误，所以没有命中就不发
+_CONFIRM_DELETE_LUA = """
+local matched = {}
+for i = 1, #ARGV, 2 do
+  local raw = redis.call('HGET', KEYS[1], ARGV[i])
+  if raw then
+    local ok, rec = pcall(cjson.decode, raw)
+    if ok and type(rec) == 'table' and rec.value == ARGV[i + 1] then
+      table.insert(matched, ARGV[i])
+    end
+  end
+end
+if #matched == 0 then return 0 end
+return redis.call('HDEL', KEYS[1], unpack(matched))
+"""
 
 
 def _read_times_to_submit() -> int:
@@ -73,63 +149,54 @@ class ProfileCandidate:
 
     def __init__(self, client=None,
                  field_ttl: int = DEFAULT_FIELD_TTL,
+                 ttl_extend: int = DEFAULT_TTL_EXTEND,
                  times_to_submit: int = TIMES_TO_SUBMIT):
         """
         :param client: Redis 客户端，不传则取全局实例。留这个口子是为了测试能注入
             指向测试库的客户端——参数名写错会当场 TypeError，而事后 setattr 换
             私有属性写错了只会静默新建一个没人读的字段，测试照跑但连错了库
+        :param field_ttl: 计数（重新）从 1 起时，field 的初始存活秒数
+        :param ttl_extend: 同值再次提及（计数 +1）时，在剩余时间上追加的秒数，不设上限
         """
         self.field_ttl = field_ttl
+        self.ttl_extend = ttl_extend
         self._client = client or get_redis_client().client
         self.times_to_submit = times_to_submit
+        self._submit_script = None
+        self._confirm_delete_script = None
+
+    def _submit(self):
+        if self._submit_script is None:
+            self._submit_script = self._client.register_script(_SUBMIT_LUA)
+        return self._submit_script
+
+    def _confirm_delete(self):
+        if self._confirm_delete_script is None:
+            self._confirm_delete_script = self._client.register_script(_CONFIRM_DELETE_LUA)
+        return self._confirm_delete_script
 
     async def submit_one_candidate(self,user_id: int,field:str, sub_key: str, value: str) -> tuple[int,bool]:
         """
         提交一个候选人到 redis 库中, 如果 field 达到落库要求了，就返回 true
         field只接受str,如果为list[str]，请循环调用
-        """
-        # 这个里面需要完成：拼接key，将用户的相关candidate查出来，如果存在，那就incr，否则就为1
-        # 还需要完成更新field的步骤
-        # 需要的value: user_id, field,value
-        # 构造 query_key，用于后续 query 拿到 field-value
-        query_key = ProfileCandidate.key(user_id)
-        query_field = ProfileCandidate.generate_field_key(field,sub_key)
 
+        计数规则见模块注释（B 语义）。晋升不删候选：删除是落库成功之后
+        delete_field_by_given 的事。Redis 不可用时返回 (-1, False)。
+        """
+        key = ProfileCandidate.key(user_id)
+        field_path = ProfileCandidate.generate_field_key(field, sub_key)
         try:
-            # 判断是否含有这个field，如果没有就创建一个，否则就incr
-            query = await self._client.hget(query_key, query_field)
-            if not query:
-                final_res = {
-                    "value": value,
-                    "times": 1,
-                }
-                await self._client.hsetex(query_key,query_field,json.dumps(final_res),ex=self.field_ttl)
-                return (1,False)
-            else:
-                try:
-                    final_res = json.loads(query)
-                except json.JSONDecodeError as e:
-                    logger.error("submit_one_candidate 序列化 %s 失败: %s",query,e)
-                    final_res = {
-                        "value": value,
-                        "times": 0,
-                    }
-                # 同键冲突以新值为准：用户先说「简单点」又说「难一点」，晋升时
-                # 该写进画像的是后者。只加计数不换值的话，用户的修正会被静默吞掉
-                final_res["value"] = value
-                final_res["times"] += 1
-                # TODO 改为并发安全的，否则就会导致落库了之后，又出现这个field-value映射
-                # 并发安全可选的技术方案比如乐观锁，或者LUA，pipeline
-                if final_res["times"] >= self.times_to_submit:
-                    await self._client.hdel(query_key,query_field)
-                    return final_res["times"], True
-                await self._client.hsetex(query_key, query_field, json.dumps(final_res), keepttl=True)
-                return final_res["times"],False
+            times, promoted = await self._submit()(
+                keys=[key],
+                args=[field_path, value, self.times_to_submit, self.field_ttl, self.ttl_extend],
+            )
         except RedisError as e:
-            # 只降级 Redis 故障：候选池写不进去不该拖垮整个请求。
-            # 编程错误不在这里捕获，让它抛出去，否则 bug 会被伪装成「Redis 挂了」
-            logger.error("submit_one_candidate Redis 操作失败: %s", e)
-            return -1,False
+            # 只降级 Redis 故障：候选池写不进去不该拖垮整个请求。Lua 运行期错误是
+            # ResponseError，也是 RedisError，走这里；AttributeError 之类的编程错误不在这里捕获，
+            # 让它抛出去，否则 bug 会被伪装成「Redis 挂了」
+            logger.error("submit_one_candidate Redis 操作失败: %s", e, exc_info=True)
+            return -1, False
+        return int(times), bool(promoted)
 
     async def query_candidates_by_user(self,user_id: int) -> dict:
         """
@@ -164,6 +231,41 @@ class ProfileCandidate:
             logger.warning("clear_candidates_by_user 删除 id = %s 的候选人池失败",user_id)
             return
         logger.info("clear_candidates_by_user 删除user_id = %s 的候选人池成功", user_id)
+
+    async def delete_field_by_given(self, user_id: int, to_delete: list[tuple[str, str, str]]):
+        """
+        晋升的偏好落库成功之后，清掉对应的候选。to_delete 的每项是
+        (field, sub_key, 晋升时的值)，一个脚本一次处理完。
+
+        条件删除（CAS）：从晋升到这里之间，别的请求可能已经把同一个子键改成了新值、
+        计数重置为 1。盲删会把这个新主张的计数一起抹掉，所以只删存着的值
+        仍等于晋升值的 field，对不上的留着，它自己继续累计。
+
+        删除失败只记日志不抛出：后果是这些偏好下次再晋升一次，重复写入由落库的
+        幂等合并消化。抛出去的话，调用方会把「已经落库成功」误报成「保存失败」。
+        """
+        # 脚本里 HDEL 至少要一个 field，所以空列表在这里就返回
+        if not to_delete:
+            return
+
+        key = ProfileCandidate.key(user_id)
+        args = []
+        for field, sub_key, value in to_delete:
+            args.extend([ProfileCandidate.generate_field_key(field, sub_key), value])
+        try:
+            deleted = await self._confirm_delete()(keys=[key], args=args)
+        except RedisError as e:
+            logger.error("delete_field_by_given 删除用户 %s 的候选失败：%s", user_id, e)
+            return
+
+        if deleted < len(to_delete):
+            # 少删了说明有候选在晋升之后、删除之前就不是当时的样子了：
+            # TTL 到期，或者被别的请求改成了不同的值（后者就是并发真的发生过）
+            logger.warning(
+                "delete_field_by_given 用户 %s 应删 %s 个候选，实际删了 %s 个，"
+                "其余已过期或被并发改成了不同的值：%s",
+                user_id, len(to_delete), deleted, [args[i] for i in range(0, len(args), 2)],
+            )
 
     @staticmethod
     def key(user_id: int):
