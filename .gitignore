@@ -24,3 +24,9 @@ junit.xml
 backend/rag_db/
 backend/rag_uploads/
 backend/rag_eval/
+
+# 文档（计划、spec、review、面试稿）只在本地维护，不入库
+docs/
+
+# superpowers 插件的本地工作目录
+.superpowers/
