@@ -6,8 +6,8 @@
 那部分归 tests/agents/tools/ 下的测试管。
 
 TTL 一律用 field 级（HSETEX，Redis 8.0+）。两条写路径语义不同，都要守住：
-- 创建：ex=field_ttl，窗口从这一刻起算
-- 更新：keepttl=True，保住原有到期时刻，不续命
+- 创建：EX field_ttl，窗口从这一刻起算
+- 更新（含值变了计数归 1）：KEEPTTL，保住原有到期时刻，不续命
 """
 import asyncio
 
@@ -151,19 +151,15 @@ class _BarrierClient:
         return value
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="Task 9.5 Steps 2/3 未做：submit_one_candidate 的 HGET → 计算 → HSETEX 不是原子的。"
-           "改成 Lua 之后这条会通过，strict 会让它报 XPASS，届时删掉这个标记",
-)
 async def test_concurrent_submits_do_not_lose_count(make_store, redis_test_client):
     """
     已经提交过 1 次，又有两个请求同时提交同一个子键：计数必须是 3。
 
-    现在的实现里两个请求都读到 1、都写回 2，少计一次。阈值是 2 时，后果是两个请求都晋升、
-    重复落库（由幂等合并消化）；阈值更高时，后果是偏好晚一轮才能晋升。
-    raises=AssertionError：屏障超时之类的其他异常算真失败，不能被当成「预期中的失败」放过。
+    现在能过，是因为 Python 侧不再 HGET：读-算-写整个收进一个 Lua 脚本，Redis 串行执行，
+    两个请求不可能交错（屏障只拦 hget，现在没有 hget 可拦）。改造前这条必然失败：
+    屏障把两个请求都卡在 HGET 之后，都读到 1、都写回 2，少计一次。
+    阈值是 2 时，旧实现的后果是两个请求都晋升、重复落库（由幂等合并消化）；
+    阈值更高时，后果是偏好晚一轮才能晋升。
     """
     await make_store().submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
 
@@ -180,7 +176,7 @@ async def test_concurrent_submits_do_not_lose_count(make_store, redis_test_clien
 
 async def test_ttl_is_not_refreshed_on_update(make_store, redis_test_client):
     """
-    更新只改值和计数，不重置到期时刻。
+    更新只改计数，不重置到期时刻。
 
     刷新的话，「7 天」就不再是「两次提及的时间窗口」——用户第 1 天提一次、
     第 400 天再提一次照样晋升，隔了一年多的两次被当成稳定偏好。
@@ -196,13 +192,86 @@ async def test_ttl_is_not_refreshed_on_update(make_store, redis_test_client):
     assert before > 0
 
     await asyncio.sleep(0.1)
-    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点b")
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
     after = (await redis_test_client.hpttl(key, FIELD_PATH))[0]
 
     assert after <= before, "更新不应该重置到期时刻；被刷新的话 after 会跳回 100000 附近"
     assert (await store.query_candidates_by_user(USER_A))[FIELD_PATH] == {
-        "value": "简单点b", "times": 2
+        "value": "简单点a", "times": 2
     }
+
+
+async def test_ttl_is_not_refreshed_on_value_change(make_store, redis_test_client):
+    """
+    值变了计数归 1，但它仍然是「更新」：不能因为换了值就重开一个 7 天窗口，
+    否则反复换值的用户永远不会过期，窗口语义和同值累加的路径不一致。
+    """
+    store = make_store(field_ttl=100, times_to_submit=3)
+    key = ProfileCandidate.key(USER_A)
+
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
+    before = (await redis_test_client.hpttl(key, FIELD_PATH))[0]
+    assert before > 0
+
+    await asyncio.sleep(0.1)
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "难一点")
+    after = (await redis_test_client.hpttl(key, FIELD_PATH))[0]
+
+    assert 0 < after <= before
+    assert (await store.query_candidates_by_user(USER_A))[FIELD_PATH] == {
+        "value": "难一点", "times": 1
+    }
+
+
+async def test_value_change_resets_count_and_does_not_promote(store):
+    """
+    B 语义：先说「简单点」再说「难一点」是两个主张，不能凑成一次确认。
+    计数归 1、不晋升，池子里存的是新值。
+    """
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+    times, promoted = await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "难一点")
+
+    assert (times, promoted) == (1, False)
+    assert (await store.query_candidates_by_user(USER_A))[FIELD_PATH] == {
+        "value": "难一点", "times": 1
+    }
+
+
+async def test_same_new_value_after_reset_promotes(store):
+    """重置之后新主张重新累计：同一个新值再来一次，照常到阈值晋升"""
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "难一点")
+    times, promoted = await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "难一点")
+
+    assert (times, promoted) == (2, True)
+
+
+@pytest.mark.parametrize("garbage", ["not json", "123", '"text"', '{"value": 1, "times": "x"}'])
+async def test_corrupt_record_self_heals(store, redis_test_client, garbage):
+    """
+    脏数据（非 JSON、JSON 但不是对象、字段类型不对）不能让这个用户的候选池永久写不进去：
+    当作没有旧状态，从 1 重新计，这次写入就把它修好，且不抛异常。
+    """
+    key = ProfileCandidate.key(USER_A)
+    await redis_test_client.hset(key, FIELD_PATH, garbage)
+
+    times, promoted = await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+
+    assert (times, promoted) == (1, False)
+    assert (await store.query_candidates_by_user(USER_A))[FIELD_PATH] == {
+        "value": "简单点", "times": 1
+    }
+
+
+async def test_threshold_comes_from_the_instance(make_store):
+    """阈值是实例配置，不是写死在脚本里的常量：配成 3 就要第三次才晋升"""
+    store = make_store(times_to_submit=3)
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+    _, second = await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+    times, third = await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+
+    assert second is False
+    assert (times, third) == (3, True)
 
 
 async def test_field_disappears_after_ttl(make_store):

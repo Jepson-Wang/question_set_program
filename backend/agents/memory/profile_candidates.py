@@ -1,5 +1,18 @@
 """
 用于记录某个用户画像的偏好被统计几次，如果超过阈值，那么就加入到库中
+
+值语义（B）：同一个子键下值变了，计数归 1、存新值，而不是继续累加。
+「简单点」和「难一点」是两个主张，不能凑成一次确认。B 依赖 Task 10 的值域枚举：
+进得了候选池的值必然在枚举内，字符串相等就是语义相等；如果值是自由文本，
+「简单点」「简单一些」会被判成不同的值，计数一路重置，稳定偏好永远晋升不了，而且不报错。
+
+并发：读-改-写放进一个 Lua 脚本，由 Redis 串行执行。没选 WATCH，因为它的监视粒度是整个 key，
+同一用户下两个无关子键的并发提交会互相触发重试，重试耗尽后返回什么还得另定语义，
+而且「EXEC 真的失败并重试」这条路径很难确定性复现。也没选分布式锁：TTL 给不出正确值，
+安全解锁本身又要一个 Lua CAS，等于绕不开 Lua。
+
+Lua 的原子只是隔离性，不是回滚：脚本跑到一半出错，前面已执行的命令撤不回来。
+所以脚本一律「先读、中间算、最后只写一条」，任何一步出错都不会留下半成品。
 """
 import json
 import os
@@ -24,17 +37,6 @@ from backend.utils.redis_client import get_redis_client
 为什么偏好类需要延迟落库：因为一次性落库，就会导致后续的每一次请求都向这个profile来落
 """
 
-# 把 submit_one_candidate 改写成 Lua 脚本时（Task 9.5 Step 2）要防的几类失败：
-# 1. Lua 运行期错误：nil 参与运算、函数名拼错（cjson.decod）、索引 nil，最常见
-# 2. redis.call 返回错误：WRONGTYPE（key 不是 hash）、参数个数不对。redis.call 遇错
-#    会中断整个脚本并把错误抛回客户端，要兜住得用 redis.pcall
-# 3. OOM：生产 Redis 的 maxmemory-policy 是 noeviction，内存满了写命令直接报错
-# 4. 脚本超时：超过 busy-reply-threshold（Redis 7 之前叫 lua-time-limit，默认 5000ms）
-#    后，Redis 不会中断脚本，只是对其他客户端回 BUSY。脚本还没写过数据时可以 SCRIPT KILL；
-#    写过之后会被拒绝（杀掉会留下无法回滚的半截状态），只剩 SHUTDOWN NOSAVE，
-#    丢掉上次持久化之后的全部数据
-# 所以脚本必须短，而且写操作放在最后：写之前的那段时间里，脚本都还能被杀掉
-
 load_env()
 
 logger = get_logger(__name__)
@@ -42,6 +44,38 @@ logger = get_logger(__name__)
 PRE_KEY = "profile:candidates:"
 DEFAULT_FIELD_TTL = 604800
 DEFAULT_TIMES_TO_SUBMIT = 2
+
+# 注意：脚本里用了 HSETEX，这把候选池锁死在 Redis 8.0+（启动时由 ensure_redis_version 检查）。
+# 脚本要短：超过 busy-reply-threshold（默认 5s）后 Redis 对其他客户端回 BUSY 却不会中断脚本，
+# 而写过数据的脚本 SCRIPT KILL 会被拒绝，只剩 SHUTDOWN NOSAVE。写放在最后，
+# 写之前的那段时间脚本都还能被杀掉。
+#
+# KEYS[1] = 候选池 key
+# ARGV    = field 路径, 新值, 阈值, field TTL 秒数（ARGV 全是字符串，运算前要 tonumber）
+# 返回    = {计数, 是否晋升(1/0)}。不能返回 Lua 的 false/nil：false 到客户端是 nil，
+#           table 里的 nil 还会把后面的元素一起截断
+_SUBMIT_LUA = """
+local raw = redis.call('HGET', KEYS[1], ARGV[1])
+local times = 1
+if raw then
+  -- 缺失的 field 在 Lua 里是 false 不是 nil，所以用真值判断。
+  -- 解码必须 pcall：一条脏数据抛出来会让这个用户的候选池永久写不进去
+  local ok, rec = pcall(cjson.decode, raw)
+  if ok and type(rec) == 'table' and type(rec.value) == 'string'
+     and type(rec.times) == 'number' and rec.value == ARGV[2] then
+    times = rec.times + 1
+  end
+end
+local promoted = 0
+if times >= tonumber(ARGV[3]) then promoted = 1 end
+local record = cjson.encode({value = ARGV[2], times = times})
+if raw then
+  redis.call('HSETEX', KEYS[1], 'KEEPTTL', 'FIELDS', 1, ARGV[1], record)
+else
+  redis.call('HSETEX', KEYS[1], 'EX', tonumber(ARGV[4]), 'FIELDS', 1, ARGV[1], record)
+end
+return {times, promoted}
+"""
 
 
 def _read_times_to_submit() -> int:
@@ -93,58 +127,36 @@ class ProfileCandidate:
         self.field_ttl = field_ttl
         self._client = client or get_redis_client().client
         self.times_to_submit = times_to_submit
+        self._submit_script = None
+
+    def _submit(self):
+        if self._submit_script is None:
+            self._submit_script = self._client.register_script(_SUBMIT_LUA)
+        return self._submit_script
+
 
     async def submit_one_candidate(self,user_id: int,field:str, sub_key: str, value: str) -> tuple[int,bool]:
         """
         提交一个候选人到 redis 库中, 如果 field 达到落库要求了，就返回 true
         field只接受str,如果为list[str]，请循环调用
+
+        计数规则见模块注释（B 语义）。晋升不删候选：删除是落库成功之后
+        delete_field_by_given 的事。Redis 不可用时返回 (-1, False)。
         """
-        # 这个里面需要完成：拼接key，将用户的相关candidate查出来，如果存在，那就incr，否则就为1
-        # 还需要完成更新field的步骤
-        # 需要的value: user_id, field,value
-        # 构造 query_key，用于后续 query 拿到 field-value
-        query_key = ProfileCandidate.key(user_id)
-        query_field = ProfileCandidate.generate_field_key(field,sub_key)
-
+        key = ProfileCandidate.key(user_id)
+        field_path = ProfileCandidate.generate_field_key(field, sub_key)
         try:
-            # 判断是否含有这个field，如果没有就创建一个，否则就incr
-            query = await self._client.hget(query_key, query_field)
-            if not query:
-                final_res = {
-                    "value": value,
-                    "times": 1,
-                }
-                await self._client.hsetex(query_key,query_field,json.dumps(final_res),ex=self.field_ttl)
-                return int(final_res["times"]),False
-            else:
-                try:
-                    final_res = json.loads(query)
-                except json.JSONDecodeError as e:
-                    logger.error("submit_one_candidate 序列化 %s 失败: %s",query,e)
-                    final_res = {
-                        "value": value,
-                        "times": 0,
-                    }
-                # 同键冲突以新值为准：用户先说「简单点」又说「难一点」，晋升时
-                # 该写进画像的是后者。只加计数不换值的话，用户的修正会被静默吞掉
-                final_res["value"] = value
-                final_res["times"] += 1
-
-                # 先将当前结果缓存到Redis中，防止落库失败 times 没更新
-                await self._client.hsetex(query_key, query_field, json.dumps(final_res), keepttl=True)
-
-                if final_res["times"] >= self.times_to_submit:
-                    # HDEL 操作更改为一个独立的方法，在落库成功后调用
-                    # 当前如果 times 达到标准了，就直接通知上层
-                    return int(final_res["times"]), True
-
-                return int(final_res["times"]), False
-
+            times, promoted = await self._submit()(
+                keys=[key],
+                args=[field_path, value, self.times_to_submit, self.field_ttl],
+            )
         except RedisError as e:
-            # 只降级 Redis 故障：候选池写不进去不该拖垮整个请求。
-            # 编程错误不在这里捕获，让它抛出去，否则 bug 会被伪装成「Redis 挂了」
-            logger.error("submit_one_candidate Redis 操作失败: %s", e)
-            return -1,False
+            # 只降级 Redis 故障：候选池写不进去不该拖垮整个请求。Lua 运行期错误是
+            # ResponseError，也是 RedisError，走这里；AttributeError 之类的编程错误不在这里捕获，
+            # 让它抛出去，否则 bug 会被伪装成「Redis 挂了」
+            logger.error("submit_one_candidate Redis 操作失败: %s", e, exc_info=True)
+            return -1, False
+        return int(times), bool(promoted)
 
     async def query_candidates_by_user(self,user_id: int) -> dict:
         """
