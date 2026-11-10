@@ -89,7 +89,7 @@ async def test_confirmed_field_is_removed_and_restarts_from_one(store):
     """
     await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
     await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
-    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY)])
+    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY, "简单点a")])
     assert await store.query_candidates_by_user(USER_A) == {}
 
     await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "难一点")
@@ -116,7 +116,7 @@ async def test_delete_only_removes_given_fields(store):
     await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点a")
     await store.submit_one_candidate(USER_A, FIELD, other, "详细")
 
-    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY)])
+    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY, "简单点a")])
 
     assert await store.query_candidates_by_user(USER_A) == {
         ProfileCandidate.generate_field_key(FIELD, other): {"value": "详细", "times": 1}
@@ -272,6 +272,54 @@ async def test_threshold_comes_from_the_instance(make_store):
 
     assert second is False
     assert (times, third) == (3, True)
+
+
+async def test_confirm_delete_removes_matching_value(store):
+    """晋升时的值和存着的值一致：正常删除"""
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+
+    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY, "简单点")])
+
+    assert await store.query_candidates_by_user(USER_A) == {}
+
+
+async def test_confirm_delete_keeps_candidate_changed_after_promotion(store):
+    """
+    晋升之后、确认删除之前，别的请求把同一子键改成了新值（计数重置为 1）。
+    这时删除要跳过它——盲删会把新主张刚起步的计数一起抹掉。
+    """
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")  # 晋升了「简单点」
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "难一点")  # 并发的新主张
+
+    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY, "简单点")])
+
+    assert await store.query_candidates_by_user(USER_A) == {
+        FIELD_PATH: {"value": "难一点", "times": 1}
+    }
+
+
+async def test_confirm_delete_only_removes_matching_ones_in_a_mixed_list(store):
+    """一批里有的值对得上、有的对不上：只删对得上的"""
+    other = "讲解详细度"
+    other_path = ProfileCandidate.generate_field_key(FIELD, other)
+    await store.submit_one_candidate(USER_A, FIELD, SUB_KEY, "简单点")
+    await store.submit_one_candidate(USER_A, FIELD, other, "详细")
+
+    await store.delete_field_by_given(
+        USER_A, [(FIELD, SUB_KEY, "简单点"), (FIELD, other, "简略")]
+    )
+
+    assert await store.query_candidates_by_user(USER_A) == {
+        other_path: {"value": "详细", "times": 1}
+    }
+
+
+async def test_confirm_delete_of_missing_field_does_not_raise(store):
+    """候选已经过期或被删：什么都不删，也不抛异常（落库已经成功，不能让调用方误报失败）"""
+    await store.delete_field_by_given(USER_A, [(FIELD, SUB_KEY, "简单点")])
+    assert await store.query_candidates_by_user(USER_A) == {}
 
 
 async def test_field_disappears_after_ttl(make_store):

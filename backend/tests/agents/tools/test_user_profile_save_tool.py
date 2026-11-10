@@ -21,7 +21,7 @@ class FakeCandidateStore:
     def __init__(self, promote: set[str]):
         self.promote = promote
         self.submitted: list[str] = []
-        self.deleted: list[tuple[str, str]] = []
+        self.deleted: list[tuple[str, str, str]] = []
 
     async def submit_one_candidate(self, user_id, field, sub_key, value):
         self.submitted.append(sub_key)
@@ -87,8 +87,22 @@ async def test_success_deletes_only_promoted_sub_keys(patched):
     patched.promote = {"题目风格"}
     result = await _save(preferences={"题目风格": "简单", "讲解详细度": "详细"})
 
-    assert patched.deleted == [("preferences", "题目风格")]
+    assert patched.deleted == [("preferences", "题目风格", "简单")]
     assert "已写入长期画像" in result
+
+
+async def test_confirm_delete_carries_the_promoted_value(patched):
+    """
+    确认删除要带上晋升的那个值（条件删除的依据），而且必须是各自提交的值，
+    不能串：带错了值，条件删除会把该删的候选留下
+    """
+    patched.promote = {"题目风格", "讲解详细度"}
+    await _save(preferences={"题目风格": "简单", "讲解详细度": "详细"})
+
+    assert sorted(patched.deleted) == sorted([
+        ("preferences", "题目风格", "简单"),
+        ("preferences", "讲解详细度", "详细"),
+    ])
 
 
 async def test_transient_failure_keeps_candidates(patched):

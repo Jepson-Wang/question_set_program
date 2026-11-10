@@ -174,10 +174,11 @@ class UserProfileSaveTool(BaseTool):
                     return _write_failed_report(to_write, "数据库暂时不可用")
                 else:
                     # 只清理这次真正晋升的子键。还在计数的候选不在 to_write 里，必须留着
+                    # 带上晋升的值：候选池据此做条件删除，值已被并发改掉的不删
                     to_delete = [
-                        (field, sub_key)
+                        (field, sub_key, value)
                         for field in _PREFERENCE_FIELDS
-                        for sub_key in (to_write.get(field) or {})
+                        for sub_key, value in (to_write.get(field) or {}).items()
                     ]
                     if to_delete:
                         await _candidate_store.delete_field_by_given(user_id, to_delete)

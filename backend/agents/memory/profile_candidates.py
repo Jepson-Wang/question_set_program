@@ -77,6 +77,24 @@ end
 return {times, promoted}
 """
 
+# 条件删除：只删存着的值仍等于晋升时的值的 field。
+# ARGV = field1, 晋升值1, field2, 晋升值2, ...
+# 同样先读完、最后只有一条 HDEL；HDEL 不带 field 会报参数个数错误，所以没有命中就不发
+_CONFIRM_DELETE_LUA = """
+local matched = {}
+for i = 1, #ARGV, 2 do
+  local raw = redis.call('HGET', KEYS[1], ARGV[i])
+  if raw then
+    local ok, rec = pcall(cjson.decode, raw)
+    if ok and type(rec) == 'table' and rec.value == ARGV[i + 1] then
+      table.insert(matched, ARGV[i])
+    end
+  end
+end
+if #matched == 0 then return 0 end
+return redis.call('HDEL', KEYS[1], unpack(matched))
+"""
+
 
 def _read_times_to_submit() -> int:
     """
@@ -128,12 +146,17 @@ class ProfileCandidate:
         self._client = client or get_redis_client().client
         self.times_to_submit = times_to_submit
         self._submit_script = None
+        self._confirm_delete_script = None
 
     def _submit(self):
         if self._submit_script is None:
             self._submit_script = self._client.register_script(_SUBMIT_LUA)
         return self._submit_script
 
+    def _confirm_delete(self):
+        if self._confirm_delete_script is None:
+            self._confirm_delete_script = self._client.register_script(_CONFIRM_DELETE_LUA)
+        return self._confirm_delete_script
 
     async def submit_one_candidate(self,user_id: int,field:str, sub_key: str, value: str) -> tuple[int,bool]:
         """
@@ -192,36 +215,39 @@ class ProfileCandidate:
             return
         logger.info("clear_candidates_by_user 删除user_id = %s 的候选人池成功", user_id)
 
-    async def delete_field_by_given(self,user_id: int, to_delete: list[tuple[str,str]]):
+    async def delete_field_by_given(self, user_id: int, to_delete: list[tuple[str, str, str]]):
         """
-        晋升的偏好落库成功之后，清掉对应的候选。所有候选都在同一个 hash 里，
-        一条 HDEL 带多个 field 一次删完。
+        晋升的偏好落库成功之后，清掉对应的候选。to_delete 的每项是
+        (field, sub_key, 晋升时的值)，一个脚本一次处理完。
+
+        条件删除（CAS）：从晋升到这里之间，别的请求可能已经把同一个子键改成了新值、
+        计数重置为 1。盲删会把这个新主张的计数一起抹掉，所以只删存着的值
+        仍等于晋升值的 field，对不上的留着，它自己继续累计。
 
         删除失败只记日志不抛出：后果是这些偏好下次再晋升一次，重复写入由落库的
-        幂等合并消化掉。抛出去的话，调用方会把「已经落库成功」误报成「保存失败」。
-
-        已知的洞：从晋升到这里删除之间，别的请求可能已经把同一个子键改成了新值、
-        计数重置为 1，这里会连新值的计数一起删掉。彻底的解法是条件删除——带上晋升时的值，
-        只有存着的值仍然相同才删（一个很短的 CAS 脚本），留到 Step 2 写 Lua 时一起做。
+        幂等合并消化。抛出去的话，调用方会把「已经落库成功」误报成「保存失败」。
         """
-        # HDEL 至少要一个 field，空调用 Redis 会报参数个数错误
+        # 脚本里 HDEL 至少要一个 field，所以空列表在这里就返回
         if not to_delete:
             return
 
-        delete_key = ProfileCandidate.key(user_id)
-        fields = [ProfileCandidate.generate_field_key(field, sub_key)
-                  for field, sub_key in to_delete]
+        key = ProfileCandidate.key(user_id)
+        args = []
+        for field, sub_key, value in to_delete:
+            args.extend([ProfileCandidate.generate_field_key(field, sub_key), value])
         try:
-            deleted = await self._client.hdel(delete_key, *fields)
+            deleted = await self._confirm_delete()(keys=[key], args=args)
         except RedisError as e:
             logger.error("delete_field_by_given 删除用户 %s 的候选失败：%s", user_id, e)
             return
 
-        if deleted < len(fields):
-            # 少删了说明有候选在晋升之后、删除之前就没了：TTL 到期，或者被别的请求删掉
+        if deleted < len(to_delete):
+            # 少删了说明有候选在晋升之后、删除之前就不是当时的样子了：
+            # TTL 到期，或者被别的请求改成了不同的值（后者就是并发真的发生过）
             logger.warning(
-                "delete_field_by_given 用户 %s 应删 %s 个候选，实际删了 %s 个：%s",
-                user_id, len(fields), deleted, fields,
+                "delete_field_by_given 用户 %s 应删 %s 个候选，实际删了 %s 个，"
+                "其余已过期或被并发改成了不同的值：%s",
+                user_id, len(to_delete), deleted, [args[i] for i in range(0, len(args), 2)],
             )
 
     @staticmethod
