@@ -2433,7 +2433,7 @@ git commit -m "feat: 画像写入引入候选池频次确认，区分一次性�
 
 ---
 
-- [ ] **Step 1: 确认值域真的在起作用**
+- [x] **Step 1: 确认值域真的在起作用**（用真实 LLM 对话人工验证：模型会按词表取值，词表外的转存 notes；没有统计比例）
 
 跑几轮真实对话，统计模型写进 `weak_points` / `preferences` 的值有多大比例落在枚举内、多大比例被转存进了 `notes`。
 
@@ -2441,7 +2441,7 @@ Task 10 保证了**存进去的值一定合法**，但保证不了**模型愿意
 
 这一步不写代码，但它决定后面几步值不值得做。
 
-- [ ] **Step 2: 把读-改-写换成 Lua 脚本，并在脚本里直接实现 B 语义**
+- [x] **Step 2: 把读-改-写换成 Lua 脚本，并在脚本里直接实现 B 语义**（`2eb1aec`；CAS 条件删除 `ab543bf`；TTL 改为初始 1 天、同值再提续 12 小时 `bc31adb`）
 
 B 语义和原子化合成一步做，**不要先用 Python 写一遍 B 再搬进 Lua**——那是把同一段逻辑写两次，而且第一版注定要删。
 
@@ -2462,7 +2462,7 @@ B 语义和原子化合成一步做，**不要先用 Python 写一遍 B 再搬�
 
 把三件事写进 `profile_candidates.py` 的模块注释：**为什么是 B、为什么 B 依赖 Task 10 的值域、为什么是 Lua 而不是 `WATCH`**。半年后没人记得这些选择背后各有一个前提，而其中两个前提是会变的。
 
-- [ ] **Step 3: 按脚本之后的形态重新收拢 `submit_one_candidate`**
+- [x] **Step 3: 按脚本之后的形态重新收拢 `submit_one_candidate`**（随 `2eb1aec` 一起：一层 `try`，TODO 已删）
 
 拆分仍然要做，但**切法和原计划不同**。原来的切法是把「由旧记录和新值算出新记录」拆成一个不碰 Redis 的纯函数，理由是它好测——可是 Step 2 之后这段逻辑搬进了 Lua，那个边界已经不存在了。**不要按一个即将消失的边界去切。**
 
@@ -2493,7 +2493,7 @@ B 语义和原子化合成一步做，**不要先用 Python 写一遍 B 再搬�
 
 **这一步新开的一个洞，要知道它在哪**：确认和提交之间，候选的值可能已经被改了（A 提交「简单」达到阈值 → B 提交「困难」把计数重置为 1 → A 的确认把整个 field 删掉 → B 的计数丢了）。彻底的解法是让确认也变成条件删除——带上晋升时那个值，只有存着的值仍然相同才删，同样是一个很短的 CAS 脚本。可以先不做，但要在注释里记下来，别让它变成一个没人知道的洞。
 
-- [ ] **Step 5: MySQL 侧补行锁，修 JSON 列的 lost update**
+- [x] **Step 5: MySQL 侧补行锁，修 JSON 列的 lost update**（`f8bf34b`）
 
 `update_user_profile` 是 `SELECT → 改 → COMMIT`，中间没有任何行锁：
 
@@ -2550,7 +2550,7 @@ Step 4 之后这个失败是可恢复的（候选还在，用户下次提到还�
 
 ⚠️ **不要在同一个事务里先 `SELECT … FOR UPDATE`、查不到再 INSERT**。行不存在时，RR 隔离级别下只能加间隙锁；间隙锁之间互相兼容，但会挡住对方的插入意向锁，两个并发建档的请求会形成死锁。而且间隙锁锁的是区间，`user_id` 不同、只要落在同一个间隙里也会死锁。「这一行只能由一个人创建」要交给唯一约束保证，不要靠加锁读来判断这一行是否存在。
 
-- [ ] **Step 7: 并发验证**
+- [x] **Step 7: 并发验证**（候选池、首次建档、行锁三条并发测试在 CI 里真实运行；行锁测试靠 `523f020` 给 CI 加的 MySQL 服务，去掉 `with_for_update()` 后稳定失败）
 
 前面六步的成立与否，只有这一步能证明。
 
@@ -2634,7 +2634,7 @@ Step 4 之后这个失败是可恢复的（候选还在，用户下次提到还�
 
 ---
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 创建 `backend/tests/test_profile_schema_skill.py`：
 
@@ -2667,12 +2667,12 @@ def test_vocab_missing_returns_empty():
     assert load_vocab("question_variant") == {}
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 Run: `cd backend && python -m pytest tests/test_profile_schema_skill.py -v`
 Expected: FAIL，`ImportError: cannot import name 'load_vocab'`
 
-- [ ] **Step 3: 写 SKILL.md**
+- [x] **Step 3: 写 SKILL.md**（实际按值域版落地：`VOCAB` 为「字段 → {键: [允许的值]}」，下方草稿只有键；测试在 `tests/agents/skills/`）
 
 创建 `backend/agents/skills/profile_schema/SKILL.md`：
 
@@ -2736,7 +2736,7 @@ VOCAB = {
 ```
 ````
 
-- [ ] **Step 4: 实现 load_vocab**
+- [x] **Step 4: 实现 load_vocab**
 
 在 `backend/agents/skills/skill_runner.py` 末尾追加：
 
@@ -2755,12 +2755,12 @@ def load_vocab(name: str, tag: str = "vocab") -> dict:
     return ns.get("VOCAB", {})
 ```
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 Run: `cd backend && python -m pytest tests/test_profile_schema_skill.py -v`
 Expected: 4 passed
 
-- [ ] **Step 6: 让 UserProfileSaveTool 按词表分流**
+- [x] **Step 6: 让 UserProfileSaveTool 按词表分流**（实际同时检查值域：键不在词表或值不在值域，都转存 notes）
 
 在 `backend/agents/tools/user_profile_save_tool.py` 顶部加入导入：
 
@@ -2809,7 +2809,7 @@ from backend.agents.skills.skill_runner import load_vocab
                 parts.append(f"词表外的内容已转存 notes：{'、'.join(overflow)}")
 ```
 
-- [ ] **Step 7: 写分流的测试**
+- [x] **Step 7: 写分流的测试**（放在 `tests/agents/tools/test_user_profile_save_tool.py`）
 
 追加到 `backend/tests/test_profile_schema_skill.py`：
 
@@ -2850,12 +2850,12 @@ def _coro(value):
     return _inner
 ```
 
-- [ ] **Step 8: 运行全部测试**
+- [x] **Step 8: 运行全部测试**（PR #30 的 CI：208 passed，0 skipped）
 
 Run: `cd backend && python -m pytest tests/ -v`
 Expected: 全部 passed
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 git add backend/agents/skills/profile_schema/ backend/agents/skills/skill_runner.py backend/agents/tools/user_profile_save_tool.py backend/tests/test_profile_schema_skill.py
