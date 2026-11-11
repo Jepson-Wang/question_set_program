@@ -16,7 +16,7 @@ import tempfile
 import httpx
 
 from backend.agents.rag.config import RagSettings
-from backend.middleware.logging import get_logger
+from backend.middleware.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
@@ -89,6 +89,11 @@ async def probe_judge(settings: RagSettings) -> None:
 
 
 async def main() -> None:
+    # 探针是独立脚本，不经过 main.py，所以要自己装日志 handler。
+    # 不装的话 logger.info 没有任何 handler 接收，整份输出会静默消失——
+    # 而这份输出正是它存在的理由。
+    setup_logging()
+
     settings = RagSettings.from_env()
     for name, probe in (("rerank", probe_rerank),
                         ("embedding", probe_embedding),
