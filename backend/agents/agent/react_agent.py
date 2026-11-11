@@ -19,11 +19,49 @@ from backend.middleware.logging import get_logger
 logger = get_logger(__name__)
 
 
-def build_react_system_prompt(hint_skills: list[str] | None = None) -> str:
+def format_profile(profile) -> str:
+    """
+    把长期画像压成几行文本，供注入 system prompt；没有可用信息时返回空串。
+    在 API 层调用一次，结果放进 GraphState，避免每轮 ReAct 都查一次库。
+
+    - weak_points 的值是掌握程度（薄弱/一般/已掌握），必须连值一起列，
+      只列键名会把「已掌握」的知识点误当成薄弱点。键值都取自词表，总量有上界。
+    - notes 是自由文本、最多 50 条，不注入，只在 user_profile_query_tool 主动查询时返回。
+    """
+    if profile is None:
+        return ""
+    if hasattr(profile, "model_dump"):
+        data = profile.model_dump()
+    else:
+        data = {key: getattr(profile, key, None)
+                for key in ("grade", "subject", "weak_points", "preferences")}
+
+    grade = data.get("grade") or ""
+    subject = data.get("subject") or ""
+    weak = data.get("weak_points") or {}
+    prefs = data.get("preferences") or {}
+    # 画像行存在但什么都没填时，「年级：未知 | 学科：未知」只会白占每轮的 token
+    if not (grade or subject or weak or prefs):
+        return ""
+
+    lines = [f"年级：{grade or '未知'} | 学科：{subject or '未知'}"]
+    if weak:
+        lines.append("知识点掌握：" + "、".join(f"{k}={v}" for k, v in weak.items()))
+    if prefs:
+        lines.append("长期偏好：" + "、".join(f"{k}={v}" for k, v in prefs.items()))
+    return "\n".join(lines)
+
+
+def build_react_system_prompt(
+    hint_skills: list[str] | None = None,
+    profile_text: str = "",
+) -> str:
     """每轮动态构建 ReAct 系统提示词。
 
     - `get_skill_list_prompt()` 每次重新扫目录 + 走 mtime 缓存，新增/删除 SKILL.md 下一轮即生效。
     - 若 `hint_skills` 非空，追加「命中提示」段，作为 LLM 语义漏触发的兜底。
+    - 若 `profile_text` 非空，追加「学生画像」段：它是稳定背景，必须放 system 而不是 user_input，
+      否则模型会把「薄弱点：函数」当成本次诉求。
     """
     prompt = f"""# 角色
 你是 ReAct 决策 Agent：基于 `user_input` 和 `messages` 上下文，循环「思考→行动」，决定调用工具或直接回答。
@@ -67,6 +105,12 @@ Skill 是存放在文件中的程序化剧本，不是可执行工具。当用�
             f"系统检测到 `user_input` 字面命中以下 Skill 触发词：{names}。"
             f"强烈建议本轮优先调用 `load_skill_tool` 加载对应 Skill，再决定后续动作；"
             f"若 `messages` 中已有该 Skill 的剧本，则直接依剧本行事，无需重复加载。\n"
+        )
+    if profile_text:
+        prompt += (
+            f"\n# 学生画像\n"
+            f"以下是该学生的稳定背景信息，用于让回答贴合其学情；"
+            f"它不是本次的提问内容，不要直接复述。\n{profile_text}\n"
         )
     return prompt
 
@@ -142,7 +186,7 @@ def _parse_react_response(content) -> dict:
 async def react_think_node(state: GraphState) -> dict:
     """LLM思考：是否调用Tool、调用哪个"""
     hint_skills = match_triggers(state['user_input'])
-    system_text = build_react_system_prompt(hint_skills)
+    system_text = build_react_system_prompt(hint_skills, state.get('profile_text', ''))
 
     llm_input = {
         "user_input": state['user_input'],
