@@ -20,10 +20,30 @@ from backend.core.config import BACKEND_ROOT
 
 # 启动子进程前从环境里去掉的键：load_env 不覆盖已存在的变量，
 # 不去掉的话读到的是外面（开发机或 CI）的值，测试结果就取决于谁在跑它
+#
+# 这份清单是手工维护的，历史上漏过 14 个键（漏掉的都是模型覆盖与 RAG 配置）。
+# 漏掉一个键不会报错，只会让子进程读到开发机上的值，测试结果取决于谁在哪台机器上跑。
+# 所以清单里每个键都必须真的被代码读到，漏了要变成一次 CI 失败：
+# 见 backend/tests/core/test_isolation_config_keys.py。
 CONFIG_KEYS = (
-    "API_KEY", "API_URL", "MODEL_NAME", "EMBEDDING_MODEL", "SQL_DATABASE_URL", "JWT_SECRET_KEY",
+    # LLM 主配置
+    "API_KEY", "API_URL", "MODEL_NAME",
+    # 各 Agent 的模型覆盖
+    "COMMON_MODEL", "DIGEST_MODEL", "EXTRACT_MODEL", "QUESTION_SET_MODEL",
+    # 向量化
+    "EMBEDDING_MODEL",
+    # 数据库与缓存
+    "SQL_DATABASE_URL",
     "REDIS_URL", "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_USERNAME", "REDIS_DB",
+    # 鉴权
+    "JWT_SECRET_KEY",
+    # 应用行为
     "APP_DEBUG", "CORS_ALLOW_ORIGINS", "PROFILE_PROMOTE_THRESHOLD",
+    # RAG 知识库
+    "RAG_ENABLED", "RAG_DB_DIR", "RAG_UPLOAD_DIR", "RAG_EVAL_DIR",
+    "RERANK_API_URL", "RERANK_API_KEY", "RERANK_MODEL",
+    "JUDGE_API_URL", "JUDGE_API_KEY", "JUDGE_MODEL",
+    "RAG_JUDGE_PASS_SCORE",
 )
 
 
