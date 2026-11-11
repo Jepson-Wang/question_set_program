@@ -19,12 +19,12 @@ load_env()
 
 api_key = os.getenv('API_KEY')
 base_url = os.getenv('API_URL')
-embedding_model = os.getenv('EMBEDDING_MODEL', 'qwen3-vl-embedding')
+embedding_model = os.getenv('EMBEDDING_MODEL', 'text-embedding-v4')
 
 
 class DashScopeEmbedding(BaseEmbedding):
     """通过 DashScope OpenAI 兼容 /embeddings 接口实现的 LlamaIndex Embedding，绕过枚举校验。"""
-    model_name: str = Field(default="qwen3-vl-embedding")
+    model_name: str = Field(default="text-embedding-v4")
     _client: OpenAI = PrivateAttr()
     _aclient: AsyncOpenAI = PrivateAttr()
 
