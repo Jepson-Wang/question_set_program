@@ -66,7 +66,10 @@ class RagSettings:
     final_top_k: int = 3
     knowledge_top_k: int = 2
     rrf_k: int = 60
-    rerank_min_score: float = 0.3
+    # 重排分数阈值：gte-rerank-v2 的 relevance_score 量纲实测下来，相关项在 0.31~0.54、
+    # 不相关项在 0.006~0.15。0.3 也能用，但 0.3146 那条离阈值只剩 0.015 余量；
+    # 降到 0.25 仍能滤掉观测到的全部不相关项，安全边际翻倍。
+    rerank_min_score: float = 0.25
     knowledge_min_similarity: float = 0.5
     leak_threshold: float = 0.95
     context_max_chars: int = 1200
