@@ -15,7 +15,7 @@ from backend.api.user_api.session_api import require_own_session
 from backend.dao.chat_mapper import get_chat_mapper
 from backend.model.user import User
 from backend.agents.agent.tools import GraphState
-from backend.agents.agent.react_agent import get_app
+from backend.agents.agent.react_agent import get_app, format_profile
 
 
 class TextRequest(BaseModel):
@@ -59,6 +59,39 @@ def _format_memory_context(short_memories: list, session_digest: str = "") -> st
     return "\n".join(lines)
 
 
+async def _build_state(text: str, user_id: int, session_id: int) -> GraphState:
+    """
+    构建送进图的初始 state。analyse 和流式接口都走这里：
+    state 在两处各拼一份，新增字段漏改一处，那条路径上就悄悄失效。
+    """
+    # 获取近3轮短期记忆，格式化后拼接到 user_input 头部
+    memory_data = await memory_manager.get_memory_for_planner(user_id, session_id)
+    short_memories = memory_data.get('short_memory', [])
+    memory_context = _format_memory_context(short_memories, memory_data.get('session_digest', ''))
+
+    if memory_context:
+        user_input = f"{memory_context}\n\n【当前问题】\n{text}"
+    else:
+        user_input = text
+
+    # 画像每个请求只读一次：本次请求内 user_profile_save_tool 若写了画像，后续 ReAct 轮次
+    # 仍看到旧画像，下个请求才更新（可接受，它是稳定背景信息）
+    profile_text = format_profile(memory_data.get('long_memory'))
+
+    return {
+        'user_input': user_input,
+        'user_id': user_id,
+        'session_id': session_id,
+        'profile_text': profile_text,
+        'thought': '',
+        'action': '',
+        'action_args': {},
+        'messages': [],
+        'round': 0,
+        'final_result': ''
+    }
+
+
 @agent_router.post('/analyse')
 async def analyse(request: TextRequest, user: User = Depends(get_current_user)) -> dict:
     if user:
@@ -70,27 +103,7 @@ async def analyse(request: TextRequest, user: User = Depends(get_current_user)) 
         await require_own_session(session_id, user_id, chat_mapper)
         await chat_mapper.add_message(session_id, "user", text)
 
-        # 获取近3轮短期记忆，格式化后拼接到 user_input 头部
-        memory_data = await memory_manager.get_memory_for_planner(user_id, session_id)
-        short_memories = memory_data.get('short_memory', [])
-        memory_context = _format_memory_context(short_memories, memory_data.get('session_digest', ''))
-
-        if memory_context:
-            user_input = f"{memory_context}\n\n【当前问题】\n{text}"
-        else:
-            user_input = text
-
-        state: GraphState = {
-            'user_input': user_input,
-            'user_id': user_id,
-            'session_id': session_id,
-            'thought': '',
-            'action': '',
-            'action_args': {},
-            'messages': [],
-            'round': 0,
-            'final_result': ''
-        }
+        state = await _build_state(text, user_id, session_id)
 
         app = get_app()
         result = await app.ainvoke(state)
@@ -122,26 +135,7 @@ async def _stream_generator(text: str, user_id: int, session_id: int):
     - observation：tool 执行结果
     - result：最终回答
     """
-    memory_data = await memory_manager.get_memory_for_planner(user_id, session_id)
-    short_memories = memory_data.get('short_memory', [])
-    memory_context = _format_memory_context(short_memories, memory_data.get('session_digest', ''))
-
-    if memory_context:
-        user_input = f"{memory_context}\n\n【当前问题】\n{text}"
-    else:
-        user_input = text
-
-    state: GraphState = {
-        'user_input': user_input,
-        'user_id': user_id,
-        'session_id': session_id,
-        'thought': '',
-        'action': '',
-        'action_args': {},
-        'messages': [],
-        'round': 0,
-        'final_result': ''
-    }
+    state = await _build_state(text, user_id, session_id)
 
     app = get_app()
     final_result = ''
