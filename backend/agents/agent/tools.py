@@ -43,6 +43,7 @@ class GraphState(TypedDict):
 
     user_id: int
     session_id: int
+    profile_text: str  # 由 API 层预先格式化好的长期画像，节点内不做 IO
 
     thought: str
     action: str
