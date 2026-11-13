@@ -8,7 +8,9 @@
 
 ## 功能特性
 
-- **ReAct 决策调度**：单一 LLM 通过「思考 → 行动 → 观察」循环决定调用哪个工具，最多 5 轮
+- **ReAct 决策调度**：单一 LLM 通过「思考 → 行动 → 观察」循环决定调用哪个工具，最多 8 轮（第 8 轮只作答、不再执行工具）
+- **工具调用预算**：每个工具在一次请求内最多调用 3 次（可按工具单独配置），超限不再执行；预算同时写进提示词，让模型提前规划
+- **同会话请求串行化**：同一 `session_id` 的并发请求排队执行，落库顺序即提问顺序，问答不会串味；不同会话之间仍然并行
 - **可插拔 Skill 能力包**：`backend/agents/skills/` 下的 `SKILL.md` 文件定义剧本化指引，教研人员可热编辑无需重启
 - **可执行校验片段**：`SKILL.md` 中内嵌 `skill:validator` 代码块，由 SkillRunner 提取执行，实现规则与校验同源
 - **三级记忆体系**：Redis 短期（24h TTL，上限 10 条）、MySQL 长期用户画像、Chroma 向量存档
@@ -73,7 +75,11 @@ backend/
 缓存清理采用 **惰性删除 + 后台守护线程** 双机制，守护线程三阶段持锁（快照 → 无锁计算 → 逐个 O(1) 删除 + `sleep(0)` 主动让出 GIL），将主线程被阻塞的时间压到最小。使用双重检查锁（Double-Checked Locking）避免并发首次创建竞态。
 
 ### 3. ReAct 决策 + function calling 混合架构
-单一 LLM 通过 `bind_tools(TOOLS)` 感知所有可用工具，每轮输出严格 JSON `{thought, action, action_args, final_result}`。`should_continue` 条件边根据 `action` 是否为空 + 轮次上限决定是否循环，最多 5 轮自动终止，防止 LLM 陷入死循环。
+单一 LLM 通过 `bind_tools(TOOLS)` 感知所有可用工具，每轮输出严格 JSON `{thought, action, action_args, final_result}`。`should_continue` 条件边根据 `action` 是否为空 + 轮次上限决定是否循环，最多 8 轮自动终止，防止 LLM 陷入死循环。第 8 轮是收尾轮：模型若仍想调工具，不再执行，改用已拿到的观察作答，保证最终回答不为空。
+
+模型若改走原生 function calling（`tool_calls`），解析层同样认：决策从 `tool_calls` 取，正文 JSON 作为兜底。
+
+**工具调用预算**：轮次上限管的是「总共几轮」，工具上限管的是「同一个工具能调几次」。模型对某个工具不满意时会反复调同一个（最典型是出题），没有上限就白烧 token。每个工具单次请求内最多调 3 次（`TOOL_MAX_CALLS` 可按工具单独配置），计数存在 `GraphState.tool_call_counts` 里、每次请求从零开始。超限的调用不执行，而是回一条「预算用完」的 observation，让模型换个思路。剩余预算同时写进 system prompt，模型能提前规划，而不是撞墙才知道。
 
 ### 4. Tools / Skills 双轨设计
 - **Tools**：编译期注册的 function calling 工具（7 个业务工具 + 1 个 `load_skill_tool`）
@@ -119,7 +125,7 @@ POST /agent/analyse
       react_think_node  ←─────────────────┐
           ↓ LLM 输出 {thought, action, args, final_result}
       should_continue                      │
-          ↓ action != "" 且 round < 5      │
+          ↓ action != "" 且 round < 8      │
       tool_exec_node  ─────────────────────┘
           ↓ action == ""
          END

@@ -53,6 +53,10 @@ class GraphState(TypedDict):
 
     final_result: str
 
+    # 每个工具在本次请求内已被调用的次数：{工具名: 次数}。
+    # 用来给单个工具设调用上限，防止模型对同一个工具反复调用。
+    tool_call_counts: dict[str, int]
+
 
 
 model = os.getenv('MODEL_NAME')
