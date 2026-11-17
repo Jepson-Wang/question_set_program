@@ -1,6 +1,6 @@
 # 学生学情分析系统
 
-基于 LangGraph ReAct 架构的 AI 智能辅导后端。学生提交题目或自然语言请求后，由 ReAct 决策 Agent 路由到合适的工具（知识点提取、变式题生成、通用问答、记忆查询、用户画像）；配合三级记忆体系（Redis 短期 + MySQL 长期 + Chroma 向量）维持对话上下文。
+基于 LangGraph ReAct 架构的 AI 智能辅导后端。学生提交题目或自然语言请求后，由 ReAct 决策 Agent 路由到合适的工具（知识点提取、变式题生成、通用问答、记忆查询、用户画像）；配合三级记忆体系（Redis 短期 + MySQL 对话归档 + MySQL 长期画像）维持对话上下文；另有一套独立的 RAG 知识库入库链路，把 PDF / Word 资料与模型生成的题目经第三方复核后灌进题库。
 
 所有代码位于 `backend/` 目录，仓库中不包含前端实现。
 
@@ -10,11 +10,13 @@
 
 - **ReAct 决策调度**：单一 LLM 通过「思考 → 行动 → 观察」循环决定调用哪个工具，最多 8 轮（第 8 轮只作答、不再执行工具）
 - **工具调用预算**：每个工具在一次请求内最多调用 3 次（可按工具单独配置），超限不再执行；预算同时写进提示词，让模型提前规划
-- **同会话请求串行化**：同一 `session_id` 的并发请求排队执行，落库顺序即提问顺序，问答不会串味；不同会话之间仍然并行
+- **同会话请求串行化**：同一 `session_id` 的并发请求排队执行，问答不会串味；不同会话之间仍然并行
 - **可插拔 Skill 能力包**：`backend/agents/skills/` 下的 `SKILL.md` 文件定义剧本化指引，教研人员可热编辑无需重启
 - **可执行校验片段**：`SKILL.md` 中内嵌 `skill:validator` 代码块，由 SkillRunner 提取执行，实现规则与校验同源
-- **三级记忆体系**：Redis 短期（24h TTL，上限 10 条）、MySQL 长期用户画像、Chroma 向量存档
-- **记忆溢出归档**：短期记忆超限时最旧记录经 LLM 精炼后写入向量库
+- **三级记忆体系**：Redis 短期（24h TTL，上限 10 条）、MySQL 对话归档（原文 + 会话摘要）、MySQL 长期用户画像
+- **记忆溢出归档**：短期记忆超限时最旧记录由 Lua 脚本原子搬入待写队列，后台任务落 MySQL 后再淘汰
+- **RAG 知识库入库**：PDF / Word 资料与种子题经「精确去重 → 近似去重 → 第三方复核」入库，复核不通过的进隔离区等人工处理
+- **第三方复核闸门**：裁判模型先独立解题再与给定答案比对，且必须与出题模型不同家族；调用失败、输出解析不了、检查项不是真正的 `true`，一律判不通过
 - **流式 SSE 响应**：`/agent/analyse/stream` 支持 `thinking` / `observation` / `skill_loaded` / `result` 四种事件
 - **统一日志**：RotatingFileHandler 5MB × 3 本地轮转，HTTP 中间件按请求记录耗时
 
@@ -43,7 +45,8 @@ backend/
 │   ├── agent/              # 各 Agent 实现（react_agent 为当前主调度）
 │   ├── tools/              # BaseTool 子类（function calling）
 │   ├── skills/             # SKILL.md 能力包 + loader + skill_runner
-│   └── memory/             # 短期 / 长期 / 向量三级记忆
+│   ├── memory/             # 短期 / 归档 / 长期三级记忆
+│   └── rag/                # RAG 知识库（配置 / 领域模型 / 向量库 / 词法索引 / 入库流水线）
 ├── api/
 │   ├── dependencies.py     # JWT 鉴权依赖
 │   └── user_api/           # agent_api、login_api 路由
@@ -158,11 +161,36 @@ POST /agent/analyse
 
 | 层级 | 存储 | 内容 | 生命周期 |
 |---|---|---|---|
-| 短期 | Redis hash `user:{id}:session:{id}` | 原始 `{user_memory, model_memory}` | 24h TTL，最多 10 条 |
-| 长期 | MySQL `user_profile` 表 | 年级、学科、薄弱点、偏好 | 每个用户持久化 |
-| 向量 | Chroma（`backend/chroma_db/`） | LLM 精炼后的带 tags 摘要 | 短期溢出时追加 |
+| 短期 | Redis LIST `stm:{id}:{session_id}` | 原始 `{user_memory, model_memory}` | 24h TTL，最多 10 条 |
+| 归档 | MySQL `memory_record` / `memory_digest` | 对话原文（追加写）+ 每会话摘要 | 永久 |
+| 长期 | MySQL `user_profile` | 年级、学科、薄弱点、偏好 | 每个用户持久化 |
 
-短期记忆达到上限时，最旧 1 条通过 `extract_memory_agent`（走 `memory_refinement` Skill）转为第三人称摘要，写入 Chroma，再从 Redis 删除。
+短期记忆达到上限时，最旧记录经单条 Lua 脚本原子搬入待写队列，由后台任务写入 MySQL，再从 Redis 淘汰；每归档 5 条重建一次会话摘要。
+
+---
+
+## RAG 知识库（入库链路）
+
+资料（PDF / Word）与模型生成的种子题，经同一条流水线进入题库：
+
+```
+精确去重 → 向量化 → 近似去重 → 第三方复核 → 写入向量库 → 重建词法索引
+                                    └→ 不通过的进隔离区（MySQL rag_quarantine）
+```
+
+- **两级去重都在复核之前**：重复的题不值得再花一次裁判调用
+- **裁判必须与出题模型不同家族**（如出题用 `qwen`、裁判用 `deepseek`），否则裁判会偏袒同家族模型的输出
+- **失败即拒**：裁判调用失败、输出解析不了、检查项不是真正的 `true`，一律判不通过，进隔离区等人工决定
+- **教材讲解不经复核**：来自权威原文，只做精确去重
+
+命令行入库（需先配置 `JUDGE_API_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL`）：
+
+```bash
+python -m backend.agents.rag.ingest file 你的资料目录 --grade 七年级
+python -m backend.agents.rag.ingest generate --kp 一元一次方程 --grade 七年级 -n 5
+```
+
+> Chroma 本地库不支持多进程同时写入：服务运行期间请走后台接口入库；命令行入库后需重启服务，服务里的词法索引才会包含新题。
 
 ---
 

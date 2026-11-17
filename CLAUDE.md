@@ -114,6 +114,54 @@ Gotcha: `backend/api/__init__.py` binds an `APIRouter` named `user_api`, shadowi
 
 `get_embedding_model()` lives in `agents/agent/embedding.py`, deliberately **not** in `get_llm.py`: importing llama-index costs ~1.5s and 1400+ modules, and nothing on the request path needs embeddings. Only the RAG knowledge base imports it.
 
+### RAG Knowledge Base (`backend/agents/rag/`)
+
+Two stages exist so far: the domain model + stores (stage 1) and the ingest pipeline (stage 2). Retrieval (stage 3) is **not** built yet — there is no retrieval module and no `rag_references` tool; do not assume one exists.
+
+```
+backend/agents/rag/
+├── config.py            # RagSettings: dirs, thresholds, judge/generator wiring
+├── models.py            # QuestionItem / KnowledgeChunk / JudgeResult
+├── llm_json.py          # parse_json_object / parse_json_array
+├── runtime.py           # RagRuntime: process-wide assembly of the real components
+├── store/
+│   ├── embedder.py      # Embedder protocol, LlamaIndexEmbedder, dot(), l2_normalize()
+│   ├── vector_store.py  # VectorStore protocol + InMemoryVectorStore
+│   ├── llama_store.py   # LlamaIndexVectorStore over Chroma (production)
+│   └── lexical_index.py # BM25 + knowledge-point inverted index (jieba)
+└── ingest/
+    ├── loaders.py       # PDF / Word -> list[PageText]
+    ├── structurer.py    # sliding-window LLM extraction -> StructureResult
+    ├── generator.py     # seed-question generation
+    ├── judge.py         # third-party review gate
+    ├── dedup.py         # exact + near duplicate removal
+    ├── service.py       # IngestService: the single pipeline entry point
+    └── __main__.py      # CLI: python -m backend.agents.rag.ingest
+```
+
+Invariants to preserve when changing this module:
+
+- **Pipeline order** (`ingest/service.py`): exact dedup → embed → near dedup → judge → write vectors → rebuild the lexical index. Both dedup passes run *before* the judge — a duplicate question is not worth a judge call.
+- **The judge must be a different model family** from the generator (`model_family` / `ensure_third_party`): a same-family judge systematically favours its own output.
+- **The judge fails closed**: call failure, unparseable output, or a check that is not literally `true` → not passed → quarantine. A gate that is unsure must not let anything through.
+- **The judge solves the problem on its own first**, then compares against the given answer. Asking "is this answer right?" invites the model to agree with it.
+- **Quarantine lives in MySQL, not in the vector store** — it is workflow state, not retrieval data. `RagQuarantineMapper.set_status` is a conditional update (`WHERE id=? AND status='pending'`), so concurrent reviewers cannot both win.
+- **Teaching-material notes skip the judge**: they come from authoritative source text, so only exact dedup applies.
+- **The two new tables need explicit registration**: `core/hooks.py` carries `import backend.model.rag`. `Base.metadata.create_all` only knows models that have been imported, and nothing in `main.py`'s import chain pulls in the RAG models.
+- **Chroma's local store does not support concurrent writes from multiple processes.** Ingest through the background API while the service runs; after a CLI ingest, restart the service so the lexical index picks up the new questions.
+- **RAG skills are `visibility: internal`** (`rag_structuring`, `rag_judge`, `rag_seed_generation`). `list_skills()` excludes them by default, so they never appear in the ReAct agent's skill list — they are ingest prompts, not agent capabilities.
+
+Config (`RagSettings.from_env`): `RAG_DB_DIR`, `RAG_UPLOAD_DIR`, `RAG_EVAL_DIR`, `RERANK_API_URL` / `RERANK_MODEL` / `RERANK_API_KEY`, `JUDGE_API_URL` / `JUDGE_API_KEY` / `JUDGE_MODEL`, `MODEL_NAME` (the generator), `RAG_JUDGE_PASS_SCORE`. Without `JUDGE_*` the ingest gate refuses to run — `build_judge_llm` raises `JudgeConfigError`.
+
+CLI:
+
+```bash
+python -m backend.agents.rag.ingest file <file or dir>... [--grade 七年级]
+python -m backend.agents.rag.ingest generate --kp 一元一次方程 --grade 七年级 [--difficulty 中等] [-n 10]
+```
+
+Exit code 2 means the judge is misconfigured, not that the ingest failed.
+
 ## Frontend (`frontend/`)
 
 `npm run dev` (Vite on 5173, proxies `/login`, `/agent`, `/sessions`, `/health` to uvicorn on 8000). Two pages: `/auth` and the chat page at `/` (new conversation) or `/c/:sessionId`.
