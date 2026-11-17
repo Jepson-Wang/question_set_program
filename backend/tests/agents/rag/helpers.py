@@ -179,3 +179,32 @@ def make_ingest_service(settings, *, structurer_llm=None, generator_llm=None, ju
         quarantine=parts.quarantine,
     )
     return service, parts
+
+
+# ---------- 运行时的替身 ----------
+
+
+def make_test_runtime(settings, *, llm=None, judge=None, judge_error=None, reranker=None):
+    """
+    用离线替身组装 RagRuntime。llm 同时充当结构化与生成用的模型；
+    judge_error 不为空时，构建裁判会抛出它（模拟裁判配置错误）。
+    """
+    from backend.agents.rag.runtime import RagRuntime
+    from backend.agents.rag.store.lexical_index import LexicalIndex
+    from backend.agents.rag.store.vector_store import InMemoryVectorStore
+
+    def judge_factory():
+        if judge_error is not None:
+            raise judge_error
+        return judge or FakeJudge()
+
+    return RagRuntime(
+        settings,
+        embedder=HashingEmbedder(),
+        question_store=InMemoryVectorStore(),
+        knowledge_store=InMemoryVectorStore(),
+        lexical_index=LexicalIndex(),
+        llm_factory=lambda: llm,
+        judge_factory=judge_factory,
+        reranker=reranker,
+    )
