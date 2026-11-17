@@ -69,6 +69,20 @@ def _clean_list(texts) -> list[str]:
             result.append(refined)
     return result
 
+def normalize_difficulty(value: str | None, fallback: str = "中等") -> str:
+    """
+    把模型给出的难度收敛到枚举内：不在枚举里就退回 fallback。
+
+    QuestionItem 的校验器对非法难度一律回落到「中等」，那会让
+    「请求困难、模型回『较难』」的题目悄悄变成中等——难度是检索路由的依据，
+    错了路由就错了，所以在构造对象之前先纠正。
+    """
+    refined = (value or "").strip()
+    if refined in DIFFICULTIES:
+        return refined
+    return fallback if fallback in DIFFICULTIES else "中等"
+
+
 def _split_knowledge_points(texts) -> list[str]:
     """
     用竖线拼起来的字符串 → 列表	空字符串或 None 返回空列表；拆出来的空项丢掉
