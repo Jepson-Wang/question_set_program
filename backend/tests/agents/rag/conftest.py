@@ -24,3 +24,20 @@ def rag_settings(tmp_path):
         near_dup_threshold=0.9,
         judge_concurrency=2,
     )
+
+
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+
+@pytest_asyncio.fixture
+async def sqlite_session_factory(tmp_path):
+    """用 SQLite 文件库代替 MySQL：DAO 只依赖会话工厂，与具体数据库无关。"""
+    import backend.model.rag  # noqa: F401  注册表结构
+    from backend.model import Base
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{(tmp_path / 'rag.db').as_posix()}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield async_sessionmaker(engine, expire_on_commit=False)
+    await engine.dispose()

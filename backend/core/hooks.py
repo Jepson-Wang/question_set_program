@@ -1,6 +1,9 @@
 from backend.core.executors import shutdown_executors
 from backend.middleware.logging import get_logger
 from backend.model import engine, Base
+# RAG 的表只在入库链路用到，main 的 import 链碰不到，必须在这里显式注册，
+# 否则建表钩子认不到这两张表，上线后第一次入库就会报表不存在
+import backend.model.rag  # noqa: F401
 from backend.utils.redis_client import close_redis, ensure_redis_version, get_redis_client
 
 logger = get_logger(__name__)
