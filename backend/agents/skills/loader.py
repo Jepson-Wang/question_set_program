@@ -22,6 +22,9 @@ class SkillMeta(TypedDict):
     description: str
     triggers: list[str]
     version: str
+    # public（默认）：出现在 ReAct 主提示词的 Skill 清单里，参与触发词匹配
+    # internal：只供代码通过 load_skill 使用（如 RAG 入库的 prompt），对 Agent 不可见
+    visibility: str
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -86,11 +89,16 @@ def get_skill_meta(name: str) -> SkillMeta:
         description=meta.get("description", ""),
         triggers=meta.get("triggers", []),
         version=meta.get("version", ""),
+        visibility=meta.get("visibility", "public"),
     )
 
 
-def list_skills() -> list[SkillMeta]:
-    """遍历 skills 目录，返回所有 Skill 的元数据列表。"""
+def list_skills(include_internal: bool = False) -> list[SkillMeta]:
+    """
+    遍历 skills 目录，返回 Skill 的元数据列表。
+    默认不含 internal skill：这份清单会进 ReAct 主提示词，internal skill 对 Agent 没有用，
+    列出来只会诱导它在处理用户请求时去加载。
+    """
     result: list[SkillMeta] = []
     for child in sorted(_SKILLS_ROOT.iterdir()):
         if not child.is_dir():
@@ -98,9 +106,12 @@ def list_skills() -> list[SkillMeta]:
         if not (child / "SKILL.md").exists():
             continue
         try:
-            result.append(get_skill_meta(child.name))
+            meta = get_skill_meta(child.name)
         except Exception:
             continue
+        if meta["visibility"] == "internal" and not include_internal:
+            continue
+        result.append(meta)
     return result
 
 
