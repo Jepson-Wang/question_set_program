@@ -104,3 +104,78 @@ def write_docx(path, paragraphs, table_rows=()) -> None:
             for c, value in enumerate(row):
                 table.cell(r, c).text = value
     document.save(str(path))
+
+
+# ---------- 入库服务的替身 ----------
+
+# SimpleNamespace 已在文件顶部导入，这里直接用，避免重复导入被 lint 判成重定义
+import asyncio
+
+from backend.agents.rag.models import JudgeResult
+
+
+class FakeJudge:
+    """reject_stems 里的题判为不通过，其余通过；同时记录调用次数与最大并发数。"""
+
+    def __init__(self, reject_stems=(), delay: float = 0.0):
+        self.reject_stems = set(reject_stems)
+        self.delay = delay
+        self.calls = 0
+        self.max_concurrency = 0
+        self._running = 0
+
+    async def judge(self, item):
+        self.calls += 1
+        self._running += 1
+        self.max_concurrency = max(self.max_concurrency, self._running)
+        try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            passed = item.stem not in self.reject_stems
+            reasons = [] if passed else ["答案与独立解答不一致"]
+            return JudgeResult(passed, 0.9 if passed else 0.3, reasons, judge_model="fake-judge")
+        finally:
+            self._running -= 1
+
+
+class ListQuarantine:
+    """隔离区替身：把 (题目, 复核结果) 记在列表里；fail=True 时模拟数据库故障。"""
+
+    def __init__(self, fail: bool = False):
+        self.entries = []
+        self.fail = fail
+
+    async def __call__(self, item, result):
+        if self.fail:
+            raise RuntimeError("数据库连不上")
+        self.entries.append((item, result))
+
+
+def make_ingest_service(settings, *, structurer_llm=None, generator_llm=None, judge=None, quarantine=None):
+    """用全套离线替身组装入库服务，返回 (service, parts)。"""
+    from backend.agents.rag.ingest.generator import SeedGenerator
+    from backend.agents.rag.ingest.service import IngestService
+    from backend.agents.rag.ingest.structurer import Structurer
+    from backend.agents.rag.store.lexical_index import LexicalIndex
+    from backend.agents.rag.store.vector_store import InMemoryVectorStore
+
+    parts = SimpleNamespace(
+        embedder=HashingEmbedder(),
+        questions=InMemoryVectorStore(),
+        knowledge=InMemoryVectorStore(),
+        index=LexicalIndex(),
+        judge=judge or FakeJudge(),
+        quarantine=quarantine or ListQuarantine(),
+    )
+    service = IngestService(
+        settings=settings,
+        embedder=parts.embedder,
+        question_store=parts.questions,
+        knowledge_store=parts.knowledge,
+        lexical_index=parts.index,
+        structurer=Structurer(structurer_llm) if structurer_llm else None,
+        generator=SeedGenerator(generator_llm) if generator_llm else None,
+        judge=parts.judge,
+        quarantine=parts.quarantine,
+    )
+    return service, parts
